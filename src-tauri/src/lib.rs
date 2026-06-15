@@ -70,24 +70,26 @@ fn open_main_window(app: &tauri::AppHandle, host: &str) -> Result<(), String> {
     }
     let base = url::Url::parse(host).map_err(|e| e.to_string())?;
     let handler_app = app.clone();
-    let handler_base = base.clone();
     WebviewWindowBuilder::new(app, MAIN_LABEL, WebviewUrl::External(base))
         .title("OpenFrame")
         .inner_size(1280.0, 860.0)
         .min_inner_size(1024.0, 700.0)
         .resizable(true)
-        .on_new_window(move |url, features| handle_new_window(&handler_app, &handler_base, url, features))
+        .on_new_window(move |url, features| handle_new_window(&handler_app, url, features))
         .build()
         .map_err(|e| e.to_string())?;
     Ok(())
 }
 
 /// Routes `window.open` / `target="_blank"` requests, which a webview otherwise drops:
-/// same-origin app pages open in a new in-app window (sharing the logged-in session),
+/// app pages open in a new in-app window (sharing the logged-in session),
 /// external http(s) links open in the system browser, other schemes are blocked.
+///
+/// "In-app" is decided against the *live* origin of an open window — not the
+/// configured host — so app links stay in-app even when the login flow redirects
+/// across hosts (configured host -> shared auth host -> the tenant you end up on).
 fn handle_new_window(
     app: &tauri::AppHandle,
-    base: &url::Url,
     url: url::Url,
     features: NewWindowFeatures,
 ) -> NewWindowResponse<tauri::Wry> {
@@ -96,7 +98,13 @@ fn handle_new_window(
         return NewWindowResponse::Deny;
     }
 
-    if url.origin() == base.origin() {
+    let target_origin = url.origin();
+    let in_app = app
+        .webview_windows()
+        .values()
+        .any(|w| w.url().map(|u| u.origin() == target_origin).unwrap_or(false));
+
+    if in_app {
         let n = WINDOW_COUNTER.fetch_add(1, Ordering::Relaxed);
         match WebviewWindowBuilder::new(app, format!("child-{n}"), WebviewUrl::External(url.clone()))
             .title(url.as_str())

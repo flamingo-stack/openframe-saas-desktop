@@ -109,10 +109,13 @@ fn handle_new_window(
         // Cascade so each window is offset instead of stacking exactly on top of
         // the previous one (which made multiple windows look like one). Wraps after 6.
         let offset = (n % 6) as f64 * 36.0;
+        // Attach the same handler to the child so links opened from it also work.
+        let child_app = app.clone();
         match WebviewWindowBuilder::new(app, format!("child-{n}"), WebviewUrl::External(url.clone()))
             .title(url.as_str())
             .inner_size(1100.0, 800.0)
             .position(140.0 + offset, 120.0 + offset)
+            .on_new_window(move |u, f| handle_new_window(&child_app, u, f))
             .window_features(features)
             .build()
         {

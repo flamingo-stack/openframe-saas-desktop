@@ -76,22 +76,33 @@
     </div>
 
     <script>
-      const invoke = window.__TAURI__?.core?.invoke;
+      // Resolve the IPC bridge. `__TAURI__.core.invoke` requires withGlobalTauri;
+      // `__TAURI_INTERNALS__.invoke` is always present in Tauri v2 — use it as fallback.
+      const invoke = window.__TAURI__?.core?.invoke ?? window.__TAURI_INTERNALS__?.invoke ?? null;
       const form = document.getElementById('form');
       const hostInput = document.getElementById('host');
       const errorEl = document.getElementById('error');
       const submitBtn = document.getElementById('submit');
 
-      // Prefill with the previously used host, if any.
-      invoke?.('get_tenant_host')
-        .then((host) => {
-          if (host) hostInput.value = host;
-        })
-        .catch(() => {});
+      const errMessage = (err) =>
+        typeof err === 'string' ? err : err?.message ? err.message : String(err);
+
+      if (!invoke) {
+        errorEl.textContent = 'Tauri IPC unavailable (window.__TAURI__ missing).';
+        submitBtn.disabled = true;
+      } else {
+        // Prefill with the previously used host, if any.
+        invoke('get_tenant_host')
+          .then((host) => {
+            if (host) hostInput.value = host;
+          })
+          .catch(() => {});
+      }
 
       form.addEventListener('submit', async (e) => {
         e.preventDefault();
         errorEl.textContent = '';
+        if (!invoke) return;
         const host = hostInput.value.trim();
         if (!host) {
           errorEl.textContent = 'Please enter an instance address.';
@@ -102,7 +113,7 @@
         try {
           await invoke('set_tenant_host', { host });
         } catch (err) {
-          errorEl.textContent = typeof err === 'string' ? err : 'Failed to connect.';
+          errorEl.textContent = errMessage(err);
           submitBtn.disabled = false;
           submitBtn.textContent = 'Connect';
         }

@@ -110,12 +110,15 @@ fn get_tenant_host(app: tauri::AppHandle) -> Option<String> {
 
 #[tauri::command]
 fn set_tenant_host(app: tauri::AppHandle, host: String) -> Result<(), String> {
-    let normalized = normalize_host(&host)?;
-    save_config(&app, &AppConfig { host: Some(normalized.clone()) })?;
-    open_main_window(&app, &normalized)?;
+    log::info!("set_tenant_host: received {host:?}");
+    let normalized = normalize_host(&host).inspect_err(|e| log::error!("normalize: {e}"))?;
+    save_config(&app, &AppConfig { host: Some(normalized.clone()) })
+        .inspect_err(|e| log::error!("save_config: {e}"))?;
+    open_main_window(&app, &normalized).inspect_err(|e| log::error!("open_main_window: {e}"))?;
     if let Some(connect) = app.get_webview_window(CONNECT_LABEL) {
         let _ = connect.close();
     }
+    log::info!("set_tenant_host: opened {normalized}");
     Ok(())
 }
 
@@ -182,7 +185,18 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             show_primary_window(app);
         }))
-        .plugin(tauri_plugin_log::Builder::new().build())
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .targets([
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
+                        file_name: Some("openframe-desktop".into()),
+                    }),
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Webview),
+                ])
+                .level(log::LevelFilter::Info)
+                .build(),
+        )
         .invoke_handler(tauri::generate_handler![
             get_tenant_host,
             set_tenant_host,

@@ -5,9 +5,13 @@ use tauri::{
     image::Image,
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    webview::{NewWindowFeatures, NewWindowResponse},
-    Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent,
+    webview::{Color, NewWindowFeatures, NewWindowResponse, PageLoadEvent, PageLoadPayload},
+    Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
 };
+
+/// App background applied to every window so no white frame shows before the
+/// page paints (matches the dark OpenFrame UI).
+const WINDOW_BG: Color = Color(22, 22, 22, 255);
 
 #[cfg(target_os = "macos")]
 use tauri::ActivationPolicy;
@@ -70,15 +74,38 @@ fn open_main_window(app: &tauri::AppHandle, host: &str) -> Result<(), String> {
     }
     let base = url::Url::parse(host).map_err(|e| e.to_string())?;
     let handler_app = app.clone();
-    WebviewWindowBuilder::new(app, MAIN_LABEL, WebviewUrl::External(base))
+    let window = WebviewWindowBuilder::new(app, MAIN_LABEL, WebviewUrl::External(base))
         .title("OpenFrame")
         .inner_size(1280.0, 860.0)
         .min_inner_size(1024.0, 700.0)
         .resizable(true)
+        .background_color(WINDOW_BG)
+        .visible(false)
         .on_new_window(move |url, features| handle_new_window(&handler_app, url, features))
+        .on_page_load(show_when_loaded)
         .build()
         .map_err(|e| e.to_string())?;
+    spawn_show_fallback(&window);
     Ok(())
+}
+
+/// Reveal the window once its page has painted, so the user never sees the
+/// webview's default white background flash before the dark UI renders.
+fn show_when_loaded(window: WebviewWindow, payload: PageLoadPayload<'_>) {
+    if payload.event() == PageLoadEvent::Finished {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+/// Safety net: reveal the window even if the page load stalls or never fires the
+/// finished event, so it can't stay invisible forever. show() is idempotent.
+fn spawn_show_fallback(window: &WebviewWindow) {
+    let window = window.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(2500));
+        let _ = window.show();
+    });
 }
 
 /// Routes `window.open` / `target="_blank"` requests, which a webview otherwise drops:
@@ -115,11 +142,17 @@ fn handle_new_window(
             .title(url.as_str())
             .inner_size(1100.0, 800.0)
             .position(140.0 + offset, 120.0 + offset)
+            .background_color(WINDOW_BG)
+            .visible(false)
             .on_new_window(move |u, f| handle_new_window(&child_app, u, f))
+            .on_page_load(show_when_loaded)
             .window_features(features)
             .build()
         {
-            Ok(window) => return NewWindowResponse::Create { window },
+            Ok(window) => {
+                spawn_show_fallback(&window);
+                return NewWindowResponse::Create { window };
+            }
             Err(e) => {
                 log::error!("failed to create child window: {e}");
                 return NewWindowResponse::Deny;

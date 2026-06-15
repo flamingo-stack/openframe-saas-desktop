@@ -106,9 +106,13 @@ fn handle_new_window(
 
     if in_app {
         let n = WINDOW_COUNTER.fetch_add(1, Ordering::Relaxed);
+        // Cascade so each window is offset instead of stacking exactly on top of
+        // the previous one (which made multiple windows look like one). Wraps after 6.
+        let offset = (n % 6) as f64 * 36.0;
         match WebviewWindowBuilder::new(app, format!("child-{n}"), WebviewUrl::External(url.clone()))
             .title(url.as_str())
             .inner_size(1100.0, 800.0)
+            .position(140.0 + offset, 120.0 + offset)
             .window_features(features)
             .build()
         {

@@ -1,8 +1,11 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use serde::{Deserialize, Serialize};
 use tauri::{
     image::Image,
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    webview::{NewWindowFeatures, NewWindowResponse},
     Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 
@@ -11,6 +14,8 @@ use tauri::ActivationPolicy;
 
 const MAIN_LABEL: &str = "main";
 const CONNECT_LABEL: &str = "connect";
+
+static WINDOW_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Default, Serialize, Deserialize)]
 struct AppConfig {
@@ -63,15 +68,71 @@ fn open_main_window(app: &tauri::AppHandle, host: &str) -> Result<(), String> {
         let _ = win.set_focus();
         return Ok(());
     }
-    let url = url::Url::parse(host).map_err(|e| e.to_string())?;
-    WebviewWindowBuilder::new(app, MAIN_LABEL, WebviewUrl::External(url))
+    let base = url::Url::parse(host).map_err(|e| e.to_string())?;
+    let handler_app = app.clone();
+    let handler_base = base.clone();
+    WebviewWindowBuilder::new(app, MAIN_LABEL, WebviewUrl::External(base))
         .title("OpenFrame")
         .inner_size(1280.0, 860.0)
         .min_inner_size(1024.0, 700.0)
         .resizable(true)
+        .on_new_window(move |url, features| handle_new_window(&handler_app, &handler_base, url, features))
         .build()
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Routes `window.open` / `target="_blank"` requests, which a webview otherwise drops:
+/// same-origin app pages open in a new in-app window (sharing the logged-in session),
+/// external http(s) links open in the system browser, other schemes are blocked.
+fn handle_new_window(
+    app: &tauri::AppHandle,
+    base: &url::Url,
+    url: url::Url,
+    features: NewWindowFeatures,
+) -> NewWindowResponse<tauri::Wry> {
+    if !matches!(url.scheme(), "http" | "https") {
+        log::warn!("blocked new window for scheme '{}': {url}", url.scheme());
+        return NewWindowResponse::Deny;
+    }
+
+    if url.origin() == base.origin() {
+        let n = WINDOW_COUNTER.fetch_add(1, Ordering::Relaxed);
+        match WebviewWindowBuilder::new(app, format!("child-{n}"), WebviewUrl::External(url.clone()))
+            .title(url.as_str())
+            .inner_size(1100.0, 800.0)
+            .window_features(features)
+            .build()
+        {
+            Ok(window) => return NewWindowResponse::Create { window },
+            Err(e) => {
+                log::error!("failed to create child window: {e}");
+                return NewWindowResponse::Deny;
+            }
+        }
+    }
+
+    if let Err(e) = open_external(url.as_str()) {
+        log::error!("failed to open external url {url}: {e}");
+    }
+    NewWindowResponse::Deny
+}
+
+/// Open a URL in the user's default browser without going through a shell
+/// (each arg is passed literally, so URL contents can't be interpreted as flags/commands).
+fn open_external(url: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut cmd = std::process::Command::new("open");
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("rundll32");
+        c.arg("url.dll,FileProtocolHandler");
+        c
+    };
+    #[cfg(target_os = "linux")]
+    let mut cmd = std::process::Command::new("xdg-open");
+
+    cmd.arg(url).spawn().map(|_| ())
 }
 
 fn open_connect_window(app: &tauri::AppHandle) -> Result<(), String> {
@@ -215,14 +276,17 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Close to tray instead of quitting.
+            // Close the primary window to tray; let child (new-tab) windows close normally.
             if let WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
-                #[cfg(target_os = "macos")]
-                let _ = window
-                    .app_handle()
-                    .set_activation_policy(ActivationPolicy::Accessory);
+                let label = window.label();
+                if label == MAIN_LABEL || label == CONNECT_LABEL {
+                    api.prevent_close();
+                    let _ = window.hide();
+                    #[cfg(target_os = "macos")]
+                    let _ = window
+                        .app_handle()
+                        .set_activation_policy(ActivationPolicy::Accessory);
+                }
             }
         })
         .run(tauri::generate_context!())

@@ -21,3 +21,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 log = "0.4"
 url = "2"
+# NativeAuth bridge: native dev-ticket exchange (reads tokens off response
+# headers a cross-origin webview fetch can't) + the oneshot that parks
+# native_auth_start until the login window captures the ticket.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tokio = { version = "1", features = ["sync"] }
+# JWT payload decode (exp claim) for the shell-owned token refresh schedule.
+base64 = "0.22"
+# Background notification plane (NATS user.<id>.notification -> OS toasts).
+# Sibling-checkout path dep (same convention as build-web.sh's FRONTEND_DIR
+# default); flips to a git dependency once the crate repo is pushed.
+openframe-nats-connector = { path = "../../openframe-nats-connector" }
+notify-rust = "4"
+futures = "0.3"

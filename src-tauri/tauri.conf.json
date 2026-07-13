@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "identifier": "com.openframe.desktop",
   "build": {
-    "frontendDist": "../connect"
+    "frontendDist": "../www"
   },
   "app": {
     "withGlobalTauri": true,

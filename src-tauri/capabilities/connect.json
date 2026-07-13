@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "connect",
-  "description": "IPC permissions scoped to the connect (host picker) window only. The remote 'main' window is intentionally absent so the loaded tenant site cannot reach Tauri commands.",
+  "description": "IPC permissions for the connect (host picker) window.",
   "windows": ["connect"],
   "permissions": ["core:default"]
 }

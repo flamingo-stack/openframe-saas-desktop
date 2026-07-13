@@ -1,5 +1,7 @@
 /node_modules
 /src-tauri/target
+/www
+.env.local
 /src-tauri/gen/schemas
 *.log
 .DS_Store

@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "IPC permissions for the windows hosting the bundled frontend (main + child). The bundle is our own code, so it may invoke the native_auth_* commands backing the window.Capacitor.Plugins.NativeAuth bridge. The remote 'native-auth' login window is intentionally absent so the login page cannot reach Tauri commands.",
+  "windows": ["main", "child-*"],
+  "permissions": ["core:default"]
+}

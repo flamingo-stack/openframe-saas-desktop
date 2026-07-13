@@ -271,10 +271,16 @@ fn handle_new_window(
         return NewWindowResponse::Deny;
     }
 
-    let target_origin = url.origin();
+    // NOT Url::origin(): tauri:// is a non-special scheme, so origin() is
+    // opaque — and opaque origins are unique per parse, never equal. Compare
+    // the (scheme, host, port) triple instead, which also covers Windows'
+    // http://tauri.localhost.
+    let same_origin = |a: &url::Url, b: &url::Url| {
+        a.scheme() == b.scheme() && a.host_str() == b.host_str() && a.port() == b.port()
+    };
     let in_app = app.webview_windows().values().any(|w| {
         (w.label() == MAIN_LABEL || w.label().starts_with("child-"))
-            && w.url().map(|u| u.origin() == target_origin).unwrap_or(false)
+            && w.url().map(|u| same_origin(&u, &url)).unwrap_or(false)
     });
 
     if in_app {

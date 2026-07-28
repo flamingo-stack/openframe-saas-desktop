@@ -11,7 +11,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-FRONTEND_DIR="${FRONTEND_DIR:-$HOME/flamingo/openframe-oss-tenant/openframe/services/openframe-frontend}"
+FRONTEND_DIR="${FRONTEND_DIR:-$HOME/flamingo/openframe-frontend}"
 
 if [ ! -d "$FRONTEND_DIR" ]; then
   echo "✗ FRONTEND_DIR not found: $FRONTEND_DIR" >&2

@@ -2,7 +2,7 @@
   "name": "openframe-desktop",
   "version": "0.1.0",
   "private": true,
-  "description": "OpenFrame Desktop — Tauri shell that bundles the openframe-frontend static export. No UI code lives here; see docs/.",
+  "description": "OpenFrame Desktop",
   "scripts": {
     "web:placeholder": "node scripts/make-placeholder-web.mjs",
     "build:web": "bash scripts/build-web.sh",

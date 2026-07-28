@@ -60,7 +60,7 @@ switched to the bundle on 2026-07-08.
 ### Bundle pipeline (mirrors `openframe-mobile/scripts/`)
 - `npm run build:web` (`scripts/build-web.sh`): builds the frontend export
   (`OPENFRAME_BUILD_TARGET=export npm run build` in `FRONTEND_DIR`, default
-  `~/flamingo/openframe-oss-tenant/openframe/services/openframe-frontend`) →
+  `~/flamingo/openframe-frontend`) →
   copies `dist/` → `www/` → stages `connect/index.html` → `www/connect.html`.
 - `www/` is a **git-ignored artifact**; `tauri.conf.json` points
   `frontendDist: "../www"` at it, and `tauri build` embeds it into the binary
@@ -112,18 +112,17 @@ both modes because env is injected at runtime):
   `destroy()` is processed by the event loop after the command returns, so
   recreating the same label inline can collide (and blocking the main thread
   would deadlock it).
-- **Frontend dependency:** everything the shell needs lives on frontend branch
-  **`feat/native-shell-token-lifecycle`** (based on latest `main`), three
-  commits: the mobile-push work (saas-tenant auth-in-shell + host learning,
-  rebased from `hotfix/mobile-push`), the host-less-boot fix
-  (`use-auth-session.ts` resolves signed-out when the native shell has no
-  tenant host — otherwise `/api/me` hits the bundle origin, never 401s, and
-  the app hangs on the shell skeleton; mobile masked this by baking a host),
-  and the shell-owned token lifecycle (NativeAuth `refreshTokens` /
-  `setTenantHost` delegation). Build the bundle from that branch until it
-  merges, e.g.: `git worktree add <path> feat/native-shell-token-lifecycle`,
-  `npm ci` there, then `FRONTEND_DIR=<path>/openframe/services/openframe-frontend
-  npm run build:web` (no standing worktree is kept).
+- **Frontend dependency:** everything the shell needs is on `main` of the
+  separate [openframe-frontend](https://github.com/flamingo-stack/openframe-frontend)
+  repo (`~/flamingo/openframe-frontend`; the former
+  `feat/native-shell-token-lifecycle` branch merged before the repo split):
+  the mobile-push work (saas-tenant auth-in-shell + host learning), the
+  host-less-boot fix (`use-auth-session.ts` resolves signed-out when the
+  native shell has no tenant host — otherwise `/api/me` hits the bundle
+  origin, never 401s, and the app hangs on the shell skeleton; mobile masked
+  this by baking a host), and the shell-owned token lifecycle (NativeAuth
+  `refreshTokens` / `setTenantHost` delegation). Build with plain
+  `npm run build:web` (default `FRONTEND_DIR`).
 - Verified 2026-07-08 (release .app): host-less boot → auth page renders
   (Create Organization / email sign-in). Discovery + login remain blocked on
   gateway CORS for the Tauri origins (shared host included). Single-tenant
@@ -470,7 +469,7 @@ weeks** on the frontend, plus separate backend work for CORS + the push pipeline
 ## 10. References
 
 - Desktop repo: `~/flamingo/openframe-desktop` (this repo).
-- Frontend: `~/flamingo/openframe-oss-tenant/openframe/services/openframe-frontend`.
+- Frontend: `~/flamingo/openframe-frontend` (separate repo, migrated out of openframe-oss-tenant in July 2026).
 - Bundled-SPA precedent: `~/flamingo/openframe-oss-tenant/clients/openframe-chat`
   (Vite + Tauri + core lib + token auth).
 - Core design system: `@flamingo-stack/openframe-frontend-core`.

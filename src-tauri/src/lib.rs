@@ -1,5 +1,10 @@
+#[cfg(target_os = "macos")]
+mod macos_un;
+mod nats;
 mod notifications;
 mod tokens;
+#[cfg(target_os = "windows")]
+mod windows_toast;
 
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -7,7 +12,6 @@ use std::sync::{
 };
 
 use serde::{Deserialize, Serialize};
-use tokens::NativeAuthTokens;
 use tauri::{
     image::Image,
     menu::{Menu, MenuItem},
@@ -15,6 +19,7 @@ use tauri::{
     webview::{Color, NewWindowFeatures, NewWindowResponse, PageLoadEvent, PageLoadPayload},
     AppHandle, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
 };
+use tokens::NativeAuthTokens;
 
 /// App background applied to every window so no white frame shows before the
 /// page paints (matches the dark OpenFrame UI).
@@ -24,27 +29,46 @@ const WINDOW_BG: Color = Color(22, 22, 22, 255);
 use tauri::ActivationPolicy;
 
 pub(crate) const MAIN_LABEL: &str = "main";
-const CONNECT_LABEL: &str = "connect";
 /// Dedicated window for the BFF OAuth flow — the desktop counterpart of the
 /// mobile shell's WKWebView login sheet (openframe-mobile NativeAuthPlugin).
 const LOGIN_LABEL: &str = "native-auth";
 
+/// Baked-in shared auth host, set at compile time
+/// (`OPENFRAME_SHARED_HOST_URL=https://… cargo build`). Overridable per install
+/// by `shared_host` in config.json, which is how a dev build points at a stage
+/// gateway without a rebuild.
+const DEFAULT_SHARED_HOST: Option<&str> = option_env!("OPENFRAME_SHARED_HOST_URL");
+
 static WINDOW_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+/// The shell knows exactly one configured URL: the **shared auth host**. There
+/// is no tenant host to configure — the bundle's /auth pages discover the
+/// tenant from the user's email (`/sas/tenant/discover` on the shared host) and
+/// login learns the tenant origin from the OAuth callback. Same model as
+/// openframe-mobile, minus mobile's optional build-time single-tenant pin.
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct AppConfig {
-    /// Fully-qualified tenant origin, e.g. "https://acme.openframe.ai" (no trailing slash).
-    pub(crate) host: Option<String>,
-    /// Shared auth host for SaaS builds (injected as NEXT_PUBLIC_SHARED_HOST_URL).
-    pub(crate) shared_host: Option<String>,
-    /// Frontend app mode (injected as NEXT_PUBLIC_APP_MODE); defaults to "oss-tenant".
-    app_mode: Option<String>,
-    /// Tenant host learned from the OAuth callback in saas-tenant (dynamic)
-    /// mode, pushed by the frontend via NativeAuth.setTenantHost. Shell-side
-    /// networking (token refresh, future NATS) uses it when no pinned host
-    /// exists.
+    /// Shared auth host, e.g. "https://auth.openframe.example" — tenant discovery,
+    /// /oauth/login, /oauth/dev-exchange and /oauth/refresh all live there.
+    /// Empty/absent falls back to [`DEFAULT_SHARED_HOST`]. Read through
+    /// [`shared_host`], never directly.
+    shared_host: Option<String>,
+    /// Tenant origin learned from the OAuth callback, pushed by the frontend
+    /// via NativeAuth.setTenantHost. Shell-side networking (token refresh,
+    /// NATS) uses it. Written by the shell, not by hand.
     pub(crate) learned_host: Option<String>,
+}
+
+/// The shared auth host in effect: config.json override, else the compile-time
+/// default. `None` means the build was never given one — every auth call will
+/// fail, so it is logged loudly at startup.
+pub(crate) fn shared_host(cfg: &AppConfig) -> Option<String> {
+    [cfg.shared_host.as_deref(), DEFAULT_SHARED_HOST]
+        .into_iter()
+        .flatten()
+        .find(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 fn config_path(app: &AppHandle) -> std::path::PathBuf {
@@ -62,20 +86,29 @@ pub(crate) fn load_config(app: &AppHandle) -> AppConfig {
 }
 
 fn save_config(app: &AppHandle, cfg: &AppConfig) -> Result<(), String> {
-    let path = config_path(app);
+    let data = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
+    write_atomic(&config_path(app), &data)
+}
+
+/// Write via a temp file + rename, so a concurrent reader never sees a
+/// half-written file. `std::fs::write` truncates first, and both stores are
+/// read from background tasks — a torn read of tokens.json deserializes as "no
+/// session", which tears the notification subscription down.
+///
+/// Owner-only on unix, applied to the temp file so the target is never briefly
+/// world-readable: tokens.json is plaintext here, unlike the mobile Keychain.
+pub(crate) fn write_atomic(path: &std::path::Path, data: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let data = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
-    std::fs::write(path, data).map_err(|e| e.to_string())
-}
-
-/// saas-tenant mode boots without a pinned tenant host: the bundle's /auth
-/// pages discover the tenant (email → /sas/tenant/discover on the shared
-/// host), and native-login persists the host learned from the OAuth callback.
-/// Requires `shared_host` in config.json to be useful.
-fn is_saas_tenant(cfg: &AppConfig) -> bool {
-    cfg.app_mode.as_deref() == Some("saas-tenant")
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, data).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
 }
 
 /// Accept "acme.openframe.ai", "https://acme.openframe.ai", or "…/" and
@@ -97,19 +130,18 @@ fn normalize_host(input: &str) -> Result<String, String> {
 /// JS injected into every window that hosts the bundled frontend, before any
 /// page script runs. It supplies what the SSR server provides on the web:
 /// (1) `window.__ENV` — the runtime env next-runtime-env reads (the export
-///     build omits `<PublicEnvScript />`); the tenant host comes from the
-///     connect-window pick persisted in config.json, so one binary serves any
-///     instance, and
+///     build omits `<PublicEnvScript />`). Only the shared auth host is
+///     supplied; `NEXT_PUBLIC_TENANT_HOST_URL` is deliberately absent so
+///     `runtimeEnv.tenantHostUrl()` falls through to the host login learned
+///     (`getStoredTenantHost`), which is what lets one binary serve any tenant.
 /// (2) a minimal Capacitor-compatible bridge — the frontend's native-shell.ts
 ///     detects the shell via `window.Capacitor.isNativePlatform()` and drives
 ///     login + token custody through `Plugins.NativeAuth`, which is backed here
 ///     by the native_auth_* Tauri commands.
 fn env_init_script(app: &AppHandle) -> String {
-    let cfg = load_config(app);
     let env = serde_json::json!({
-        "NEXT_PUBLIC_TENANT_HOST_URL": cfg.host.clone().unwrap_or_default(),
-        "NEXT_PUBLIC_SHARED_HOST_URL": cfg.shared_host.clone().unwrap_or_default(),
-        "NEXT_PUBLIC_APP_MODE": cfg.app_mode.clone().unwrap_or_else(|| "oss-tenant".into()),
+        "NEXT_PUBLIC_SHARED_HOST_URL": shared_host(&load_config(app)).unwrap_or_default(),
+        "NEXT_PUBLIC_APP_MODE": "saas-tenant",
         "NEXT_PUBLIC_ENABLE_DEV_TICKET_OBSERVER": "true",
     });
     format!(
@@ -190,11 +222,15 @@ fn webview_log(window: WebviewWindow, level: String, message: String) {
 }
 
 fn open_main_window(app: &AppHandle) -> Result<(), String> {
-    if let Some(win) = app.get_webview_window(MAIN_LABEL) {
-        let _ = win.show();
-        let _ = win.set_focus();
+    if app.get_webview_window(MAIN_LABEL).is_some() {
+        show_primary_window(app);
         return Ok(());
     }
+    // Close-to-tray drops the app to Accessory; a window created after that
+    // (sign-out recreates one) would otherwise come back with no dock icon.
+    #[cfg(target_os = "macos")]
+    let _ = app.set_activation_policy(ActivationPolicy::Regular);
+
     let handler_app = app.clone();
     let window = WebviewWindowBuilder::new(app, MAIN_LABEL, WebviewUrl::App("index.html".into()))
         .initialization_script(env_init_script(app))
@@ -205,7 +241,7 @@ fn open_main_window(app: &AppHandle) -> Result<(), String> {
         .background_color(WINDOW_BG)
         .visible(false)
         .on_new_window(move |url, features| handle_new_window(&handler_app, url, features))
-        .on_page_load(show_when_loaded)
+        .on_page_load(handle_page_load)
         .build()
         .map_err(|e| e.to_string())?;
     spawn_show_fallback(&window);
@@ -233,11 +269,19 @@ fn reopen_main_window(app: &AppHandle) {
 }
 
 /// Reveal the window once its page has painted, so the user never sees the
-/// webview's default white background flash before the dark UI renders.
-fn show_when_loaded(window: WebviewWindow, payload: PageLoadPayload<'_>) {
-    if payload.event() == PageLoadEvent::Finished {
-        let _ = window.show();
-        let _ = window.set_focus();
+/// webview's default white background flash before the dark UI renders. Also
+/// closes the notification click gate again for each new document: the
+/// webview's `notification:click` listener does not survive a page load.
+fn handle_page_load(window: WebviewWindow, payload: PageLoadPayload<'_>) {
+    match payload.event() {
+        PageLoadEvent::Started if window.label() == MAIN_LABEL => {
+            notifications::reset_click_gate(window.app_handle());
+        }
+        PageLoadEvent::Finished => {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+        _ => {}
     }
 }
 
@@ -290,17 +334,21 @@ fn handle_new_window(
         let offset = (n % 6) as f64 * 36.0;
         // Attach the same handler to the child so links opened from it also work.
         let child_app = app.clone();
-        match WebviewWindowBuilder::new(app, format!("child-{n}"), WebviewUrl::External(url.clone()))
-            .initialization_script(env_init_script(app))
-            .title(url.as_str())
-            .inner_size(1100.0, 800.0)
-            .position(140.0 + offset, 120.0 + offset)
-            .background_color(WINDOW_BG)
-            .visible(false)
-            .on_new_window(move |u, f| handle_new_window(&child_app, u, f))
-            .on_page_load(show_when_loaded)
-            .window_features(features)
-            .build()
+        match WebviewWindowBuilder::new(
+            app,
+            format!("child-{n}"),
+            WebviewUrl::External(url.clone()),
+        )
+        .initialization_script(env_init_script(app))
+        .title(url.as_str())
+        .inner_size(1100.0, 800.0)
+        .position(140.0 + offset, 120.0 + offset)
+        .background_color(WINDOW_BG)
+        .visible(false)
+        .on_new_window(move |u, f| handle_new_window(&child_app, u, f))
+        .on_page_load(handle_page_load)
+        .window_features(features)
+        .build()
         {
             Ok(window) => {
                 spawn_show_fallback(&window);
@@ -340,88 +388,31 @@ fn open_external(url: &str) -> std::io::Result<()> {
     cmd.arg(url).spawn().map(|_| ())
 }
 
-fn open_connect_window(app: &AppHandle) -> Result<(), String> {
-    if let Some(win) = app.get_webview_window(CONNECT_LABEL) {
-        let _ = win.show();
-        let _ = win.set_focus();
-        return Ok(());
-    }
-    WebviewWindowBuilder::new(app, CONNECT_LABEL, WebviewUrl::App("connect.html".into()))
-        .title("Connect to OpenFrame")
-        .inner_size(520.0, 600.0)
-        .resizable(false)
-        .build()
-        .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
 pub(crate) fn show_primary_window(app: &AppHandle) {
-    let label = if app.get_webview_window(MAIN_LABEL).is_some() {
-        MAIN_LABEL
-    } else {
-        CONNECT_LABEL
-    };
-    if let Some(win) = app.get_webview_window(label) {
+    if let Some(win) = app.get_webview_window(MAIN_LABEL) {
         #[cfg(target_os = "macos")]
         let _ = app.set_activation_policy(ActivationPolicy::Regular);
         let _ = win.show();
+        let _ = win.unminimize();
         let _ = win.set_focus();
     }
 }
 
-#[tauri::command]
-fn get_tenant_host(app: AppHandle) -> Option<String> {
-    load_config(&app).host
-}
-
-#[tauri::command]
-fn set_tenant_host(app: AppHandle, host: String) -> Result<(), String> {
-    log::info!("set_tenant_host: received {host:?}");
-    let normalized = normalize_host(&host).inspect_err(|e| log::error!("normalize: {e}"))?;
-    let mut cfg = load_config(&app);
-    cfg.host = Some(normalized.clone());
-    save_config(&app, &cfg).inspect_err(|e| log::error!("save_config: {e}"))?;
-    // The env init script is baked at window creation, so a live main window
-    // still carries the previous tenant — replace it. destroy(), not close():
-    // close() emits CloseRequested, which the tray handler turns into a hide.
-    if let Some(main) = app.get_webview_window(MAIN_LABEL) {
-        let _ = main.destroy();
-        reopen_main_window(&app);
-    } else {
-        open_main_window(&app).inspect_err(|e| log::error!("open_main_window: {e}"))?;
-    }
-    if let Some(connect) = app.get_webview_window(CONNECT_LABEL) {
-        let _ = connect.destroy();
-    }
-    log::info!("set_tenant_host: opened {normalized}");
-    Ok(())
-}
-
-#[tauri::command]
-fn switch_instance(app: AppHandle) -> Result<(), String> {
-    let mut cfg = load_config(&app);
-    cfg.host = None;
+/// Tray "Sign Out": drop the session and the learned tenant, then recreate the
+/// main window so the bundle boots to its sign-in screen, which rediscovers the
+/// tenant from the user's email against the shared host. destroy(), not close():
+/// close() emits CloseRequested, which the tray handler turns into a hide.
+fn sign_out(app: &AppHandle) -> Result<(), String> {
+    let mut cfg = load_config(app);
     cfg.learned_host = None;
-    save_config(&app, &cfg)?;
-    // The stored tokens belong to the tenant being left behind.
+    save_config(app, &cfg)?;
     native_auth_clear_tokens(app.clone())?;
-    let had_main = match app.get_webview_window(MAIN_LABEL) {
+    match app.get_webview_window(MAIN_LABEL) {
         Some(main) => {
             let _ = main.destroy();
-            true
+            reopen_main_window(app);
         }
-        None => false,
-    };
-    if is_saas_tenant(&cfg) {
-        // No host picker in saas-tenant mode — a fresh main window boots to
-        // the sign-in screen (tokens are gone), which rediscovers the tenant.
-        if had_main {
-            reopen_main_window(&app);
-        } else {
-            open_main_window(&app)?;
-        }
-    } else {
-        open_connect_window(&app)?;
+        None => open_main_window(app)?,
     }
     Ok(())
 }
@@ -608,21 +599,28 @@ fn native_auth_set_tokens(
     if refresh_token.is_some() {
         stored.refresh_token = refresh_token;
     }
-    tokens::save_tokens(&app, &stored)
+    tokens::save_tokens(&app, &stored)?;
+    // A sign-in on a connection that never dropped (the previous user signed
+    // out under it) gets no Connected event — subscribe for the new user here.
+    nats::resubscribe(&app);
+    Ok(())
 }
 
 #[tauri::command]
 fn native_auth_clear_tokens(app: AppHandle) -> Result<(), String> {
     // Who cleared the session matters in post-mortems: this path is the
-    // webview (force-logout / sign-out) or switch_instance — the shell's own
-    // refresh logs its 401-clear separately in tokens.rs.
-    log::info!("[tokens] tokens cleared (webview logout or instance switch)");
+    // webview (force-logout / sign-out) or the tray's Sign Out — the shell's
+    // own refresh logs its 401-clear separately in tokens.rs.
+    log::info!("[tokens] tokens cleared (webview logout or tray sign-out)");
+    // Every logout funnels through here, so this is the one place that reliably
+    // tears down the signed-out user's notification subscription.
+    notifications::end_session(&app);
     tokens::clear_tokens(&app)
 }
 
-/// Persist the tenant host the frontend learned from the OAuth callback
-/// (saas-tenant dynamic mode), so shell-side networking (token refresh, future
-/// NATS) has a gateway without depending on webview localStorage.
+/// Persist the tenant host the frontend learned from the OAuth callback, so
+/// shell-side networking (token refresh, the NATS notification plane) has a
+/// gateway without depending on webview localStorage.
 #[tauri::command]
 fn native_auth_set_tenant_host(app: AppHandle, origin: String) -> Result<(), String> {
     let normalized = normalize_host(&origin)?;
@@ -631,8 +629,61 @@ fn native_auth_set_tenant_host(app: AppHandle, origin: String) -> Result<(), Str
         log::info!("learned tenant host: {normalized}");
         cfg.learned_host = Some(normalized);
         save_config(&app, &cfg)?;
+        // Login writes tokens before it pushes the host, so this — not
+        // native_auth_set_tokens — is where a tenant switch becomes visible.
+        // The live connection belongs to the tenant being left.
+        nats::reconnect(&app);
     }
     Ok(())
+}
+
+/// Called once per webview document, when its `notification:click` listener
+/// mounts. Opens the click gate and returns a click that happened before the
+/// listener existed (a notification click that cold-started the app), if any.
+///
+/// Child windows run the same bundle and so call this too; only the main window
+/// is ever emitted to, so anyone else must not open the gate or drain the stash.
+#[tauri::command]
+fn take_pending_notification_click(window: WebviewWindow) -> Option<serde_json::Value> {
+    if window.label() != MAIN_LABEL {
+        return None;
+    }
+    notifications::take_startup_click(window.app_handle())
+}
+
+/// Deliver a notification-activation URI carried in a process's arguments —
+/// the Windows toast click path, either our own argv (cold start) or a second
+/// launch forwarded by the single-instance plugin (warm click). Returns true
+/// when one was found and delivered; the caller then skips its own
+/// window-raising, since delivery raises the window itself.
+#[cfg(target_os = "windows")]
+fn handle_notification_argv(app: &AppHandle, args: impl IntoIterator<Item = String>) -> bool {
+    args.into_iter()
+        .any(|arg| notifications::handle_notification_uri(app, &arg))
+}
+
+/// Register the `openframe-desktop://` URI scheme (HKCU, no elevation).
+/// Windows toast clicks activate through it — see windows_toast.rs. Re-written
+/// on every launch so the command always points at the current exe path.
+#[cfg(target_os = "windows")]
+fn register_url_scheme() {
+    use winreg::{enums::*, RegKey};
+
+    let Ok(exe) = std::env::current_exe() else {
+        log::warn!("url scheme: current_exe unavailable — skipping registration");
+        return;
+    };
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let path = format!(r"Software\Classes\{}", notifications::URI_SCHEME);
+    let Ok((key, _)) = hkcu.create_subkey(&path) else {
+        log::warn!("url scheme: failed to create registry key {path}");
+        return;
+    };
+    let _ = key.set_value("", &"URL:OpenFrame Desktop");
+    let _ = key.set_value("URL Protocol", &"");
+    if let Ok((command, _)) = key.create_subkey(r"shell\open\command") {
+        let _ = command.set_value("", &format!("\"{}\" \"%1\"", exe.display()));
+    }
 }
 
 fn tray_icon() -> Image<'static> {
@@ -648,9 +699,9 @@ fn tray_icon() -> Image<'static> {
 
 fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     let show_i = MenuItem::with_id(app, "show", "Show", true, None::<&str>)?;
-    let switch_i = MenuItem::with_id(app, "switch", "Switch Instance…", true, None::<&str>)?;
+    let signout_i = MenuItem::with_id(app, "signout", "Sign Out", true, None::<&str>)?;
     let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show_i, &switch_i, &quit_i])?;
+    let menu = Menu::with_items(app, &[&show_i, &signout_i, &quit_i])?;
 
     TrayIconBuilder::new()
         .icon(tray_icon())
@@ -670,9 +721,9 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
         })
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => show_primary_window(app),
-            "switch" => {
-                if let Err(e) = switch_instance(app.clone()) {
-                    log::error!("switch_instance failed: {e}");
+            "signout" => {
+                if let Err(e) = sign_out(app) {
+                    log::error!("sign_out failed: {e}");
                 }
             }
             "quit" => app.exit(0),
@@ -685,8 +736,20 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            show_primary_window(app);
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            // A Windows toast click activates the openframe-desktop:// URI,
+            // which reaches the running instance as a second launch carrying it
+            // in argv. Anything else is the user re-launching the app.
+            #[cfg(target_os = "windows")]
+            let handled = handle_notification_argv(app, argv);
+            #[cfg(not(target_os = "windows"))]
+            let handled = {
+                let _ = argv;
+                false
+            };
+            if !handled {
+                show_primary_window(app);
+            }
         }))
         .plugin(
             tauri_plugin_log::Builder::new()
@@ -707,9 +770,6 @@ pub fn run() {
         .manage(AuthState::default())
         .manage(tokens::TokenLifecycle::default())
         .invoke_handler(tauri::generate_handler![
-            get_tenant_host,
-            set_tenant_host,
-            switch_instance,
             native_auth_start,
             native_auth_exchange_ticket,
             native_auth_get_tokens,
@@ -717,29 +777,48 @@ pub fn run() {
             native_auth_set_tokens,
             native_auth_clear_tokens,
             native_auth_set_tenant_host,
+            take_pending_notification_click,
             webview_log
         ])
         .setup(|app| {
             build_tray(app)?;
+            #[cfg(target_os = "windows")]
+            register_url_scheme();
             tokens::spawn_refresh_loop(app.handle().clone());
             notifications::init(app.handle());
+            nats::spawn(app.handle().clone());
 
             let handle = app.handle().clone();
-            let cfg = load_config(&handle);
-            if cfg.host.is_some() || is_saas_tenant(&cfg) {
-                open_main_window(&handle)
-            } else {
-                open_connect_window(&handle)
+            match shared_host(&load_config(&handle)) {
+                Some(host) => log::info!("shared auth host: {host}"),
+                // Nothing to sign in against: discovery, /oauth/* and refresh
+                // all live on the shared host. Still open the window so the
+                // failure is visible in the UI rather than an empty screen.
+                None => log::error!(
+                    "no shared auth host — build with OPENFRAME_SHARED_HOST_URL or set \
+                     shared_host in config.json; every auth call will fail"
+                ),
             }
-            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            // Cold start from a Windows toast click: the protocol launch put
+            // the URI in our own argv. Runs before the window exists so the
+            // payload is stashed (the webview pulls it via
+            // take_pending_notification_click) instead of being shown early —
+            // handle_page_load still owns the reveal, so no unpainted flash.
+            // `args_os`, not `args`: the latter panics on non-UTF-8 arguments.
+            #[cfg(target_os = "windows")]
+            handle_notification_argv(
+                &handle,
+                std::env::args_os().filter_map(|arg| arg.into_string().ok()),
+            );
+
+            open_main_window(&handle).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
             Ok(())
         })
         .on_window_event(|window, event| match event {
-            // Close the primary window to tray; let child (new-tab) windows close normally.
+            // Close the main window to tray; let child (new-tab) windows close normally.
             WindowEvent::CloseRequested { api, .. } => {
-                let label = window.label();
-                if label == MAIN_LABEL || label == CONNECT_LABEL {
+                if window.label() == MAIN_LABEL {
                     api.prevent_close();
                     let _ = window.hide();
                     #[cfg(target_os = "macos")]
@@ -752,7 +831,13 @@ pub fn run() {
             WindowEvent::Destroyed if window.label() == LOGIN_LABEL => {
                 finish_login(window.app_handle(), Err("USER_CANCELED".into()));
             }
-            // Badge clear + pending toast-click handoff.
+            // Sign-out destroys and recreates the main window; park clicks from
+            // here until the replacement's listener mounts, rather than emitting
+            // them at a label that currently has no window.
+            WindowEvent::Destroyed if window.label() == MAIN_LABEL => {
+                notifications::reset_click_gate(window.app_handle());
+            }
+            // The user is looking at the app — clear the unread badge.
             WindowEvent::Focused(true) if window.label() == MAIN_LABEL => {
                 notifications::on_main_focused(window.app_handle());
             }

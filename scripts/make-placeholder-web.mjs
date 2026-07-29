@@ -6,7 +6,7 @@
 //
 // --if-missing: exit quietly when www/index.html already exists (used by the
 // predev hook so it never clobbers a real staged bundle).
-import { copyFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -55,5 +55,4 @@ const html = `<!doctype html>
 `;
 
 writeFileSync(index, html);
-copyFileSync(join(root, 'connect', 'index.html'), join(www, 'connect.html'));
-console.log('▸ wrote placeholder www/index.html (+ connect.html)');
+console.log('▸ wrote placeholder www/index.html');

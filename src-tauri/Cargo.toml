@@ -25,12 +25,43 @@ url = "2"
 # headers a cross-origin webview fetch can't) + the oneshot that parks
 # native_auth_start until the login window captures the ticket.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["sync", "time", "rt"] }
 # JWT payload decode (exp claim) for the shell-owned token refresh schedule.
 base64 = "0.22"
 # Background notification plane (NATS user.<id>.notification -> OS toasts).
-# Sibling-checkout path dep (same convention as build-web.sh's FRONTEND_DIR
-# default); flips to a git dependency once the crate repo is pushed.
-openframe-nats-connector = { path = "../../openframe-nats-connector" }
-notify-rust = "4"
+# The flamingo fork adds auth_url_callback — async-nats re-invokes it on every
+# reconnect so the expiring bearer riding on the WS URL can be re-supplied.
+async-nats = { git = "https://github.com/flamingo-stack/nats.rs.git", branch = "main", features = ["websockets"] }
 futures = "0.3"
+rand = "0.8"
+percent-encoding = "2"
+uuid = { version = "1", features = ["v4"] }
+
+# Protocol-activation toasts + the openframe-desktop:// scheme they activate.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = ["Data_Xml_Dom", "UI_Notifications"] }
+winreg = "0.52"
+
+# UNUserNotificationCenter backend (clicks survive the process, unlike the
+# deprecated NSUserNotificationCenter path).
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", features = [
+    "NSArray",
+    "NSBundle",
+    "NSDictionary",
+    "NSError",
+    "NSSet",
+    "NSString",
+] }
+objc2-user-notifications = { version = "0.3.2", features = [
+    "UNNotification",
+    "UNNotificationAction",
+    "UNNotificationCategory",
+    "UNNotificationContent",
+    "UNNotificationRequest",
+    "UNNotificationResponse",
+    "UNNotificationTrigger",
+    "UNUserNotificationCenter",
+] }

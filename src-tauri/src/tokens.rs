@@ -53,20 +53,9 @@ pub fn load_tokens(app: &AppHandle) -> NativeAuthTokens {
 }
 
 pub fn save_tokens(app: &AppHandle, tokens: &NativeAuthTokens) -> Result<(), String> {
-    let path = tokens_path(app);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
     let data = serde_json::to_string(tokens).map_err(|e| e.to_string())?;
-    std::fs::write(&path, data).map_err(|e| e.to_string())?;
-    // Unlike the mobile Keychain this is plaintext on disk — keep it
-    // owner-readable only. OS-keychain storage is tracked in the docs.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
+    // write_atomic keeps it owner-only; OS-keychain storage is tracked in the docs.
+    crate::write_atomic(&tokens_path(app), &data)
 }
 
 pub fn clear_tokens(app: &AppHandle) -> Result<(), String> {
@@ -123,19 +112,15 @@ fn needs_refresh(tokens: &NativeAuthTokens) -> bool {
 }
 
 /// Where /oauth/refresh lives. Mirrors the frontend's resolution (shared auth
-/// host first), with the shell-known tenant hosts as fallback — which also
-/// fixes oss-mode shells, where the webview's relative-path fallback would
-/// resolve to the asset origin and always fail.
+/// host first), falling back to the tenant host learned at login — the BFF
+/// resolves the tenant from the token either way (refreshTokensByLookup).
 fn refresh_base(cfg: &AppConfig) -> Option<String> {
-    [
-        cfg.shared_host.as_ref(),
-        cfg.learned_host.as_ref(),
-        cfg.host.as_ref(),
-    ]
-    .into_iter()
-    .flatten()
-    .find(|s| !s.is_empty())
-    .cloned()
+    crate::shared_host(cfg).or_else(|| {
+        cfg.learned_host
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    })
 }
 
 fn emit_token_update(app: &AppHandle, tokens: &NativeAuthTokens) {
@@ -222,6 +207,10 @@ pub async fn refresh(
         log::warn!("[tokens] refresh rejected ({status}) — session is over, clearing tokens");
         let cleared = NativeAuthTokens::default();
         let _ = clear_tokens(app);
+        // The shell can notice the session died while the webview sits idle in
+        // the tray, so it has to tear the notification plane down itself — the
+        // webview's logout path may not run for hours, if ever.
+        crate::notifications::end_session(app);
         emit_token_update(app, &cleared);
         return Ok(cleared);
     }

@@ -173,9 +173,10 @@ export default config;
    ```html
    <script>window.__ENV = { NEXT_PUBLIC_TENANT_HOST_URL: "https://<tenant>", /* … */ };</script>
    ```
-   For a multi-tenant app the tenant host is chosen at runtime (host-picker, like the
-   desktop connect window) and written via a tiny Capacitor `Preferences` read →
-   `window.__ENV` before navigation.
+   For a multi-tenant app the tenant host is **discovered at login** from a baked
+   shared auth host and persisted by the frontend — see native-apps-strategy.md
+   §"Hosts: shared only, tenant discovered". (The runtime host-picker this
+   originally proposed was built for desktop, then deleted on 2026-07-28.)
 
 2. **SPA fallback for deep links.** Capacitor serves files from `webDir`. The
    **dashboard query-param routes already resolve** — `/devices/details?id=123` hits
@@ -294,8 +295,9 @@ backgrounded/killed; APNS/FCM fill that gap.
 
 ## 9. Open decisions
 
-- **Tenant host UX on mobile** — runtime host-picker (like the desktop connect window)
-  vs per-customer pre-baked builds with the host compiled in.
+- ~~**Tenant host UX on mobile**~~ — settled 2026-07-28: baked shared auth host,
+  tenant discovered at login. Mobile keeps an optional build-time single-tenant
+  pin (`NEXT_PUBLIC_TENANT_HOST_URL`); desktop supports no pin at all.
 - **Bundle delivery to the mobile repo** — submodule vs CI artifact vs npm package (§3).
 - **Public App Store** as an eventual goal (only realistic with the bundled build).
 - **Firebase project ownership** for FCM (Android push) — new vs existing Flamingo project.

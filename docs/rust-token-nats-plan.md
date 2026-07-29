@@ -110,74 +110,100 @@ Mobile parity is mechanical (URLSession refresh + Keychain in
 - Remaining to verify: a full login → idle past access-token expiry → shell
   rotation (`[tokens] refreshed` in the log) → resume-without-relogin cycle.
 
-## Step 2 — `openframe-nats-connector` crate + notification plane ✅ (as-built, 2026-07-10)
+## Step 2 — NATS connection layer + notification plane ✅ (as-built, 2026-07-10; revised 2026-07-28)
 
-### The crate (`~/flamingo/openframe-nats-connector`, own git repo, local-only)
+### Connection layer (`src-tauri/src/nats.rs`)
 
-Extraction of openframe-chat's `nats_bridge/connection.rs`: connect/reconnect
-state machine, jittered fast-then-exponential backoff, the auth-failure guard
-(the fork resets its attempt counter after a successful `auth_url_callback`,
-so a revoked token would hot-loop without it), URL build + token masking.
-Generalized behind:
+Port of openframe-chat's `nats_bridge/connection.rs`: connect/reconnect state
+machine, jittered fast-then-exponential backoff, the auth-failure guard (the
+fork resets its attempt counter after a successful `auth_url_callback`, so a
+revoked token would hot-loop without it), URL build + token masking.
 
-- `trait ConnectSource { async fn server_url() -> Option<String>; async fn token() -> Option<String>; }`
-  — asked before every (re)connect, so a shell token refresher plugs in here.
-  (The fork requires the auth callback future to be `Sync`; the crate hops
-  through `tokio::spawn` so sources can run non-`Sync` work like HTTP refresh.)
-- `ConnectorConfig` (client name, ws path, NATS user/pass; defaults =
-  `machine`/`""`/`/ws/nats-api`).
-- `on_connected` hooks (JetStream consumers die with the connection; plain
-  SUBs are replayed by async-nats itself) + a `watch`-based status channel.
-- Runtime-agnostic: `run()` is a plain future; uses the `log` crate.
+- Credentials are asked for before every (re)connect: `learned_host || host`
+  and `tokens::ensure_fresh()`, so a reconnect after sleep dials with a
+  refreshed bearer inline. (The fork requires the auth callback future to be
+  `Sync`; ours isn't — HTTP refresh — so it hops through `tokio::spawn`.)
+- `/ws/nats-api`, NATS-level creds `machine`/`""`; the real auth is the URL
+  bearer the gateway validates at WS upgrade.
+- On every Connected it re-runs `notifications::ensure_subscription` (plain
+  SUBs are replayed by async-nats itself, but the subject changes when the
+  signed-in user does).
 
-Consumed by the desktop as a **sibling-checkout path dep**
-(`../../openframe-nats-connector`, same convention as `FRONTEND_DIR`); flips
-to a git dependency once pushed to the org.
-
-**Deferred: the openframe-chat refactor onto the crate.** Chat's CI can't
-resolve a path/unpushed dep — gated on pushing the crate repo. The agent
-(`openframe-client`) can follow later. Until then chat keeps its original copy.
+**History:** this started as a separate `openframe-nats-connector` crate
+(generic `ConnectSource` trait, `ConnectorConfig`, `on_connected` hook list,
+status watch channel) consumed as a sibling-checkout path dep. The crate was
+never pushed, so chat could never adopt it and the desktop was the only
+consumer; it was **inlined here on 2026-07-28** and the generic surface the
+single consumer never used was dropped. Extract again only when a second
+native shell actually needs it — from a pushed repo, not a path dep.
 
 ### Desktop notification plane (`src-tauri/src/notifications.rs`)
 
-- Second NATS connection (webview keeps its own for interactive streams):
-  `ShellConnectSource` = `learned_host || host` + `tokens::ensure_fresh()` —
-  reconnect-after-sleep dials with a refreshed bearer inline.
+- Second NATS connection (webview keeps its own for interactive streams).
 - Subject `user.<userId>.notification`; **userId = the `userId` claim** of the
   access token (verified against a live gateway token; `sub` is the email).
   Router replaced when the signed-in user changes; kept across reconnects.
 - Envelope contract (same as chat's): anything with a `title` is displayable;
-  `description` truncated to 140 chars. Toasts fire only when the main window
-  is hidden/unfocused (`should_notify`) — the webview's own subscription keeps
-  driving the in-app drawer; duplicate delivery, different sinks.
-- notify-rust toast (dev builds borrow `com.apple.Terminal`'s identity —
-  unsigned binaries can't post as themselves), dock badge while hidden,
-  click → show window + `notification:click` event with the **raw envelope**;
-  window-focus within 30s also replays a pending click (chat's heuristic).
-- Frontend (`feat/native-shell-token-lifecycle`): `onNativeNotificationClick`
-  in native-shell.ts; `resolveNatsNotificationRoute` in
-  notification-navigation.ts (same context mapping as the drawer, wire-shape
-  input); `NativeShellInitializer` pushes the route (fallback
-  `/notifications`). Drawer-only actions (mingo sidebar) have no URL yet.
+  `description` truncated to 140 chars. Notifications fire only when the main
+  window is hidden/unfocused (`should_notify`) — the webview's own
+  subscription keeps driving the in-app drawer; duplicate delivery, different
+  sinks. Dock/taskbar badge while hidden, cleared on main-window focus.
+- Click payload = the envelope's **`context`** object (all the frontend route
+  mapping reads, and small enough for the Windows activation URI), emitted as
+  `notification:click`.
+
+### Click delivery (aligned with chat's #2115 refactor, 2026-07-28)
+
+notify-rust is gone: its click callback only fires for a *live* banner in the
+*current* process, so a click from Notification Center or one that cold-starts
+the app went nowhere — which is what the old "window focused within 30s
+replays the pending click" heuristic was papering over. Per platform now:
+
+- **macOS bundled builds** (`src-tauri/src/macos_un.rs`):
+  `UNUserNotificationCenter` + a delegate; the payload rides in the
+  notification's `userInfo`, so `didReceiveNotificationResponse` reports every
+  click — live banner, Notification Center hours later, or a cold start.
+  Permission is requested once, after the first successful subscribe (i.e.
+  only for signed-in shells).
+- **Windows** (`src-tauri/src/windows_toast.rs`): hand-built toast XML with
+  `activationType="protocol"` (tauri-winrt-notification only does in-process
+  foreground activation). Clicks open `openframe-desktop://notify?context=…`,
+  registered under `HKCU\Software\Classes` at startup; a warm click reaches
+  the running instance via single-instance argv forwarding, a cold click
+  launches us with the URI in argv.
+- **macOS dev builds** (`tauri dev` runs an unbundled binary — UN APIs abort
+  without a bundle id) **and Linux: no OS notifications.** The old
+  `com.apple.Terminal` identity-borrowing dev workaround died with notify-rust;
+  test toasts against a `tauri build` bundle.
+
+Cold-start clicks fire long before React mounts, so all paths funnel through
+`deliver_click` → `emit_or_stash`: the payload is parked until the webview
+calls `take_pending_notification_click`, which opens the gate and drains it.
+
+### Frontend counterpart (openframe-frontend)
+
+`onNativeNotificationClick` + `takeNativeStartupNotificationClick` in
+native-shell.ts; `resolveNatsNotificationRoute` in notification-navigation.ts
+(same context mapping as the drawer, wire-shape input); `NativeShellInitializer`
+registers the listener, then drains the startup click and pushes the route
+(fallback `/notifications`). Drawer-only actions (mingo sidebar) have no URL yet.
 
 ### Known limitations
 
-- "Switch Instance"/sign-out doesn't force-drop an established connection —
+- Tray "Sign Out" doesn't force-drop an established connection —
   the old-user subscription lives until the next natural reconnect (token
-  rotation will refuse re-auth). Add a connector `disconnect()` if it matters.
-- No feature-flag gate on toasts (chat has one, pushed from its webview): a
-  webview-independent plane can't wait for webview state. Subject-level
-  silence is the effective gate.
+  rotation will refuse re-auth). Add a `disconnect()` if it matters.
+- No feature-flag gate on notifications (chat has one, pushed from its
+  webview): a webview-independent plane can't wait for webview state.
+  Subject-level silence is the effective gate.
+- The webview-ready gate is not reset when the main window is recreated
+  (`set_tenant_host` / `switch_instance`), so a click landing during that
+  reload is emitted into a not-yet-mounted listener. Only reachable by
+  clicking a notification mid-instance-switch.
 
 ## Step 3 — full IPC transport (only if ever needed)
 
 Move interactive streams behind a core-lib `NatsTransport` abstraction
 (nats.ws on web, shell IPC in shells) so Rust owns the single connection.
 Do this only when something concrete requires streams while hidden; step 2's
-crate is the foundation either way.
-
-## Crate/repo placement
-
-`openframe-nats-connector` as a Cargo **git dependency** (org precedent: the
-nats.rs fork, `openframe-frontend-core` on npm) — either its own repo or a
-crate dir in openframe-oss-tenant. Path deps rejected (machine-specific).
+connection layer is the foundation either way.

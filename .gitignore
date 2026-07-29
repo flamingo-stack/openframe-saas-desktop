@@ -1,7 +1,27 @@
+# Dependencies / build output
 /node_modules
 /src-tauri/target
-/www
-.env.local
 /src-tauri/gen/schemas
+
+# Staged frontend bundle — produced by scripts/build-web.sh, never committed
+/www
+# Frontend checkout build-web.sh clones when FRONTEND_DIR is unset
+/.frontend
+
+# Local config and secrets. tokens.json / config.json live in the OS app-config
+# dir, not in the repo, but keep the patterns so a stray copy can't be committed.
+.env
+.env.*
+!.env.example
+tokens.json
+config.json
+*.pem
+*.p12
+*.key
+*.keystore
+*.jks
+
+# Logs and OS cruft
 *.log
 .DS_Store
+Thumbs.db

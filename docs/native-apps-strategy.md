@@ -57,32 +57,83 @@ the `openframe-frontend` static export** — the same `build:export` bundle
 repo.** Originally shipped as a remote-URL shell (shape A, verified end-to-end);
 switched to the bundle on 2026-07-08.
 
+### Build entry point — `Makefile` (added 2026-07-28)
+Mirrors `clients/openframe-chat/Makefile` in openframe-oss-tenant so one CI
+shape drives both. **The Makefile is the entry point; the npm scripts are the
+primitives it calls** — `npm run build` alone is a raw `tauri build` that skips
+web staging and bakes no host.
+
+```sh
+make lint                      # fmt-check + clippy -D warnings
+make test                      # cargo test
+make build TARGET=<rust-target> OPENFRAME_VERSION=<v> \
+           OPENFRAME_SHARED_HOST_URL=https://… [BUNDLES=app]
+```
+- `OPENFRAME_SHARED_HOST_URL` is **required for `build`** and checked at parse
+  time, so it fails in milliseconds rather than after the frontend export. Same
+  guard, same rationale as openframe-mobile's `inject-env.mjs`.
+- `OPENFRAME_VERSION` is applied via `tauri build --config '{"version":…}'`.
+  (chat's Makefile accepts the same variable from CI and ignores it, so chat
+  ships whatever is in its `tauri.conf.json` — worth fixing there.)
+- `lint`/`test` depend on `web-placeholder`, because `generate_context!` embeds
+  `www/` at **compile** time — a fresh clone cannot even `cargo clippy` without
+  a staged bundle.
+- Adopting `fmt-check` required one mechanical `cargo fmt --all` pass over
+  `src/`; the tree is rustfmt-clean as of this change and `make lint` enforces it.
+
 ### Bundle pipeline (mirrors `openframe-mobile/scripts/`)
-- `npm run build:web` (`scripts/build-web.sh`): builds the frontend export
-  (`OPENFRAME_BUILD_TARGET=export npm run build` in `FRONTEND_DIR`, default
-  `~/flamingo/openframe-frontend`) →
-  copies `dist/` → `www/` → stages `connect/index.html` → `www/connect.html`.
+- `npm run build:web` (`scripts/build-web.sh`, wrapped by `make web`): clones or
+  refreshes **[openframe-oss-frontend](https://github.com/flamingo-stack/openframe-oss-frontend)**
+  into git-ignored `.frontend/` (shallow, single ref), installs, runs
+  `OPENFRAME_BUILD_TARGET=export npm run build`, copies `dist/` → `www/`.
+  `FRONTEND_DIR=<path>` uses an existing checkout untouched (the dev loop — no
+  git operations); `FRONTEND_REF=<branch|tag>` pins the ref, default `main`;
+  `FRONTEND_REPO` overrides the origin.
 - `www/` is a **git-ignored artifact**; `tauri.conf.json` points
   `frontendDist: "../www"` at it, and `tauri build` embeds it into the binary
   (`generate_context!` runs at compile time, so `www/` must exist even for
   `cargo check` — `npm run web:placeholder` writes a stub, and the `predev`
   hook stages it automatically when missing).
 - **No build-time `inject-env.mjs`** (the one difference from mobile): env is
-  injected at **runtime** (below), so one binary serves any instance and
-  "Switch Instance" keeps working.
+  injected at **runtime** (below), so the same bundle works against any gateway.
+- `bundle.windows` in `tauri.conf.json` matches chat's:
+  `certificateThumbprint: null` (CI signs the artifact afterwards, out of band)
+  and `webviewInstallMode: downloadBootstrapper` for the NSIS installer.
+
+### Hosts: shared only, tenant discovered (2026-07-28)
+The shell knows **exactly one configured URL — the shared auth host.** There is
+no tenant host to configure anywhere; the mobile model, minus mobile's optional
+build-time single-tenant pin (`NEXT_PUBLIC_TENANT_HOST_URL`), which the desktop
+does not support. Self-hosted OSS instances are consequently out of scope.
+
+- Baked at Rust build time:
+  `OPENFRAME_SHARED_HOST_URL=https://auth.openframe.example npm run build`
+  (`option_env!` in lib.rs; `build.rs` declares `rerun-if-env-changed` so a
+  changed host actually invalidates the cache). Per-install override for
+  dev/QA: `"shared_host"` in `config.json` (app config dir).
+- `config.json` holds only `shared_host` (override) and `learned_host` — the
+  tenant origin the frontend pushes back via `NativeAuth.setTenantHost` after
+  login, used by shell-side networking (token refresh, NATS). Nothing else.
+- **Boot always goes straight to the main window.** Unauthenticated, the bundle
+  shows its own /auth pages: email → `/sas/tenant/discover` on the shared host →
+  provider → `nativeLogin({tenantId, provider, tenantDomain})`. The tenant host
+  is learned from the OAuth callback origin and persisted by the frontend
+  (`storeTenantHost`, localStorage `native:tenant-host-url`) as well as
+  shell-side.
+- The **connect window / host picker is gone** (`connect/index.html`,
+  `capabilities/connect.json`, `get_tenant_host`, `set_tenant_host` — all
+  deleted 2026-07-28), and tray "Switch Instance…" became **"Sign Out"**:
+  clears tokens + `learned_host` and recreates the main window at the sign-in
+  screen.
 
 ### How it works
-- First launch → no saved host → **connect window** (`www/connect.html`). On
-  submit, `set_tenant_host` normalizes/validates the URL, persists it to
-  `config.json` (app config dir), opens the **main** window at
-  `WebviewUrl::App("index.html")` — the bundle, not the tenant URL.
 - Every window hosting bundle content gets a Tauri **initialization script**
   (`env_init_script`, runs before any page script):
-  - `window.__ENV = { NEXT_PUBLIC_TENANT_HOST_URL: <picked host>,
-    NEXT_PUBLIC_SHARED_HOST_URL, NEXT_PUBLIC_APP_MODE (default "oss-tenant"),
-    NEXT_PUBLIC_ENABLE_DEV_TICKET_OBSERVER: "true" }` — the global
-    next-runtime-env reads (export builds omit `<PublicEnvScript />`).
-    `shared_host` / `app_mode` are optional `config.json` keys for SaaS builds.
+  - `window.__ENV = { NEXT_PUBLIC_SHARED_HOST_URL, NEXT_PUBLIC_APP_MODE:
+    "saas-tenant", NEXT_PUBLIC_ENABLE_DEV_TICKET_OBSERVER: "true" }` — the
+    global next-runtime-env reads (export builds omit `<PublicEnvScript />`).
+    `NEXT_PUBLIC_TENANT_HOST_URL` is deliberately **absent** so the frontend's
+    `runtimeEnv.tenantHostUrl()` falls through to the learned host.
   - A minimal **Capacitor-compatible bridge**: `window.Capacitor.isNativePlatform()`
     → `true` + `Plugins.NativeAuth` backed by `native_auth_*` Tauri commands, so
     the frontend's `native-shell.ts` treats desktop exactly like the mobile
@@ -91,30 +142,15 @@ switched to the bundle on 2026-07-08.
   `index.html` (verified in tauri 2.11 source), so the export's trailing-slash
   routes, cold deep links to the query-param pages, and unknown paths (SPA
   fallback) all resolve.
-- Tray (Show / Switch Instance / Quit), close-to-tray, single-instance, macOS
-  dock/activation-policy handling — unchanged. "Switch Instance" now also
-  clears the stored tokens (they belong to the tenant being left).
-
-### saas-tenant mode (dynamic tenant, like the mobile app)
-Set in `config.json` (app config dir; no rebuild needed — same bundle serves
-both modes because env is injected at runtime):
-```json
-{ "shared_host": "https://auth.openframe.ai", "app_mode": "saas-tenant" }
-```
-- Boot goes **straight to the main window** (no connect/host picker): the
-  bundle's /auth pages run email → `/sas/tenant/discover` on the shared host →
-  provider → `nativeLogin({tenantId, provider, tenantDomain})`; the tenant host
-  is learned from the OAuth callback origin and persisted by the frontend
-  (`storeTenantHost`, localStorage `native:tenant-host-url`).
-- Tray "Switch Instance…" acts as **sign out**: clears host + tokens and
-  recreates the main window at the sign-in screen (no host picker).
+- Tray (Show / Sign Out / Quit), close-to-tray, single-instance, macOS
+  dock/activation-policy handling.
 - Window replacement is done from a spawned task (`reopen_main_window`) —
   `destroy()` is processed by the event loop after the command returns, so
   recreating the same label inline can collide (and blocking the main thread
   would deadlock it).
 - **Frontend dependency:** everything the shell needs is on `main` of the
-  separate [openframe-frontend](https://github.com/flamingo-stack/openframe-frontend)
-  repo (`~/flamingo/openframe-frontend`; the former
+  separate [openframe-oss-frontend](https://github.com/flamingo-stack/openframe-oss-frontend)
+  repo, which `scripts/build-web.sh` clones (the former
   `feat/native-shell-token-lifecycle` branch merged before the repo split):
   the mobile-push work (saas-tenant auth-in-shell + host learning), the
   host-less-boot fix (`use-auth-session.ts` resolves signed-out when the
@@ -125,8 +161,7 @@ both modes because env is injected at runtime):
   `npm run build:web` (default `FRONTEND_DIR`).
 - Verified 2026-07-08 (release .app): host-less boot → auth page renders
   (Create Organization / email sign-in). Discovery + login remain blocked on
-  gateway CORS for the Tauri origins (shared host included). Single-tenant
-  pin for testing: set `host` in config.json alongside `shared_host`/`app_mode`.
+  gateway CORS for the Tauri origins (shared host included).
 
 ### Auth — NativeAuth bridge (Rust twin of mobile's `NativeAuthPlugin.swift`)
 - `native_auth_start` — opens the gateway BFF OAuth flow in a dedicated
@@ -140,17 +175,21 @@ both modes because env is injected at runtime):
 - `native_auth_get/set/clear_tokens` — `tokens.json` (mode 0600) in the app
   config dir; `set` merges per-field (rotation responses may carry one token).
   **Not keychain-backed yet** — hardening item, unlike mobile's Keychain.
-- **OS notifications are shell-owned** (2026-07-10, `src-tauri/src/notifications.rs`):
-  a second, Rust-owned NATS connection (the webview keeps its own for
-  interactive streams) subscribes to `user.<userId>.notification` (userId =
-  the access token's `userId` claim) and stays alive while the app sits in the
-  tray — OS toasts + dock badge when the window is hidden/unfocused, raw
-  envelope forwarded on click as `notification:click`, routed by the frontend
-  via the same mapping the drawer uses. Built on the extracted
-  **`openframe-nats-connector`** crate (`~/flamingo/openframe-nats-connector`,
-  sibling-checkout path dep) — openframe-chat's connection layer generalized
-  behind a `ConnectSource` trait; chat's refactor onto it is pending the crate
-  being pushed. Details: [rust-token-nats-plan.md](./rust-token-nats-plan.md) §2.
+- **OS notifications are shell-owned** (2026-07-10, revised 2026-07-28,
+  `src-tauri/src/notifications.rs`): a second, Rust-owned NATS connection (the
+  webview keeps its own for interactive streams) subscribes to
+  `user.<userId>.notification` (userId = the access token's `userId` claim)
+  and stays alive while the app sits in the tray — OS notifications + badge
+  when the window is hidden/unfocused, the envelope's `context` forwarded on
+  click as `notification:click`, routed by the frontend via the same mapping
+  the drawer uses. The connection layer (a port of openframe-chat's
+  `nats_bridge/connection.rs`) lives inline in `src-tauri/src/nats.rs`; it was
+  briefly a separate `openframe-nats-connector` crate, inlined again on
+  2026-07-28 since it never got pushed and had exactly one consumer. Click
+  delivery mirrors chat's #2115 refactor: `UNUserNotificationCenter` on macOS
+  (bundled builds only), protocol-activation toasts on Windows, both routed
+  through a stash that waits for the webview's `notification:click` listener.
+  Details: [rust-token-nats-plan.md](./rust-token-nats-plan.md) §2.
 - **Token lifecycle is shell-owned** (2026-07-10, `src-tauri/src/tokens.rs`):
   JWT-exp-scheduled single-flight refresh against `{shared_host || learned_host
   || host}/oauth/refresh`, 30s background poll (survives webview idle +
@@ -164,10 +203,10 @@ both modes because env is injected at runtime):
   [rust-token-nats-plan.md](./rust-token-nats-plan.md).
 
 ### Security posture
-- Capabilities: `connect.json` (host picker) and `main.json` (`main` +
-  `child-*`) — the bundle is our own code, so it may invoke the IPC backing the
-  NativeAuth bridge. The **remote `native-auth` login window is in no
-  capability** → the login page cannot reach Tauri commands.
+- Capabilities: `main.json` only (`main` + `child-*`) — the bundle is our own
+  code, so it may invoke the IPC backing the NativeAuth bridge. The **remote
+  `native-auth` login window is in no capability** → the login page cannot
+  reach Tauri commands.
 - **Prerequisite: gateway CORS must allow `tauri://localhost`** (macOS/Linux)
   and `http://tauri.localhost` (Windows), including exposing the
   `Access-Token`/`Refresh-Token` headers — the same change already made for
@@ -206,11 +245,11 @@ boot marker with the injected `window.__ENV`. Log file:
 - `src-tauri/src/lib.rs` — windows, tray, `env_init_script` (env + Capacitor
   shim), `native_auth_*` commands, `handle_new_window`, config/token stores.
 - `scripts/build-web.sh` / `scripts/make-placeholder-web.mjs` — bundle staging.
-- `connect/index.html` — host picker source (staged to `www/connect.html`; uses
-  `window.__TAURI_INTERNALS__.invoke` with `__TAURI__.core.invoke` fallback).
+- `src-tauri/src/nats.rs` / `notifications.rs` / `macos_un.rs` /
+  `windows_toast.rs` — background notification plane.
 - `src-tauri/tauri.conf.json` — `frontendDist: "../www"`, `withGlobalTauri`,
   dynamic windows, `com.openframe.desktop`.
-- `src-tauri/capabilities/connect.json` + `main.json` — IPC scopes.
+- `src-tauri/capabilities/main.json` — IPC scope.
 
 ### Commit history (this repo)
 - `78b5606` scaffold
@@ -223,10 +262,9 @@ boot marker with the injected `window.__ENV`. Log file:
 
 ### Run it
 ```bash
-cd ~/flamingo/openframe-desktop
 npm install
-npm run build:web  # build + stage the frontend export (FRONTEND_DIR overrides the checkout)
-npm run dev        # tauri dev; enter an instance e.g. test-dev.openframe.build
+npm run build:web  # clone/refresh openframe-oss-frontend, build + stage the export
+npm run dev        # tauri dev; the bundle's /auth screen discovers the tenant
 ```
 > `npm run dev` auto-stages a placeholder bundle when `www/` is missing (the
 > `generate_context!` macro needs it even to compile). Running the bare
@@ -461,16 +499,17 @@ weeks** on the frontend, plus separate backend work for CORS + the push pipeline
 - **Mobile MVP shape**: ship remote-load first, or wait for bundled? (Recommend:
   ship remote-load to de-risk push/distribution while export work proceeds.)
 - **Public App Store** as a goal? (Only realistic with the bundled build.)
-- **Tenant host UX on mobile**: same connect/host-picker pattern as desktop, or
-  per-customer pre-baked builds?
+- **Tenant host UX on mobile**: ~~connect/host-picker~~ — settled 2026-07-28,
+  both shells discover the tenant at login from a baked shared auth host; the
+  desktop picker is deleted and mobile keeps only its optional build-time pin.
 
 ---
 
 ## 10. References
 
-- Desktop repo: `~/flamingo/openframe-desktop` (this repo).
-- Frontend: `~/flamingo/openframe-frontend` (separate repo, migrated out of openframe-oss-tenant in July 2026).
-- Bundled-SPA precedent: `~/flamingo/openframe-oss-tenant/clients/openframe-chat`
+- Frontend: [flamingo-stack/openframe-oss-frontend](https://github.com/flamingo-stack/openframe-oss-frontend)
+  — the static export this shell embeds; staged by `scripts/build-web.sh`.
+- Bundled-SPA precedent: `openframe-oss-tenant/clients/openframe-chat`
   (Vite + Tauri + core lib + token auth).
 - Core design system: `@flamingo-stack/openframe-frontend-core`.
 - Key frontend auth/URL touchpoints: `src/lib/api-client.ts`,

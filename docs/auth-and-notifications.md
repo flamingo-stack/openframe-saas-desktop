@@ -111,8 +111,9 @@ dials with a fresh bearer.
   webview's own subscription keeps driving the in-app drawer — duplicate delivery,
   different sinks. A badge accumulates while hidden and clears on focus.
 - The click payload is the envelope's routing `context`, narrowed to the fields
-  the frontend's route mapping reads. The rest of a context can be arbitrarily
-  large, and it has to fit inside a Windows activation URI.
+  the frontend's route mapping reads plus `approvalRequestId`, which the macOS
+  action buttons need. The rest of a context can be arbitrarily large, and it has
+  to fit inside a Windows activation URI.
 - Every logout path tears the subscription down — including a session death the
   shell detects itself, which the webview may not notice for hours while idle in
   the tray. Otherwise the previous user's notification content would keep
@@ -144,6 +145,43 @@ which drains it and opens the gate for direct delivery. The gate closes again on
 each new document and when the main window is destroyed, because the listener does
 not survive either.
 
+### Action buttons (macOS only)
+
+Some notifications complete their work from the banner, with no window and no
+webview: **Approve / Reject** on an AI tool-approval request, **Reply** on a Mingo
+message. Both are plain authenticated REST calls, so the whole decision runs in
+Rust (`chat_api.rs`) against the tenant host, with a bearer from
+`tokens::ensure_fresh`.
+
+- Three categories are registered at init (`setNotificationCategories` replaces
+  the whole set, so it is one call): approval, message, and the default one-button
+  set every other notification keeps. Which one a notification gets is derived
+  from its click payload — and only when the id the button needs actually
+  survived the payload projection, because an Approve that can resolve nothing is
+  worse than no Approve.
+- Only the buttons run in the background. A body click or "Open" is still the
+  existing click path, and so is any action identifier this build does not know.
+
+> **The session, not the notification, is the authority.** A banner can sit in
+> Notification Center for days, across a sign-out or a different user signing in
+> on the same Mac. So every background action first resolves a live session
+> (`chat_api::active_session`: tokens that refresh, an access token still inside
+> its `exp`, a `userId` claim) and refuses unless that session is **the same user
+> the notification was delivered to** — the subscription's user id is stamped into
+> `userInfo` at fire time for exactly this comparison. Approve additionally
+> carries `AuthenticationRequired`, but that is only macOS's device-lock gate: on
+> an unlocked Mac it prompts for nothing, which is why it is not the gate that
+> matters here.
+
+There is no window to report into afterwards, so the outcome comes back as another
+notification: a plain confirmation on success, and on failure a re-post of the
+original — same category, same payload, the reason in the body — so the buttons
+are still there to retry with. A failed reply carries the typed text back with it,
+since responding to a notification clears the inline field.
+
+Windows gets none of this: its toasts activate a URI, and running an action without
+foregrounding the app would need a COM `INotificationActivationCallback`.
+
 ## Known gaps
 
 - No feature-flag gate on notifications. A webview-independent plane cannot wait
@@ -154,3 +192,7 @@ not survive either.
 - Moving the interactive streams behind a shared transport abstraction, so the
   shell owns a single connection, remains possible but unjustified — nothing
   consumes those streams while hidden.
+- A notification action taken while the app is **quit** relaunches it, and launch
+  opens the main window — so that path completes the action but does not stay
+  invisible. Suppressing the window would mean knowing at setup time that a
+  response is coming, which the delegate only reports afterwards.

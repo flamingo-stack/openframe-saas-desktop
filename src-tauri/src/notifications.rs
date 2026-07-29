@@ -117,7 +117,7 @@ pub(crate) async fn ensure_subscription(app: &AppHandle, client: async_nats::Cli
     let task_app = app.clone();
     let task_subject = subject.clone();
     let task = tauri::async_runtime::spawn(async move {
-        notification_router(task_app, task_subject, subscriber).await;
+        notification_router(task_app, task_subject, user_id, subscriber).await;
     });
     *slot = Some(SubscriptionSlot { subject, task });
 }
@@ -125,6 +125,7 @@ pub(crate) async fn ensure_subscription(app: &AppHandle, client: async_nats::Cli
 async fn notification_router(
     app: AppHandle,
     subject: String,
+    user_id: String,
     mut subscriber: async_nats::Subscriber,
 ) {
     while let Some(message) = subscriber.next().await {
@@ -145,7 +146,7 @@ async fn notification_router(
                 continue;
             }
         };
-        maybe_notify(&app, &payload);
+        maybe_notify(&app, &payload, &user_id);
     }
     // The stream only closes when the client is torn down — clear the slot
     // (only if it is still ours; a user switch may have replaced it) so the
@@ -162,7 +163,11 @@ async fn notification_router(
 /// Every envelope on this subject is user-displayable by contract — anything
 /// with a `title` fires unless the user is already looking at the app (the
 /// webview's own subscription drives the in-app drawer either way).
-fn maybe_notify(app: &AppHandle, envelope: &serde_json::Value) {
+///
+/// `user_id` is the subject's user — whoever the notification was delivered to.
+/// It rides along to macOS so an action taken hours later can refuse to run
+/// under a different session (see `macos_un::run_action`).
+fn maybe_notify(app: &AppHandle, envelope: &serde_json::Value, user_id: &str) {
     let Some(title) = string_field(envelope, "title") else {
         log::debug!("[notifications] ignoring envelope without title");
         return;
@@ -181,12 +186,17 @@ fn maybe_notify(app: &AppHandle, envelope: &serde_json::Value) {
     set_badge(app, unread);
 
     #[cfg(target_os = "macos")]
-    crate::macos_un::fire(title, body, click);
+    crate::macos_un::fire(title, body, click, user_id.to_string());
     #[cfg(target_os = "windows")]
-    fire_toast(app, title, body, click);
+    {
+        // No background activation on Windows — its toasts only carry the click
+        // URI, so there is nothing to bind a session to.
+        let _ = user_id;
+        fire_toast(app, title, body, click);
+    }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        let _ = (title, body, click);
+        let _ = (title, body, click, user_id);
         log::debug!("[notifications] no OS notification backend on this platform");
     }
 }
@@ -217,14 +227,16 @@ fn fire_toast(app: &AppHandle, title: String, body: String, click: Option<serde_
 
 /// The webview's `notification:click` payload: the envelope's routing context
 /// in wire shape, which the frontend's `resolveNatsNotificationRoute` maps to a
-/// route. Only the three fields that mapping reads survive — the rest of
-/// `context` can be arbitrarily large (an approval request carries the whole
-/// `toolCalls` array), and it has to fit in a Windows activation URI, which the
-/// shell truncates at ~2 KB. `None` when the envelope points at nothing
-/// openable; the click then only raises the window.
+/// route. Only the fields that mapping reads — plus `approvalRequestId`, which
+/// the macOS Approve/Reject buttons resolve against the chat API — survive. The
+/// rest of `context` can be arbitrarily large (an approval request carries the
+/// whole `toolCalls` array), and it has to fit in a Windows activation URI,
+/// which the shell truncates at ~2 KB; every id kept here is a UUID. `None`
+/// when the envelope points at nothing openable; the click then only raises the
+/// window.
 fn click_payload(envelope: &serde_json::Value) -> Option<serde_json::Value> {
     let context = envelope.get("context")?;
-    let routing: serde_json::Map<_, _> = ["type", "ticketId", "dialogId"]
+    let routing: serde_json::Map<_, _> = ["type", "ticketId", "dialogId", "approvalRequestId"]
         .into_iter()
         .filter_map(|key| Some((key.to_string(), context.get(key)?.clone())))
         .collect();
@@ -480,20 +492,26 @@ mod tests {
     }
 
     /// The bulk a context can carry (an approval request's toolCalls) must not
-    /// reach the activation URI — Windows truncates it at ~2 KB.
+    /// reach the activation URI — Windows truncates it at ~2 KB. The ids the
+    /// macOS action buttons act on must survive it.
     #[test]
     fn click_payload_keeps_only_routing_fields() {
         let envelope = serde_json::json!({
             "context": {
                 "type": "ADMIN_APPROVAL_REQUEST",
                 "ticketId": "abc",
+                "approvalRequestId": "0a2a0b3c-9d1e-4f5a-8b7c-6d5e4f3a2b1c",
                 "toolCalls": [{ "toolExplanation": "x".repeat(4096) }],
             }
         });
         let payload = click_payload(&envelope).unwrap();
         assert_eq!(
             payload,
-            serde_json::json!({ "context": { "type": "ADMIN_APPROVAL_REQUEST", "ticketId": "abc" } })
+            serde_json::json!({ "context": {
+                "type": "ADMIN_APPROVAL_REQUEST",
+                "ticketId": "abc",
+                "approvalRequestId": "0a2a0b3c-9d1e-4f5a-8b7c-6d5e4f3a2b1c",
+            } })
         );
         assert!(click_uri(Some(&payload)).len() < 2048);
     }

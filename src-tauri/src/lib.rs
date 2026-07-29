@@ -1,3 +1,8 @@
+// Both are macOS-only: the background notification actions that need the chat
+// API only exist there (Windows toast activation cannot run one without a COM
+// activator).
+#[cfg(target_os = "macos")]
+mod chat_api;
 #[cfg(target_os = "macos")]
 mod macos_un;
 mod nats;

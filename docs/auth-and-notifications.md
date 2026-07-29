@@ -139,6 +139,21 @@ cold-starts the app, went nowhere.
 - **macOS dev builds and Linux** have no backend. The notification APIs abort
   without a bundle identifier, so test notifications against a built app.
 
+> **A built `.app` is not enough on macOS — it has to be signed.** `tauri build`
+> ships the bundle carrying only the linker's ad-hoc signature (`codesign -dv`
+> reports `flags=…(adhoc,linker-signed)` and an `Identifier` derived from the
+> binary name, not `com.openframe.desktop`). UserNotifications refuses to serve
+> an app it cannot identify: `requestAuthorization` **and** every
+> `addNotificationRequest` fail with `UNErrorDomain error 1`
+> (`UNErrorCodeNotificationsNotAllowed`), which reads in the log as
+> "authorization failed" followed by "request rejected" for each notification —
+> the plane is otherwise working, envelopes arrive and are dispatched. Signing the
+> bundle with any real identity fixes it:
+> `codesign --force --sign "Apple Development: …" path/to/OpenFrame.app`, after
+> which `codesign -dv` shows `Identifier=com.openframe.desktop`. Every fresh build
+> needs it again — signing runs against the produced artifact, which is why it is
+> not in the Makefile.
+
 A cold-start click fires long before the webview's listener mounts, so all paths
 funnel through a stash: the payload is parked until the webview signals readiness,
 which drains it and opens the gate for direct delivery. The gate closes again on

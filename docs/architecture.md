@@ -50,11 +50,21 @@ server would have:
   dev-ticket observer flag. This is what `next-runtime-env` reads; export builds
   omit `<PublicEnvScript />`. `NEXT_PUBLIC_TENANT_HOST_URL` is deliberately
   **absent**, so the frontend falls through to the tenant host learned at login.
-- A minimal **Capacitor-compatible bridge**: `window.Capacitor.isNativePlatform()`
-  returns true and `Plugins.NativeAuth` is backed by the `native_auth_*` Tauri
-  commands. The frontend's native-shell layer therefore treats desktop exactly
-  like the mobile shell — bearer auth, plugin-held tokens — with no
-  desktop-specific frontend code.
+- **`window.__OPENFRAME_SHELL__.nativeAuth`** — the auth bridge, backed by the
+  `native_auth_*` Tauri commands. Its method names match openframe-mobile's
+  `NativeAuthPlugin`, so the frontend keeps one interface with two
+  implementations and desktop gets the same treatment as mobile — bearer auth,
+  shell-held tokens — with no desktop-specific frontend code.
+
+  This used to be injected as a **fake `window.Capacitor`** whose
+  `isNativePlatform()` returned true, because the frontend had a single
+  "is this native?" predicate that both shells had to satisfy. The frontend now
+  distinguishes all three targets itself (`lib/platform.ts` — web / mobile /
+  desktop, detecting us from Tauri's IPC globals), so nothing here impersonates
+  Capacitor, and phone-only features (FCM push, biometrics, safe-area insets,
+  Android back) can no longer switch on in a desktop window. Renaming or dropping
+  this namespace kills desktop sign-in: keep it in sync with `nativeAuthPlugin()`
+  in the frontend.
 
 ## Hosts
 

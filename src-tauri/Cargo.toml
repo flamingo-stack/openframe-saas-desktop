@@ -43,15 +43,19 @@ windows = { version = "0.61", features = ["Data_Xml_Dom", "UI_Notifications"] }
 winreg = "0.52"
 
 # UNUserNotificationCenter backend (clicks survive the process, unlike the
-# deprecated NSUserNotificationCenter path).
+# deprecated NSUserNotificationCenter path), plus the NSWorkspace wake
+# notification the token refresh hangs off.
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
 objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", features = ["NSWorkspace"] }
 objc2-foundation = { version = "0.3.2", features = [
     "NSArray",
     "NSBundle",
     "NSDictionary",
     "NSError",
+    "NSNotification",
+    "NSOperation",
     "NSSet",
     "NSString",
 ] }

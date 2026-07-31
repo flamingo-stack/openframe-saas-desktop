@@ -32,6 +32,11 @@ use crate::{show_primary_window, tokens, MAIN_LABEL};
 /// Consumed by `onNativeNotificationClick` in the frontend's native-shell.ts —
 /// a rename here silently stops routing there.
 const CLICK_EVENT: &str = "notification:click";
+/// Length limit for text the shell did not write: an incoming envelope's
+/// `description` and the gateway's error text. A body the shell composes itself
+/// is deliberately exempt — a failed reply's banner carries the user's own
+/// words, and trimming those would discard the only copy left.
+pub(crate) const BODY_CHARS: usize = 140;
 /// Custom URI scheme Windows toasts activate through, registered under HKCU at
 /// startup by `crate::register_url_scheme`. Windows-only: every other platform
 /// delivers clicks in-process (macOS) or not at all.
@@ -177,7 +182,7 @@ fn maybe_notify(app: &AppHandle, envelope: &serde_json::Value, user_id: &str) {
         return;
     }
     let body = string_field(envelope, "description")
-        .map(|d| truncate_for_notification(&d, 140))
+        .map(|d| truncate_for_notification(&d, BODY_CHARS))
         .unwrap_or_default();
     let click = click_payload(envelope);
 
@@ -431,7 +436,7 @@ fn set_badge(app: &AppHandle, count: u32) {
     }
 }
 
-fn string_field(value: &serde_json::Value, key: &str) -> Option<String> {
+pub(crate) fn string_field(value: &serde_json::Value, key: &str) -> Option<String> {
     value
         .get(key)
         .and_then(|v| v.as_str())
@@ -439,7 +444,7 @@ fn string_field(value: &serde_json::Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn truncate_for_notification(text: &str, max: usize) -> String {
+pub(crate) fn truncate_for_notification(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_string();
     }

@@ -15,11 +15,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_nats::{Client, Event};
-use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+use percent_encoding::utf8_percent_encode;
 use tauri::{AppHandle, Manager};
 use tokio::sync::RwLock;
 
-use crate::{load_config, notifications, tokens};
+use crate::{load_config, notifications, tenant_host, tokens, UNRESERVED};
 
 /// NATS client name, as it shows up server-side.
 const CLIENT_NAME: &str = "openframe-desktop";
@@ -59,15 +59,21 @@ struct Connector {
 /// Tenant gateway to dial — the notification subject is per-user on the
 /// tenant's NATS, not the shared auth host. None until login learns it.
 async fn read_server_url(app: &AppHandle) -> Option<String> {
-    load_config(app).learned_host.filter(|s| !s.is_empty())
+    tenant_host(&load_config(app))
 }
 
-/// Fresh bearer for the `?authorization=` query param. None = not signed in
-/// yet. `ensure_fresh` refreshes an expiring token inline, so a reconnect
-/// after hours in the tray (or laptop sleep) dials with a valid token instead
-/// of waiting for the background poll.
+/// Bearer for the `?authorization=` query param. None = not signed in yet.
+///
+/// Reads what is stored and asks for a rotation in the background rather than
+/// awaiting one. Awaiting it put a token rotation inside this reconnect loop,
+/// which is the worst place for one: a reconnect means the network just broke,
+/// and a rotation whose response is lost costs the whole session (the gateway
+/// retires the presented refresh token with no grace window). A rejected dial is
+/// cheap by comparison — it backs off and retries, by which time the rotation
+/// this kicked off has landed.
 async fn read_token(app: &AppHandle) -> Option<String> {
-    tokens::ensure_fresh(app).await.access_token
+    tokens::refresh_soon(app, "NATS needs a bearer");
+    tokens::load_tokens(app).access_token
 }
 
 /// Spawn the connect/reconnect lifecycle. Call once, after
@@ -148,8 +154,6 @@ async fn run(connector: Arc<Connector>) {
     let app = connector.app.clone();
 
     loop {
-        // Both in one pass: read_token runs a token read + possible HTTP
-        // refresh, so probing and then re-fetching would do that work twice.
         let (server_url, token) = loop {
             match (read_server_url(&app).await, read_token(&app).await) {
                 (Some(url), Some(token)) => break (url, token),
@@ -315,12 +319,6 @@ fn reconnect_delay(attempt: usize) -> Duration {
 /// Everything except RFC 3986 unreserved characters gets percent-encoded — a
 /// no-op for JWTs, and the same output the web client's URLSearchParams
 /// produces for this query param.
-const QUERY_VALUE: &AsciiSet = &NON_ALPHANUMERIC
-    .remove(b'-')
-    .remove(b'_')
-    .remove(b'.')
-    .remove(b'~');
-
 fn build_connect_url(server_url: &str, token: &str) -> String {
     let (scheme, host) = match server_url.strip_prefix("http://") {
         Some(h) => ("ws", h),
@@ -330,7 +328,7 @@ fn build_connect_url(server_url: &str, token: &str) -> String {
         ),
     };
     let host = host.trim_end_matches('/');
-    let token = utf8_percent_encode(token, QUERY_VALUE);
+    let token = utf8_percent_encode(token, UNRESERVED);
     format!("{scheme}://{host}{WS_PATH}?authorization={token}")
 }
 

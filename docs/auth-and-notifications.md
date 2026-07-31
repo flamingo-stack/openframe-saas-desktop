@@ -36,25 +36,68 @@ what must survive idle:
 - **Freshness.** The access token's JWT `exp` is decoded without signature
   verification — it is a scheduling hint about our own token, nothing more. A
   refresh is due when a refresh token exists and the access token is missing or
-  expires within 60 seconds.
+  expires within 120 seconds. That margin is squeezed from both sides: it must
+  span several poll ticks (App Nap coalesces a hidden app's timers, and a margin
+  the poll can skip entirely lets the access token die), yet stay a small
+  fraction of the token's 900-second life, because every rotation is a chance to
+  lose the session — see the hazard note below.
 - **Refresh.** `POST {base}/oauth/refresh` with the `Refresh-Token` header;
   rotated tokens come back on the `Access-Token`/`Refresh-Token` response
   headers. `tenantId` is omitted — the gateway resolves the tenant from the token.
   Base resolution is the shared auth host, falling back to the learned tenant
   host.
-- **Single-flight.** A mutex serializes refreshes. Forced refreshes (delegated
-  from a webview 401) are dampened by comparing the pre-call access token: if it
-  changed while waiting for the lock, a parallel refresh already rotated it.
+- **Single-flight.** A mutex serializes refreshes, and every write to
+  `tokens.json` takes it — including the webview's `setTokens`, which would
+  otherwise be able to land a read-merge-write on top of a rotation that
+  completed in between and restore a spent refresh token.
+- **Retries, and what may not be retried.** A refresh is not idempotent, so the
+  three failure modes are kept apart: *unreached* (DNS, connect, TLS — the
+  gateway never saw it) is retried after 1s and 3s; *rejected* (401/403) is final
+  on the first answer, since re-presenting the same token cannot change it; and
+  *unknown* (a broken or timed-out response, a 5xx, a 200 with no token headers)
+  is never retried, because a retry can only turn "maybe rotated" into a
+  rejection.
 - **Outcome contract**, consumed by the frontend's delegation: rotated → tokens;
-  session over (401/403) → tokens cleared, empty set returned; transient failure
-  (network, 5xx, no headers) → error, stored tokens kept.
+  session over (rejected, or a rotation that could not be written to disk) →
+  tokens cleared, empty set returned; unreached/unknown → error, stored tokens
+  kept. The `refreshTokens` command softens the last case before the webview sees
+  it: it resolves with the stored tokens instead of rejecting, because the
+  frontend maps every refresh that yields no access token to `forceLogout`, and
+  that deletes a refresh token which is good for days. Deciding a session is over
+  stays here, where custody is.
 - **Background loop.** A 30-second freshness poll rather than a scheduled timer,
-  because polling self-heals across laptop sleep/wake.
+  because polling self-heals across laptop sleep/wake. It backs off while
+  refreshes keep failing, up to 16× the interval.
+- **Wake and window-show.** macOS `NSWorkspaceDidWakeNotification`
+  (`macos_wake.rs`) and showing the main window both nudge a refresh. A machine
+  that slept through the access token's whole life comes back with every overdue
+  timer firing at once, the webview's among them; getting ahead of that is
+  cheaper than letting its first 401 drive the recovery.
 - **Push to webview.** Every shell-side token change emits
   `native-auth:token-update` to all bundle windows, so the webview's cache mirrors
   rotations and session death.
 - **Fresh on read.** `getTokens` refreshes first when the token is expiring, so
   the app resumes instantly after long idle instead of a 401→refresh round trip.
+  `ensure_fresh` (awaits the rotation) is for callers with a person waiting;
+  background reconnect loops use `refresh_soon` (fires it off) instead.
+
+> **Every rotation is a chance to lose the session.** The authorization server
+> issues rotating refresh tokens (`reuseRefreshTokens(false)`) and retires the
+> presented one the moment it mints the next, with no grace window. So a refresh
+> whose *response* is lost — connection broken mid-answer, which is what a Wi-Fi
+> transition looks like — leaves this side holding a token the server has already
+> retired. There is no client-side recovery: the next refresh is rejected and the
+> user signs in again. Observed on 2026-07-29 at 23:04, five seconds apart: a POST
+> that went out with no answer back, then a 401 on the same token.
+>
+> What the shell can do, and does: never retry an unknown outcome, keep rotations
+> as infrequent as the margin allows, keep them out of reconnect loops (which run
+> exactly when the network cannot deliver an answer), and name the case in the log
+> when a rejection follows a lost answer instead of reporting it as a revoked
+> session. What it cannot do is make a lost rotation recoverable. That needs the
+> authorization server to accept the previous refresh token for a few seconds
+> after rotation and re-issue the same pair — the standard mitigation for this
+> hazard, and the only fix that removes it.
 
 > **The refresh POST sends a body on purpose.** reqwest/hyper omit
 > `Content-Length` for bodyless POSTs — *and* for an explicit zero-length body.
@@ -73,7 +116,7 @@ The bridge is shell-agnostic; the frontend feature-detects each method.
 |---|---|
 | `start` / `exchangeTicket` | OAuth in a shell-owned window, then a native token exchange — the response headers carrying tokens are invisible to a cross-origin webview fetch. |
 | `get` / `set` / `clearTokens` | `set` merges per field: a rotation response may carry one token or both. |
-| `refreshTokens` | Optional. Its presence means "the shell owns refresh", and the webview stops calling the refresh endpoint entirely. |
+| `refreshTokens` | Optional. Its presence means "the shell owns refresh", and the webview stops calling the refresh endpoint entirely. Rejects only when there is genuinely nothing to refresh with — a rejection is a logout on the frontend side. |
 | `setTenantHost` | Persists the login-learned tenant origin shell-side, so shell networking has a gateway without depending on webview storage. |
 
 Login accepts **any** callback URL carrying a dev ticket, checked in both the
@@ -94,6 +137,11 @@ dials with a fresh bearer.
 - Credentials are read before every dial. A capped exponential backoff, plus a
   separate guard on consecutive auth failures — without it a revoked token
   re-dials with full TLS+WS handshakes every ~200 ms forever.
+- The dial reads the *stored* bearer and kicks a rotation off in the background
+  rather than awaiting one. Awaiting it put a rotation inside this loop, which
+  runs precisely when the network has just broken — the one condition under which
+  a rotation's answer goes missing and the session is unrecoverable. A rejected
+  dial costs a backoff; a lost rotation costs the login.
 - On every `Connected` the subscription is re-established, because the subject
   changes when the signed-in user does.
 - Sign-in on the same tenant re-subscribes on the live connection; a tenant switch

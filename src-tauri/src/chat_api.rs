@@ -9,22 +9,16 @@
 
 use std::time::Duration;
 
-use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+use percent_encoding::utf8_percent_encode;
 use tauri::AppHandle;
 
-use crate::{load_config, tokens};
+use crate::{
+    load_config,
+    notifications::{truncate_for_notification, BODY_CHARS},
+    tenant_host, tokens, UNRESERVED,
+};
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
-/// An error body ends up in a notification banner, which shows a few lines.
-const MAX_ERROR_CHARS: usize = 160;
-
-/// RFC 3986 unreserved set: ids are interpolated into the path, so anything
-/// else is escaped rather than trusted to be a UUID.
-const PATH_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
-    .remove(b'-')
-    .remove(b'_')
-    .remove(b'.')
-    .remove(b'~');
 
 /// A live signed-in session: a usable bearer and the user it belongs to.
 /// Obtained through [`active_session`] — constructing one is the shell's proof
@@ -64,7 +58,7 @@ pub(crate) async fn resolve_approval(
 ) -> Result<(), String> {
     let path = format!(
         "/chat/api/v1/approval-requests/{}/approve",
-        utf8_percent_encode(request_id, PATH_SEGMENT)
+        utf8_percent_encode(request_id, UNRESERVED)
     );
     post_json(
         app,
@@ -103,10 +97,8 @@ async fn post_json(
     path: &str,
     body: serde_json::Value,
 ) -> Result<(), String> {
-    let base = load_config(app)
-        .learned_host
-        .filter(|host| !host.is_empty())
-        .ok_or("this install has not learned a tenant host yet")?;
+    let base =
+        tenant_host(&load_config(app)).ok_or("this install has not learned a tenant host yet")?;
 
     let client = reqwest::Client::builder()
         .timeout(HTTP_TIMEOUT)
@@ -131,6 +123,15 @@ async fn post_json(
         log::info!("[chat-api] POST {path}: HTTP {status}");
         return Ok(());
     }
+    // 401 means the gateway rejected a token `active_session` considered live —
+    // revoked, or its signing key rotated, neither of which `exp` predicts. Say
+    // that, rather than quoting a status line: the user's move is to open the
+    // app. A 403 is a different verdict (wrong tenant, subscription state) and
+    // carries its own message, so it falls through to the body below.
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        log::warn!("[chat-api] POST {path} rejected: HTTP {status} — session no longer accepted");
+        return Err("this session is no longer valid — open OpenFrame and sign in again".into());
+    }
     // Body only at debug: an error message can quote user content.
     let reason = response.text().await.ok().and_then(|raw| {
         log::debug!("[chat-api] error body: {raw}");
@@ -145,20 +146,11 @@ async fn post_json(
 /// nobody.
 fn error_message(body: &str) -> Option<String> {
     let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
-    let text = ["message", "error"]
-        .into_iter()
-        .find_map(|key| parsed.get(key)?.as_str())
-        .map(str::trim)
-        .filter(|text| !text.is_empty())?;
-    if text.chars().count() <= MAX_ERROR_CHARS {
-        return Some(text.to_string());
-    }
-    Some(
-        text.chars()
-            .take(MAX_ERROR_CHARS - 1)
-            .chain(std::iter::once('…'))
-            .collect(),
-    )
+    let text = ["message", "error"].into_iter().find_map(|key| {
+        let text = parsed.get(key)?.as_str()?.trim();
+        (!text.is_empty()).then_some(text)
+    })?;
+    Some(truncate_for_notification(text, BODY_CHARS))
 }
 
 #[cfg(test)]
@@ -183,7 +175,7 @@ mod tests {
     fn error_message_is_bounded() {
         let long = format!(r#"{{"message":"{}"}}"#, "x".repeat(4096));
         let message = error_message(&long).unwrap();
-        assert_eq!(message.chars().count(), MAX_ERROR_CHARS);
+        assert_eq!(message.chars().count(), BODY_CHARS);
         assert!(message.ends_with('…'));
     }
 }

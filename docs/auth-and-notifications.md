@@ -197,7 +197,7 @@ cold-starts the app, went nowhere.
 > "authorization failed" followed by "request rejected" for each notification —
 > the plane is otherwise working, envelopes arrive and are dispatched. Signing the
 > bundle with any real identity fixes it:
-> `codesign --force --sign "Apple Development: …" path/to/OpenFrame.app`, after
+> `codesign --force --sign "Apple Development: …" "path/to/OpenFrame Desktop.app"`, after
 > which `codesign -dv` shows `Identifier=com.openframe.desktop`. Every fresh build
 > needs it again — signing runs against the produced artifact, which is why it is
 > not in the Makefile.

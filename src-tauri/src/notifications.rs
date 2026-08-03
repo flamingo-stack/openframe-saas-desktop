@@ -10,9 +10,14 @@
 //     userInfo.
 //   - Windows: toasts activate an `openframe-desktop://notify` URI, which
 //     reaches a running instance through single-instance argv forwarding or
-//     launches the app cold (`handle_notification_uri`).
+//     launches the app cold (`handle_notification_uri`). Their action buttons
+//     take the other route, through the COM activator (`windows_activator`).
 //   - macOS dev builds (unbundled — UN APIs abort there) and other platforms
 //     have no OS notification backend.
+//
+// On both desktop platforms a notification that carries an actionable context
+// gets buttons that complete the work with no window and no webview; what they
+// do, and the session gate they do it under, is `notification_actions`.
 //
 // Unlike chat, the shell does not map notifications to routes: the payload
 // forwarded on `notification:click` is the envelope's `context` in wire shape,
@@ -62,9 +67,10 @@ struct SubscriptionSlot {
     task: tauri::async_runtime::JoinHandle<()>,
 }
 
-/// Register the plane's state and, on macOS, the notification-center delegate.
-/// Must run before `crate::nats::spawn`, whose Connected handler subscribes
-/// through this module.
+/// Register the plane's state and the platform's click/action backend — the
+/// notification-center delegate on macOS, the COM activator on Windows. Must run
+/// before `crate::nats::spawn`, whose Connected handler subscribes through this
+/// module.
 pub(crate) fn init(app: &AppHandle) {
     app.manage(NotificationsPlane {
         subscription: tokio::sync::Mutex::new(None),
@@ -74,6 +80,8 @@ pub(crate) fn init(app: &AppHandle) {
     });
     #[cfg(target_os = "macos")]
     crate::macos_un::init(app);
+    #[cfg(target_os = "windows")]
+    crate::windows_activator::init(app);
 }
 
 /// Runs on every NATS Connected event. async-nats replays plain SUBs across
@@ -170,8 +178,9 @@ async fn notification_router(
 /// webview's own subscription drives the in-app drawer either way).
 ///
 /// `user_id` is the subject's user — whoever the notification was delivered to.
-/// It rides along to macOS so an action taken hours later can refuse to run
-/// under a different session (see `macos_un::run_action`).
+/// It rides along to the platform backend so an action taken hours later can
+/// refuse to run under a different session (see
+/// `notification_actions::run_action`).
 fn maybe_notify(app: &AppHandle, envelope: &serde_json::Value, user_id: &str) {
     let Some(title) = string_field(envelope, "title") else {
         log::debug!("[notifications] ignoring envelope without title");
@@ -190,40 +199,17 @@ fn maybe_notify(app: &AppHandle, envelope: &serde_json::Value, user_id: &str) {
     let unread = plane.unread.fetch_add(1, Ordering::Relaxed) + 1;
     set_badge(app, unread);
 
-    #[cfg(target_os = "macos")]
-    crate::macos_un::fire(title, body, click, user_id.to_string());
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
-        // No background activation on Windows — its toasts only carry the click
-        // URI, so there is nothing to bind a session to.
-        let _ = user_id;
-        fire_toast(app, title, body, click);
+        use crate::notification_actions::{kind_for, post};
+        let kind = kind_for(click.as_ref());
+        post(app, title, body, click, Some(user_id.to_string()), kind);
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = (title, body, click, user_id);
         log::debug!("[notifications] no OS notification backend on this platform");
     }
-}
-
-#[cfg(target_os = "windows")]
-fn fire_toast(app: &AppHandle, title: String, body: String, click: Option<serde_json::Value>) {
-    // Dev builds have no registered AUMID; PowerShell's works out of the box.
-    const POWERSHELL_APP_ID: &str =
-        "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe";
-    let app_id = if tauri::is_dev() {
-        POWERSHELL_APP_ID.to_string()
-    } else {
-        app.config().identifier.clone()
-    };
-    let uri = click_uri(click.as_ref());
-
-    std::thread::spawn(
-        move || match crate::windows_toast::show(&app_id, &title, &body, &uri) {
-            Ok(()) => log::info!("[notifications] toast fired: {title}"),
-            Err(err) => log::warn!("[notifications] toast show failed: {err:?}"),
-        },
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -233,12 +219,12 @@ fn fire_toast(app: &AppHandle, title: String, body: String, click: Option<serde_
 /// The webview's `notification:click` payload: the envelope's routing context
 /// in wire shape, which the frontend's `resolveNatsNotificationRoute` maps to a
 /// route. Only the fields that mapping reads — plus `approvalRequestId`, which
-/// the macOS Approve/Reject buttons resolve against the chat API — survive. The
-/// rest of `context` can be arbitrarily large (an approval request carries the
-/// whole `toolCalls` array), and it has to fit in a Windows activation URI,
-/// which the shell truncates at ~2 KB; every id kept here is a UUID. `None`
-/// when the envelope points at nothing openable; the click then only raises the
-/// window.
+/// the Approve/Reject buttons resolve against the chat API — survive. The rest
+/// of `context` can be arbitrarily large (an approval request carries the whole
+/// `toolCalls` array), and it has to fit both in a Windows activation URI and in
+/// a toast payload that repeats it once per button; every id kept here is a
+/// UUID. `None` when the envelope points at nothing openable; the click then
+/// only raises the window.
 fn click_payload(envelope: &serde_json::Value) -> Option<serde_json::Value> {
     let context = envelope.get("context")?;
     let routing: serde_json::Map<_, _> = ["type", "ticketId", "dialogId", "approvalRequestId"]
@@ -250,7 +236,7 @@ fn click_payload(envelope: &serde_json::Value) -> Option<serde_json::Value> {
 
 /// `openframe-desktop://notify?context=<percent-encoded JSON>`.
 #[cfg(any(target_os = "windows", test))]
-fn click_uri(click: Option<&serde_json::Value>) -> String {
+pub(crate) fn click_uri(click: Option<&serde_json::Value>) -> String {
     use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
     match click.and_then(|c| c.get("context")) {
         Some(context) => format!(
@@ -273,7 +259,16 @@ fn parse_click_uri(uri: &str) -> Option<serde_json::Value> {
     let json = percent_encoding::percent_decode_str(encoded)
         .decode_utf8()
         .ok()?;
-    let context: serde_json::Value = serde_json::from_str(&json).ok()?;
+    payload_from_context_json(&json)
+}
+
+/// Wrap a decoded `context` object back into the shape every click path carries
+/// it in. Both Windows activation transports land here — the URI a toast body
+/// activates and the arguments a toast button carries — so the envelope shape
+/// the webview and `kind_for` depend on is asserted once.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn payload_from_context_json(json: &str) -> Option<serde_json::Value> {
+    let context: serde_json::Value = serde_json::from_str(json).ok()?;
     context
         .is_object()
         .then(|| serde_json::json!({ "context": context }))

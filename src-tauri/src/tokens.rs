@@ -158,8 +158,8 @@ pub(crate) fn jwt_claim_str(token: &str, claim: &str) -> Option<String> {
 
 /// True once the access token's `exp` has passed. Unparseable `exp` counts as
 /// live, same convention as [`needs_refresh`] — that is the 401 path's problem.
-/// Used by the macOS notification actions, which must not act on a dead session.
-#[cfg(target_os = "macos")]
+/// Used by the notification actions, which must not act on a dead session.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub(crate) fn is_expired(token: &str) -> bool {
     jwt_exp_secs(token).is_some_and(|exp| now_secs() >= exp)
 }
@@ -573,7 +573,7 @@ mod tests {
         assert!(!retryable(&Outcome::Rotated(NativeAuthTokens::default())));
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     #[test]
     fn an_expired_token_is_expired_and_a_live_one_is_not() {
         assert!(is_expired(&token_expiring_in(-1)));

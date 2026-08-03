@@ -1,8 +1,8 @@
 // Authenticated chat-service calls the shell makes on its own, with no webview
-// involved: the macOS notification action buttons (approve/reject an AI tool
-// request, reply to a Mingo message) complete here, so the decision never has
-// to open a window. Same endpoints and payloads as the frontend's
-// mingo-api-service, in bearer mode.
+// involved: the notification action buttons (approve/reject an AI tool request,
+// reply to a Mingo message) complete here, so the decision never has to open a
+// window. Same endpoints and payloads as the frontend's mingo-api-service, in
+// bearer mode.
 //
 // Base is the **tenant** host learned at login (`learned_host`), not the shared
 // auth host: /chat lives on the tenant gateway.

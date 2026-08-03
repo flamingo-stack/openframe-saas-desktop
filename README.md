@@ -122,7 +122,10 @@ src-tauri/
   src/tokens.rs       token custody, refresh, rotation events
   src/nats.rs         NATS-over-WebSocket connection lifecycle
   src/notifications.rs  subscription, dispatch, click delivery
+  src/notification_actions.rs  what a notification button does, and its session gate
+  src/chat_api.rs     the REST calls a button completes without a window
   src/macos_un.rs     UNUserNotificationCenter backend
-  src/windows_toast.rs  protocol-activation toasts
+  src/windows_toast.rs  toast XML + the button-argument codec
+  src/windows_activator.rs  COM activator the toast buttons activate
 www/                  staged frontend bundle (generated, git-ignored)
 ```

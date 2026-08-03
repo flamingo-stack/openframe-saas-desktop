@@ -11,8 +11,9 @@
 //
 // Notifications that carry an actionable context get buttons that complete the
 // work without opening a window: Approve/Reject on an AI tool-approval request,
-// inline Reply on a Mingo message. Those run as REST calls in `chat_api`, under
-// the session gate in `run_action`.
+// inline Reply on a Mingo message. What this file owns of that is the macOS
+// half — categories, the delegate, and decoding a response; the decision itself
+// and its session gate live in `notification_actions`, shared with Windows.
 //
 // UN APIs abort in processes without a bundle identifier, so `init` refuses to
 // activate for dev builds (`tauri dev` runs a bare binary) — those have no OS
@@ -39,8 +40,8 @@ use objc2_user_notifications::{
 use tauri::AppHandle;
 
 use crate::{
-    chat_api,
-    notifications::{deliver_click, string_field},
+    notification_actions::{Action, ActionContext, ActionKind},
+    notifications::deliver_click,
 };
 
 /// Keeps its original id: notifications already sitting in Notification Center
@@ -53,11 +54,6 @@ const OPEN_ACTION_ID: &str = "open";
 const APPROVE_ACTION_ID: &str = "approve";
 const REJECT_ACTION_ID: &str = "reject";
 const REPLY_ACTION_ID: &str = "reply";
-
-/// Envelope `context.type` values that earn action buttons. The rest of the set
-/// (tickets, client chats) has no action the shell can complete on its own.
-const APPROVAL_CONTEXT_TYPE: &str = "ADMIN_APPROVAL_REQUEST";
-const MESSAGE_CONTEXT_TYPE: &str = "ADMIN_AI_MESSAGE";
 
 const PAYLOAD_KEY: &str = "of-click-payload";
 /// The user the notification was delivered to, stamped at fire time. An action
@@ -131,21 +127,17 @@ pub(crate) fn ensure_authorized() {
         );
 }
 
-/// Fire an incoming notification. `user_id` is the subscription's user, stamped
-/// into `userInfo` so a button pressed hours later can check it still matches
-/// the signed-in session.
-pub(crate) fn fire(title: String, body: String, click: Option<serde_json::Value>, user_id: String) {
-    let category = category_for(click.as_ref());
-    post(title, body, click, Some(user_id), category.to_string());
-}
-
-fn post(
+/// Post a notification. `user_id` is the user it is delivered to, stamped into
+/// `userInfo` so a button pressed hours later can check it still matches the
+/// signed-in session; a follow-up that reports an action's outcome carries none.
+pub(crate) fn post(
     title: String,
     body: String,
     click: Option<serde_json::Value>,
     user_id: Option<String>,
-    category: String,
+    kind: ActionKind,
 ) {
+    let category = category_for(kind).to_string();
     if !active() {
         log::debug!("[notifications] UN backend inactive (dev/unbundled build) — dropping");
         return;
@@ -204,17 +196,11 @@ fn post(
     });
 }
 
-/// Which button set a notification gets. Derived from the click payload rather
-/// than passed in, so cross-platform code never has to know about macOS
-/// category ids. Buttons are only offered when the id the action needs actually
-/// survived the payload projection.
-fn category_for(click: Option<&serde_json::Value>) -> &'static str {
-    match context_str(click, "type").as_deref() {
-        Some(APPROVAL_CONTEXT_TYPE) if context_str(click, "approvalRequestId").is_some() => {
-            CATEGORY_APPROVAL
-        }
-        Some(MESSAGE_CONTEXT_TYPE) if context_str(click, "dialogId").is_some() => CATEGORY_MESSAGE,
-        _ => CATEGORY_DEFAULT,
+fn category_for(kind: ActionKind) -> &'static str {
+    match kind {
+        ActionKind::Approval => CATEGORY_APPROVAL,
+        ActionKind::Message => CATEGORY_MESSAGE,
+        ActionKind::Default => CATEGORY_DEFAULT,
     }
 }
 
@@ -245,7 +231,8 @@ fn register_categories(center: &UNUserNotificationCenter) {
     };
     // AuthenticationRequired is the device-lock gate only; the gate that
     // matters — that a signed-in session still owns this notification — is
-    // enforced in `run_action`, because macOS has no notion of our session.
+    // enforced in `notification_actions::run_action`, because macOS has no
+    // notion of our session.
     let approve = UNNotificationAction::actionWithIdentifier_title_options(
         &NSString::from_str(APPROVE_ACTION_ID),
         &NSString::from_str("Approve"),
@@ -285,68 +272,24 @@ fn register_categories(center: &UNUserNotificationCenter) {
 // Response routing
 // ---------------------------------------------------------------------------
 
-enum Action {
-    Approve,
-    Reject,
-    Reply(String),
-}
-
-impl Action {
-    /// Success banner title.
-    fn done(&self) -> &'static str {
-        match self {
-            Action::Approve => "Approved",
-            Action::Reject => "Rejected",
-            Action::Reply(_) => "Reply sent",
-        }
-    }
-
-    fn verb(&self) -> &'static str {
-        match self {
-            Action::Approve => "approve",
-            Action::Reject => "reject",
-            Action::Reply(_) => "send the reply",
-        }
-    }
-
-    /// Failure banner body. A failed reply carries the text back: responding to
-    /// the notification cleared the inline field, so this is the only copy left.
-    fn failed(&self, reason: &str) -> String {
-        let line = format!("Could not {} — {reason}.", self.verb());
-        match self {
-            Action::Reply(text) => format!("{line} Your reply: {text}"),
-            _ => line,
-        }
-    }
-}
-
 /// Everything a background action needs, lifted out of the ObjC response before
 /// the async work starts — none of it can cross a thread boundary otherwise.
-/// Keeping the original title and category also lets a failure re-post the
-/// notification still actionable, so the decision is not lost.
-struct ActionContext {
-    title: String,
-    category: String,
-    payload: Option<serde_json::Value>,
-    user_id: Option<String>,
-}
-
-impl ActionContext {
-    fn from_response(response: &UNNotificationResponse) -> Self {
-        let content = response.notification().request().content();
-        let user_info = content.userInfo();
-        Self {
-            title: content.title().to_string(),
-            category: content.categoryIdentifier().to_string(),
-            payload: user_info_str(&user_info, PAYLOAD_KEY)
-                .and_then(|json| serde_json::from_str(&json).ok()),
-            user_id: user_info_str(&user_info, USER_KEY),
-        }
+/// The category identifier is deliberately not read back: the button set a
+/// re-post needs is derived from the payload, which is where the category came
+/// from at fire time.
+fn action_context(response: &UNNotificationResponse) -> ActionContext {
+    let content = response.notification().request().content();
+    let user_info = content.userInfo();
+    ActionContext {
+        title: content.title().to_string(),
+        payload: user_info_str(&user_info, PAYLOAD_KEY)
+            .and_then(|json| serde_json::from_str(&json).ok()),
+        user_id: user_info_str(&user_info, USER_KEY),
     }
 }
 
 fn handle_response(app: &AppHandle, action_id: &str, response: &UNNotificationResponse) {
-    let context = ActionContext::from_response(response);
+    let context = action_context(response);
     let action = match action_id {
         APPROVE_ACTION_ID => Action::Approve,
         REJECT_ACTION_ID => Action::Reject,
@@ -373,76 +316,7 @@ fn handle_response(app: &AppHandle, action_id: &str, response: &UNNotificationRe
         }
     };
 
-    let app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        report(&context, &action, run_action(&app, &context, &action).await);
-    });
-}
-
-/// The session gate. A notification sitting in Notification Center is not
-/// authority to act on anything: the shell acts only while the user it was
-/// delivered to is still signed in, so an approval cannot be granted from a
-/// signed-out app, and a stale notification cannot act under whoever signed in
-/// after (the notification plane keeps running across a user switch on the same
-/// machine).
-async fn run_action(
-    app: &AppHandle,
-    context: &ActionContext,
-    action: &Action,
-) -> Result<(), String> {
-    let session = chat_api::active_session(app)
-        .await
-        .ok_or("no one is signed in — open OpenFrame and sign in, then try again")?;
-    if context.user_id.as_deref() != Some(session.user_id.as_str()) {
-        return Err("this notification belongs to a different account".into());
-    }
-
-    match action {
-        Action::Approve | Action::Reject => {
-            let request_id = context_str(context.payload.as_ref(), "approvalRequestId")
-                .ok_or("this notification carries no approval request")?;
-            let approve = matches!(action, Action::Approve);
-            chat_api::resolve_approval(app, &session, &request_id, approve).await
-        }
-        Action::Reply(text) => {
-            let dialog_id = context_str(context.payload.as_ref(), "dialogId")
-                .ok_or("this notification carries no conversation")?;
-            chat_api::send_message(app, &session, &dialog_id, text).await
-        }
-    }
-}
-
-/// A background action has no window to report into, so the outcome comes back
-/// as another notification. Failures re-post the original — same category, same
-/// payload — so the buttons are still there to retry with.
-fn report(context: &ActionContext, action: &Action, outcome: Result<(), String>) {
-    match outcome {
-        Ok(()) => post(
-            action.done().to_string(),
-            context.title.clone(),
-            context.payload.clone(),
-            None,
-            CATEGORY_DEFAULT.to_string(),
-        ),
-        Err(reason) => {
-            // The reason quotes the gateway, which can quote user content —
-            // same policy as chat_api's error bodies, so it stays at debug.
-            log::warn!("[notifications] could not {}", action.verb());
-            log::debug!("[notifications] {} failed: {reason}", action.verb());
-            post(
-                context.title.clone(),
-                action.failed(&reason),
-                context.payload.clone(),
-                context.user_id.clone(),
-                context.category.clone(),
-            )
-        }
-    }
-}
-
-/// A string field of the click payload's `context`, if present and non-empty.
-fn context_str(click: Option<&serde_json::Value>, key: &str) -> Option<String> {
-    string_field(click?.pointer("/context")?, key)
+    crate::notification_actions::spawn(app, context, action);
 }
 
 fn user_info_str(user_info: &NSDictionary, key: &str) -> Option<String> {
@@ -510,57 +384,5 @@ impl NotificationDelegate {
     fn new() -> Retained<Self> {
         let this = Self::alloc().set_ivars(());
         unsafe { msg_send![super(this), init] }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn click(context: serde_json::Value) -> serde_json::Value {
-        serde_json::json!({ "context": context })
-    }
-
-    #[test]
-    fn actionable_contexts_get_their_category() {
-        assert_eq!(
-            category_for(Some(&click(serde_json::json!({
-                "type": "ADMIN_APPROVAL_REQUEST",
-                "approvalRequestId": "req-1",
-            })))),
-            CATEGORY_APPROVAL
-        );
-        assert_eq!(
-            category_for(Some(&click(serde_json::json!({
-                "type": "ADMIN_AI_MESSAGE",
-                "dialogId": "dlg-1",
-            })))),
-            CATEGORY_MESSAGE
-        );
-    }
-
-    /// No id, no button: an Approve that cannot resolve anything is worse than
-    /// no Approve at all.
-    #[test]
-    fn contexts_without_the_id_the_action_needs_stay_default() {
-        assert_eq!(
-            category_for(Some(&click(
-                serde_json::json!({ "type": "ADMIN_APPROVAL_REQUEST", "ticketId": "t-1" })
-            ))),
-            CATEGORY_DEFAULT
-        );
-        assert_eq!(
-            category_for(Some(&click(
-                serde_json::json!({ "type": "ADMIN_AI_MESSAGE", "dialogId": "" })
-            ))),
-            CATEGORY_DEFAULT
-        );
-        assert_eq!(
-            category_for(Some(&click(
-                serde_json::json!({ "type": "TICKET_ASSIGNED", "ticketId": "t-1" })
-            ))),
-            CATEGORY_DEFAULT
-        );
-        assert_eq!(category_for(None), CATEGORY_DEFAULT);
     }
 }

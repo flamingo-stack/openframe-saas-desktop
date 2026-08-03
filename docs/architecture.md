@@ -141,6 +141,8 @@ logs a boot marker with the injected `window.__ENV` and the page origin.
   Manager storage is not implemented.
 - No auto-updater.
 - Linux has no OS-notification backend, and neither do unbundled macOS dev builds
-  (the notification APIs require a bundle identifier).
+  (the notification APIs require a bundle identifier). Windows dev builds do,
+  including the action buttons — the shell registers its own AUMID and toast
+  activator under `HKCU` rather than depending on the installer.
 - CI signing and notarization are out of scope for this repo's build tooling; they
   run against the produced artifact.

@@ -183,7 +183,8 @@ cold-starts the app, went nowhere.
   foreground activation, which dies with the process. Clicks open a custom URI
   registered under `HKCU` at startup; a warm click reaches the running instance
   through single-instance argv forwarding, a cold click launches the app with the
-  URI in argv.
+  URI in argv. The action buttons take the other route, through a COM activator —
+  see below.
 - **macOS dev builds and Linux** have no backend. The notification APIs abort
   without a bundle identifier, so test notifications against a built app.
 
@@ -208,7 +209,7 @@ which drains it and opens the gate for direct delivery. The gate closes again on
 each new document and when the main window is destroyed, because the listener does
 not survive either.
 
-### Action buttons (macOS only)
+### Action buttons
 
 Some notifications complete their work from the banner, with no window and no
 webview: **Approve / Reject** on an AI tool-approval request, **Reply** on a Mingo
@@ -216,34 +217,89 @@ message. Both are plain authenticated REST calls, so the whole decision runs in
 Rust (`chat_api.rs`) against the tenant host, with a bearer from
 `tokens::ensure_fresh`.
 
-- Three categories are registered at init (`setNotificationCategories` replaces
-  the whole set, so it is one call): approval, message, and the default one-button
-  set every other notification keeps. Which one a notification gets is derived
-  from its click payload — and only when the id the button needs actually
-  survived the payload projection, because an Approve that can resolve nothing is
-  worse than no Approve.
-- Only the buttons run in the background. A body click or "Open" is still the
-  existing click path, and so is any action identifier this build does not know.
+Which buttons a notification earns, what a pressed one does, and how the outcome
+comes back have one implementation for both platforms (`notification_actions.rs`);
+each backend owns only its own plumbing. The button set is derived from the click
+payload — and only when the id the button needs actually survived the payload
+projection, because an Approve that can resolve nothing is worse than no Approve.
+Only the buttons run in the background: a body click or "Open" is still the
+existing click path, and so is any action this build does not recognize.
 
 > **The session, not the notification, is the authority.** A banner can sit in
-> Notification Center for days, across a sign-out or a different user signing in
-> on the same Mac. So every background action first resolves a live session
-> (`chat_api::active_session`: tokens that refresh, an access token still inside
-> its `exp`, a `userId` claim) and refuses unless that session is **the same user
-> the notification was delivered to** — the subscription's user id is stamped into
-> `userInfo` at fire time for exactly this comparison. Approve additionally
-> carries `AuthenticationRequired`, but that is only macOS's device-lock gate: on
-> an unlocked Mac it prompts for nothing, which is why it is not the gate that
-> matters here.
+> Notification Center or the Action Center for days, across a sign-out or a
+> different user signing in on the same machine. So every background action first
+> resolves a live session (`chat_api::active_session`: tokens that refresh, an
+> access token still inside its `exp`, a `userId` claim) and refuses unless that
+> session is **the same user the notification was delivered to** — the
+> subscription's user id is stamped into the notification at fire time for exactly
+> this comparison (macOS `userInfo`, Windows button arguments), and an unstamped
+> notification from an older build is refused.
 
 There is no window to report into afterwards, so the outcome comes back as another
 notification: a plain confirmation on success, and on failure a re-post of the
-original — same category, same payload, the reason in the body — so the buttons
-are still there to retry with. A failed reply carries the typed text back with it,
+original — same buttons, same payload, the reason in the body — so the decision is
+still there to retry with. A failed reply carries the typed text back with it,
 since responding to a notification clears the inline field.
 
-Windows gets none of this: its toasts activate a URI, and running an action without
-foregrounding the app would need a COM `INotificationActivationCallback`.
+#### macOS (`macos_un.rs`)
+
+Three categories are registered at init (`setNotificationCategories` replaces the
+whole set, so it is one call): approval, message, and the default one-button set
+every other notification keeps.
+
+**How many buttons the user sees is macOS's call, not ours.** A banner folds every
+action behind the "Options" chevron regardless of count — two collapse just like
+three (verified on 15.x), and no action or category option overrides it. Only the
+Alerts notification style, which the user chooses in System Settings, renders
+actions as buttons. What the app does control is what is in that menu, so the
+approval category carries the decision and nothing else.
+
+Approve additionally carries `AuthenticationRequired`, but that is only macOS's
+device-lock gate: on an unlocked Mac it prompts for nothing, which is why it is not
+the gate that matters. Reject is `Destructive` and one click — denying a tool
+execution is the fail-safe direction, so it must not be harder than approving.
+
+#### Windows (`windows_activator.rs`)
+
+Protocol activation, which still carries the body click, cannot carry these: it
+delivers no user input at all — so an inline reply is impossible through it — and
+it cannot run in the process that is already running. Both need a COM
+`INotificationActivationCallback`, so the buttons declare
+`activationType="background"` and Windows resolves them to a CLSID registered
+against the app's AUMID.
+
+- **Registration** is HKCU-only and rewritten on every launch, like the URI scheme,
+  so the CLSID always names the current exe:
+  `Software\Classes\CLSID\{CLSID}\LocalServer32` gets `"<exe>" -ToastActivated`,
+  and `Software\Classes\AppUserModelId\<AUMID>` gets a `CustomActivator` value. The
+  installer already stamps the AUMID itself onto the Start Menu shortcut (tauri's
+  NSIS `SetLnkAppUserModelId` writes the bundle identifier, which is what toasts
+  are posted under) but has no property for the activator.
+- That key is also the AUMID registration, so a **dev build** posts under its own
+  identifier instead of borrowing PowerShell's — which could never have carried our
+  CLSID, and so could never have had working buttons. Unlike macOS, the buttons can
+  be exercised without an installed build.
+- The class object is registered from an **MTA** thread, so activations arrive on an
+  RPC thread and no message pump is involved — the only thread with a pump is
+  Tauri's event loop, which must not block on a REST call. It is registered from the
+  instance that survived the single-instance check, so COM never routes an
+  activation into a process that is about to exit.
+- Windows has no per-notification sidecar like macOS's `userInfo`, so the payload,
+  the title and the delivered-to user id ride in each button's `arguments` string.
+  The click payload is already projected down to ids, which is what keeps a toast
+  inside the platform's ~5 KB cap when the arguments are repeated per button.
+- A press that arrives while the app is **quit** starts it through `LocalServer32`;
+  that launch opens no window, so a background decision completes invisibly and
+  leaves the app resident in the tray. A press that needs the app opens the window
+  itself, since setup no longer will.
+- Reject is styled `Critical` (red), the closest Windows has to Destructive. Windows
+  renders these inline rather than behind a chevron, so the approval decision is
+  actually visible on the banner — better than the macOS result above.
+- The title and the body are clamped before the XML is built, because a document
+  over the platform's ~5 KB cap is not rejected loudly — the toast simply never
+  appears, and the title is repeated inside every button's arguments. One
+  consequence: a failed reply's echoed text is bounded here where it is not on
+  macOS, so a very long reply comes back truncated rather than not at all.
 
 ## Known gaps
 
@@ -255,7 +311,11 @@ foregrounding the app would need a COM `INotificationActivationCallback`.
 - Moving the interactive streams behind a shared transport abstraction, so the
   shell owns a single connection, remains possible but unjustified — nothing
   consumes those streams while hidden.
-- A notification action taken while the app is **quit** relaunches it, and launch
+- On **macOS**, an action taken while the app is quit relaunches it, and launch
   opens the main window — so that path completes the action but does not stay
   invisible. Suppressing the window would mean knowing at setup time that a
-  response is coming, which the delegate only reports afterwards.
+  response is coming, which the delegate only reports afterwards. Windows does not
+  have this gap: its launch carries `-ToastActivated`, which says up front that the
+  process exists only to serve a press.
+- Toast activation does not reach a process running **elevated**, so action buttons
+  do nothing for a shell started as administrator.

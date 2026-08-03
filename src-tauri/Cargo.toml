@@ -37,9 +37,27 @@ rand = "0.8"
 percent-encoding = "2"
 uuid = { version = "1", features = ["v4"] }
 
-# Protocol-activation toasts + the openframe-desktop:// scheme they activate.
+# Toasts (WinRT: Data_Xml_Dom, UI_Notifications) plus the two things a toast
+# button needs that protocol activation cannot give it — an in-process call and
+# the inline reply text — which arrive through a COM activator
+# (Win32_UI_Notifications for INotificationActivationCallback, Win32_System_Com
+# for the class object that serves it). winreg registers both that activator's
+# CLSID and the openframe-desktop:// scheme the toast body still activates.
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.61", features = ["Data_Xml_Dom", "UI_Notifications"] }
+windows = { version = "0.61", features = [
+    "Data_Xml_Dom",
+    "UI_Notifications",
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Notifications",
+] }
+# Direct dependency because `#[implement]` expands to absolute `::windows_core::`
+# paths, which resolve against this crate's extern prelude — reaching it only as
+# `windows::core` is not enough. Same reason tao and webview2-com declare it.
+# Bump it in lockstep with `windows`: if the two resolve to different major
+# versions the macro's `::windows_core::IUnknownImpl` stops satisfying the
+# `_Impl` supertrait, and the error points nowhere near this file.
+windows-core = "0.61"
 winreg = "0.52"
 
 # UNUserNotificationCenter backend (clicks survive the process, unlike the

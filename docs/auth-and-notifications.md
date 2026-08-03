@@ -65,14 +65,26 @@ what must survive idle:
   frontend maps every refresh that yields no access token to `forceLogout`, and
   that deletes a refresh token which is good for days. Deciding a session is over
   stays here, where custody is.
-- **Background loop.** A 30-second freshness poll rather than a scheduled timer,
-  because polling self-heals across laptop sleep/wake. It backs off while
-  refreshes keep failing, up to 16× the interval.
+- **Background loop.** A 30-second freshness poll rather than a scheduled timer.
+  It backs off while refreshes keep failing, up to 16× the interval. Note that it
+  does *not* self-heal across sleep, contrary to what this file used to say:
+  `tokio::time::sleep` runs on `Instant`, which is `CLOCK_UPTIME_RAW` on macOS
+  and stops while the machine is out, so on a laptop cycling through maintenance
+  DarkWake a single tick can take over an hour of wall clock. Freshness itself is
+  decided on the wall clock, so a late tick still refreshes correctly.
 - **Wake and window-show.** macOS `NSWorkspaceDidWakeNotification`
   (`macos_wake.rs`) and showing the main window both nudge a refresh. A machine
   that slept through the access token's whole life comes back with every overdue
   timer firing at once, the webview's among them; getting ahead of that is
-  cheaper than letting its first 401 drive the recovery.
+  cheaper than letting its first 401 drive the recovery. Neither covers much on
+  its own — measured over six days of logs, wake fired five times and window-show
+  once — and `NSWorkspaceDidWakeNotification` is not posted for DarkWake at all.
+- **Wake settling.** `spawn_wake_watch` detects resume by watching the wall clock
+  run ahead of the monotonic one, and no rotation goes out until the machine has
+  been awake 15 seconds. This is the guard for the failure below: a laptop idling
+  overnight is awake 2-9 seconds every ~15 minutes, and a rotation fired into one
+  of those windows cannot get its answer back. It is also the only sleep signal
+  that works on Windows, which has no wake observer in this shell.
 - **Push to webview.** Every shell-side token change emits
   `native-auth:token-update` to all bundle windows, so the webview's cache mirrors
   rotations and session death.
@@ -87,17 +99,31 @@ what must survive idle:
 > whose *response* is lost — connection broken mid-answer, which is what a Wi-Fi
 > transition looks like — leaves this side holding a token the server has already
 > retired. There is no client-side recovery: the next refresh is rejected and the
-> user signs in again. Observed on 2026-07-29 at 23:04, five seconds apart: a POST
-> that went out with no answer back, then a 401 on the same token.
+> user signs in again.
 >
-> What the shell can do, and does: never retry an unknown outcome, keep rotations
-> as infrequent as the margin allows, keep them out of reconnect loops (which run
-> exactly when the network cannot deliver an answer), and name the case in the log
-> when a rejection follows a lost answer instead of reporting it as a revoked
-> session. What it cannot do is make a lost rotation recoverable. That needs the
+> Observed end to end on 2026-08-01. The machine was idling on battery in
+> maintenance DarkWake, awake 2-9 seconds every ~15 minutes. The access token died
+> inside one of those sleeps; at the next resume the background poll asked for a
+> rotation and POSTed at 01:33:30 UTC, the same second the machine went back to
+> sleep. The answer never arrived. Thirty-two minutes later the next caller
+> presented the same token and got a 401, and custody was cleared. Note where the
+> POST came from: the poll, not the reconnect path this design had already moved
+> rotations out of.
+>
+> What the shell can do, and does: refuse to rotate until the machine has been
+> awake long enough for an answer to come back (`spawn_wake_watch`), hold the
+> token back for a cooldown after a rotation whose fate is unknown rather than
+> letting the next caller cash the ambiguity in as a 401, bound the request on the
+> wall clock so a POST the machine sleeps through cannot hold the single-flight
+> lock for fifteen minutes, never retry an unknown outcome, keep rotations as
+> infrequent as the margin allows, and name both the case and the caller in the
+> log when a rejection follows a lost answer.
+>
+> What it cannot do is make a lost rotation recoverable. That needs the
 > authorization server to accept the previous refresh token for a few seconds
 > after rotation and re-issue the same pair — the standard mitigation for this
-> hazard, and the only fix that removes it.
+> hazard, and the only fix that removes it. Everything above only narrows the
+> window.
 
 > **The refresh POST sends a body on purpose.** reqwest/hyper omit
 > `Content-Length` for bodyless POSTs — *and* for an explicit zero-length body.
@@ -142,6 +168,14 @@ dials with a fresh bearer.
   runs precisely when the network has just broken — the one condition under which
   a rotation's answer goes missing and the session is unrecoverable. A rejected
   dial costs a backoff; a lost rotation costs the login.
+- With nobody signed in, the callback **parks** instead of returning an error.
+  Returning one does not stop the fork — it logs and re-enters its connect loop,
+  which is how one overnight logout produced a full TLS+WS handshake every 30
+  seconds for two days. Nor can the loop be stopped from outside: between
+  connections the connector task sits inside its own connect loop and is not
+  polling the client's command channel, so dropping the `Client` is unobserved.
+  Blocking in the callback suspends the task that actually needs suspending, and
+  resuming is just returning a URL — so sign-in needs no separate wake-up.
 - On every `Connected` the subscription is re-established, because the subject
   changes when the signed-in user does.
 - Sign-in on the same tenant re-subscribes on the live connection; a tenant switch

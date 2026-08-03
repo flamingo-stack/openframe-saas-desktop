@@ -34,6 +34,9 @@ const FAST_DELAY_MS: u64 = 200;
 const BASE_DELAY_MS: u64 = 1_000;
 const MAX_DELAY_MS: u64 = 30_000;
 const PING_INTERVAL: Duration = Duration::from_secs(10);
+/// How often a parked reconnect loop looks for credentials. Matches `run`'s own
+/// credential wait, so signing in costs the same wherever the connector is.
+const PARK_POLL: Duration = Duration::from_secs(5);
 
 struct Connector {
     app: AppHandle,
@@ -74,6 +77,16 @@ async fn read_server_url(app: &AppHandle) -> Option<String> {
 async fn read_token(app: &AppHandle) -> Option<String> {
     tokens::refresh_soon(app, "NATS needs a bearer");
     tokens::load_tokens(app).access_token
+}
+
+/// Both halves a dial needs, each None until it is known.
+///
+/// One spelling of the pair for all three places that wait on it, because both
+/// halves are `Option<String>` and a swapped pair therefore type-checks in
+/// silence — which is exactly what had happened in one of them. Not free to
+/// call: reading the token also asks for a rotation when one is due.
+async fn credentials(app: &AppHandle) -> (Option<String>, Option<String>) {
+    (read_server_url(app).await, read_token(app).await)
 }
 
 /// Spawn the connect/reconnect lifecycle. Call once, after
@@ -155,7 +168,7 @@ async fn run(connector: Arc<Connector>) {
 
     loop {
         let (server_url, token) = loop {
-            match (read_server_url(&app).await, read_token(&app).await) {
+            match credentials(&app).await {
                 (Some(url), Some(token)) => break (url, token),
                 (url, token) => {
                     log::info!(
@@ -163,7 +176,7 @@ async fn run(connector: Arc<Connector>) {
                         url.is_some(),
                         token.is_some()
                     );
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    tokio::time::sleep(PARK_POLL).await;
                 }
             }
         };
@@ -246,22 +259,41 @@ async fn rebuild_connect_url(connector: &Arc<Connector>) -> Result<String, async
         log::warn!("[nats] {failures} consecutive auth failures — delaying reconnect {delay_ms}ms");
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     }
-    match (
-        read_token(&connector.app).await,
-        read_server_url(&connector.app).await,
-    ) {
-        (Some(token), Some(url)) => {
+    match credentials(&connector.app).await {
+        (Some(url), Some(token)) => {
             log::info!(
                 "[nats] auth_url_callback: supplying token for (re)connect ({})",
                 mask_token(&token)
             );
             Ok(build_connect_url(&url, &token))
         }
-        _ => {
-            log::warn!("[nats] auth_url_callback: no token available for (re)connect");
-            Err(async_nats::AuthError::new(
-                "no token available for NATS reconnect",
-            ))
+        _ => Ok(park_until_credentials(connector).await),
+    }
+}
+
+/// Hold the reconnect loop until someone is signed in again, and hand it a URL
+/// when they are.
+///
+/// Returning `Err` from `auth_url_callback` does not stop anything: the fork
+/// logs it and re-enters its connect loop, so a signed-out app kept dialling the
+/// gateway — a full TLS+WS handshake every 30s, 660 rounds over two days after
+/// one overnight logout, with the paired warnings for each. Nor can it be
+/// stopped from outside: while the connector is between connections it is parked
+/// inside its own connect loop and is not polling the client's command channel,
+/// so dropping every `Client` handle is unobserved and leaves the task running.
+///
+/// Blocking here is what actually suspends it. `handle_auth_error` awaits this
+/// callback with no timeout, and it is the task that needs stopping, so parking
+/// in place needs no new state and cannot race the teardown paths. Resuming is
+/// just returning, so sign-in needs no separate trigger.
+async fn park_until_credentials(connector: &Arc<Connector>) -> String {
+    log::info!("[nats] no credentials — parking the reconnect loop until sign-in");
+    loop {
+        tokio::time::sleep(PARK_POLL).await;
+        if let (Some(url), Some(token)) = credentials(&connector.app).await {
+            log::info!("[nats] credentials are back — resuming the reconnect loop");
+            connector.auth_failures.store(0, Ordering::Relaxed);
+            return build_connect_url(&url, &token);
         }
     }
 }

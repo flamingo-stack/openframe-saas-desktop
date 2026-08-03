@@ -645,7 +645,7 @@ async fn native_auth_get_tokens(app: AppHandle) -> Result<NativeAuthTokens, Stri
 async fn native_auth_refresh_tokens(app: AppHandle) -> Result<NativeAuthTokens, String> {
     log::info!("[tokens] webview requested a refresh (upstream 401)");
     let prev_access = tokens::load_tokens(&app).access_token;
-    match tokens::refresh(&app, true, prev_access).await {
+    match tokens::refresh(&app, true, prev_access, "webview upstream 401").await {
         Ok(tokens) => Ok(tokens),
         Err(e) => {
             let stored = tokens::load_tokens(&app);
@@ -885,6 +885,7 @@ pub fn run() {
             build_tray(app)?;
             #[cfg(target_os = "windows")]
             register_url_scheme();
+            tokens::spawn_wake_watch(app.handle().clone());
             tokens::spawn_refresh_loop(app.handle().clone());
             #[cfg(target_os = "macos")]
             macos_wake::observe(app.handle().clone());

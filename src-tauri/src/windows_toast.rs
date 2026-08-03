@@ -25,6 +25,8 @@ use percent_encoding::utf8_percent_encode;
 #[cfg(target_os = "windows")]
 use tauri::{AppHandle, Manager};
 
+#[cfg(target_os = "windows")]
+use crate::notifications::Delivery;
 use crate::{
     notification_actions::{Action, ActionContext, ActionKind},
     UNRESERVED,
@@ -56,6 +58,28 @@ const REPLY_ACTION: &str = "reply";
 const TITLE_LIMIT: usize = 50;
 const BODY_LIMIT: usize = 300;
 
+/// Groups every toast the shell posts, so a tag only has to be unique within the
+/// app. Windows matches tag **and** group, so both have to be set for a
+/// replacement to land.
+#[cfg(target_os = "windows")]
+const TOAST_GROUP: &str = "openframe";
+/// Windows caps a tag at 64 characters.
+const TAG_LIMIT: usize = 64;
+
+/// The logo behind a toast's **header icon**, which Windows reads through
+/// `IconUri` on the AUMID registration (`windows_activator::register`).
+///
+/// The other place a toast can wear a logo — `<image placement="appLogoOverride">`
+/// in the XML, the large image beside the text — is deliberately not used while
+/// the notification layout is being designed.
+///
+/// Embedded rather than read out of the bundle so a dev build — no installer, no
+/// resources laid down — wears the same logo as a shipped one.
+#[cfg(target_os = "windows")]
+const TOAST_LOGO: &[u8] = include_bytes!("../icons/128x128.png");
+#[cfg(target_os = "windows")]
+const TOAST_LOGO_FILE: &str = "notification-logo.png";
+
 /// Post a notification. `user_id` is the user it is delivered to, encoded into
 /// each button's arguments so a press hours later can check it still matches the
 /// signed-in session; a follow-up that reports an action's outcome carries none.
@@ -67,6 +91,7 @@ pub(crate) fn post(
     click: Option<serde_json::Value>,
     user_id: Option<String>,
     kind: ActionKind,
+    delivery: Delivery,
 ) {
     // Both dev and release post under the app identifier: the installer stamps
     // it onto the Start Menu shortcut, and `windows_activator::init` registers
@@ -75,15 +100,34 @@ pub(crate) fn post(
     // so could never have had working buttons.
     let app_id = app.config().identifier.clone();
     let xml = toast_xml(&title, &body, click.as_ref(), user_id.as_deref(), kind);
+    // The toast's identity, and so what a later one replaces. Only approval
+    // requests have one — they are the only kind the gateway republishes, and
+    // the only kind whose second copy corrects the first rather than saying
+    // something new. Keyed on the request rather than the notification id
+    // because the two are 1:1 for an approval and the request id is already
+    // carried on every path, including the follow-up posted after a press, which
+    // lands on the toast it resolved for free.
+    //
+    // `maybe_notify` only marks an envelope `Update` when this is present — an
+    // update with nothing to land on would be silenced into invisibility.
+    let tag =
+        crate::notification_actions::approval_request_id(click.as_ref()).map(|key| toast_tag(&key));
 
-    std::thread::spawn(move || match show(&app_id, &xml) {
-        Ok(()) => log::info!("[notifications] toast fired: {title}"),
-        Err(err) => log::warn!("[notifications] toast show failed: {err:?}"),
-    });
+    std::thread::spawn(
+        move || match show(&app_id, &xml, tag.as_deref(), delivery) {
+            Ok(()) => log::info!("[notifications] toast fired: {title} ({delivery:?})"),
+            Err(err) => log::warn!("[notifications] toast show failed: {err:?}"),
+        },
+    );
 }
 
 #[cfg(target_os = "windows")]
-fn show(app_id: &str, xml: &str) -> windows::core::Result<()> {
+fn show(
+    app_id: &str,
+    xml: &str,
+    tag: Option<&str>,
+    delivery: Delivery,
+) -> windows::core::Result<()> {
     use windows::core::HSTRING;
     use windows::Data::Xml::Dom::XmlDocument;
     use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
@@ -91,7 +135,111 @@ fn show(app_id: &str, xml: &str) -> windows::core::Result<()> {
     let document = XmlDocument::new()?;
     document.LoadXml(&HSTRING::from(xml))?;
     let toast = ToastNotification::CreateToastNotification(&document)?;
+    // Both of these refine a notification that is already worth showing, so
+    // neither is allowed to `?` and take it down with it — the same trade
+    // `toast_tag` makes: a stacked or noisy banner beats a lost one.
+    //
+    // A tagged toast *replaces* the one already carrying that tag instead of
+    // stacking beside it. That is how a superseding envelope lands on the banner
+    // it supersedes, and how the follow-up the shell posts after a press lands
+    // on the banner it just resolved.
+    let tagged = match tag {
+        Some(tag) => toast
+            .SetTag(&HSTRING::from(tag))
+            .and_then(|()| toast.SetGroup(&HSTRING::from(TOAST_GROUP)))
+            .inspect_err(|err| {
+                log::warn!("[notifications] toast not tagged ({err:?}) — it will stack instead");
+            })
+            .is_ok(),
+        None => false,
+    };
+    // An update goes straight to the Action Center with no banner: the user has
+    // already been interrupted once for this notification, and what changed is
+    // the outcome of a decision. Only worth doing if the tag landed, though —
+    // silencing a toast that cannot replace anything files it where nobody will
+    // look, so an untagged correction is better shown than hidden.
+    // `SuppressPopup` lives on a later interface than the toast itself, so it
+    // can fail by cast rather than by argument.
+    if delivery == Delivery::Update && tagged {
+        if let Err(err) = toast.SetSuppressPopup(true) {
+            log::warn!("[notifications] update could not be silenced ({err:?})");
+        }
+    }
     ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(app_id))?.Show(&toast)
+}
+
+/// Where the logo lives on disk, laying it down on first use — hence `ensure`,
+/// as elsewhere in the crate. Called from the AUMID registration, which is the
+/// only thing that reads it while the toast layout carries no image of its own.
+///
+/// It has to be a file because the notification platform resolves it out of
+/// process, and it lives in the app-config directory rather than the install
+/// directory because a toast sitting in the Action Center still resolves it after
+/// the app has exited, or been uninstalled.
+///
+/// Resolved once per process. `None` costs the logo, never the notification.
+#[cfg(target_os = "windows")]
+pub(crate) fn ensure_logo(app: &AppHandle) -> Option<&'static std::path::Path> {
+    use std::sync::OnceLock;
+    static PATH: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let dir = app.path().app_config_dir().ok()?;
+        let path = dir.join(TOAST_LOGO_FILE);
+        // Rewritten only when missing or a different size, and then through a
+        // temporary that is renamed into place: a plain write truncates first,
+        // and Windows caches whatever it read of the identity until the
+        // notification service restarts — so being caught mid-write is not an
+        // error that corrects itself on the next toast.
+        if !std::fs::metadata(&path).is_ok_and(|meta| meta.len() == TOAST_LOGO.len() as u64) {
+            if let Err(err) = write_logo(&dir, &path) {
+                log::warn!("[notifications] toast logo not written ({err}) — toasts go without");
+                return None;
+            }
+            log::info!("[notifications] toast logo written to {}", path.display());
+        }
+        Some(path)
+    })
+    .as_deref()
+}
+
+/// Write the logo through a temporary and rename it into place, so a reader
+/// never sees a partial file — Windows caches whatever it read of the identity
+/// until the notification service restarts, so being caught mid-write is not a
+/// mistake the next toast corrects.
+///
+/// Like `crate::write_atomic`, but the staging path carries the process id: two
+/// instances laying the same file down would otherwise share one temporary, and
+/// the second's write would truncate what the first is about to rename into
+/// place — reintroducing the torn file this exists to prevent.
+#[cfg(target_os = "windows")]
+fn write_logo(dir: &std::path::Path, path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    // Cleaned up on either failure: the name carries a fresh process id every
+    // launch, so a staging file left behind is one nothing will ever reclaim.
+    let staged = std::fs::write(&tmp, TOAST_LOGO)
+        // Windows renames over an existing file here (MOVEFILE_REPLACE_EXISTING).
+        .and_then(|()| std::fs::rename(&tmp, path));
+    staged.inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
+/// Windows matches a tag verbatim and rejects `SetTag` for one it does not
+/// accept, which would fail the whole `show` — so an id is folded to fit rather
+/// than passed through. Losing the replacement costs a duplicate toast; losing
+/// the toast costs the notification.
+fn toast_tag(key: &str) -> String {
+    key.chars()
+        .take(TAG_LIMIT)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 /// Silent to match the previously shipped toasts. `useButtonStyle` is what lets
@@ -461,6 +609,34 @@ mod tests {
         assert!(!xml.contains('\x1b') && !xml.contains('\x07') && !xml.contains('\x0b'));
         // The three XML 1.0 allows are left alone.
         assert!(escape_xml("a\tb\nc\rd").contains("a\tb\nc\rd"));
+    }
+
+    /// `SetTag` rejecting a value fails the whole `show`, so the tag is folded
+    /// to something Windows takes rather than handed the id verbatim.
+    #[test]
+    fn a_tag_is_always_something_windows_accepts() {
+        assert_eq!(
+            toast_tag("6a706b66d453f877ae41f42c"),
+            "6a706b66d453f877ae41f42c"
+        );
+        assert_eq!(toast_tag("a/b c&д"), "a-b-c--");
+        let long = toast_tag(&"x".repeat(4096));
+        assert_eq!(long.chars().count(), TAG_LIMIT);
+    }
+
+    /// The layout is being designed and the large image is out of it for now, so
+    /// the only logo a toast wears comes from the AUMID registration's `IconUri`
+    /// — which is not part of this document.
+    #[test]
+    fn the_toast_carries_no_image_of_its_own() {
+        for kind in [
+            ActionKind::Default,
+            ActionKind::Approval,
+            ActionKind::Message,
+        ] {
+            let xml = toast_xml("t", "b", Some(&approval_click()), Some("u1"), kind);
+            assert!(!xml.contains("<image"), "{kind:?} toast carried an image");
+        }
     }
 
     #[test]

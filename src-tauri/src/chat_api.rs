@@ -48,6 +48,13 @@ pub(crate) async fn active_session(app: &AppHandle) -> Option<Session> {
     })
 }
 
+/// What resolving an approval request found. `AlreadyResolved` is not a
+/// failure: the decision it was asked to make had already been made.
+pub(crate) enum ApprovalOutcome {
+    Resolved,
+    AlreadyResolved,
+}
+
 /// Resolve a Mingo tool-approval request. One endpoint for both outcomes, same
 /// as the frontend's approve/reject mutations.
 pub(crate) async fn resolve_approval(
@@ -55,18 +62,32 @@ pub(crate) async fn resolve_approval(
     session: &Session,
     request_id: &str,
     approve: bool,
-) -> Result<(), String> {
+) -> Result<ApprovalOutcome, String> {
     let path = format!(
         "/chat/api/v1/approval-requests/{}/approve",
         utf8_percent_encode(request_id, UNRESERVED)
     );
-    post_json(
+    match post_json(
         app,
         session,
         &path,
         serde_json::json!({ "approve": approve }),
     )
     .await
+    {
+        Ok(()) => Ok(ApprovalOutcome::Resolved),
+        // The endpoint's one conflict is a request that is no longer pending —
+        // decided from the web UI, from another device, by another admin, or
+        // from a banner this shell had not yet caught up with. None of those is
+        // a failed press: the tool call already carries the verdict the user was
+        // asked for, so reporting it as an error would put a red banner on a
+        // decision that stands.
+        Err(err) if err.status == Some(reqwest::StatusCode::CONFLICT) => {
+            log::info!("[chat-api] POST {path}: already resolved");
+            Ok(ApprovalOutcome::AlreadyResolved)
+        }
+        Err(err) => Err(err.reason),
+    }
 }
 
 /// Send a message to a Mingo (admin AI) dialog.
@@ -87,6 +108,25 @@ pub(crate) async fn send_message(
         }),
     )
     .await
+    .map_err(|err| err.reason)
+}
+
+/// A rejected call. The `reason` is user-facing — it ends up in a follow-up
+/// notification — while the `status` is for callers that read a particular one
+/// as something other than a failure; it is `None` when the request never got a
+/// response.
+struct PostError {
+    status: Option<reqwest::StatusCode>,
+    reason: String,
+}
+
+impl PostError {
+    fn new(status: Option<reqwest::StatusCode>, reason: impl Into<String>) -> Self {
+        Self {
+            status,
+            reason: reason.into(),
+        }
+    }
 }
 
 /// Errors are user-facing (they end up in a follow-up notification), so they
@@ -96,14 +136,14 @@ async fn post_json(
     session: &Session,
     path: &str,
     body: serde_json::Value,
-) -> Result<(), String> {
-    let base =
-        tenant_host(&load_config(app)).ok_or("this install has not learned a tenant host yet")?;
+) -> Result<(), PostError> {
+    let base = tenant_host(&load_config(app))
+        .ok_or_else(|| PostError::new(None, "this install has not learned a tenant host yet"))?;
 
     let client = reqwest::Client::builder()
         .timeout(HTTP_TIMEOUT)
         .build()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| PostError::new(None, e.to_string()))?;
     let response = client
         .post(format!("{base}{path}"))
         .bearer_auth(&session.access_token)
@@ -115,7 +155,7 @@ async fn post_json(
         .await
         .map_err(|e| {
             log::warn!("[chat-api] POST {path} to {base} failed: {e}");
-            "the gateway could not be reached".to_string()
+            PostError::new(None, "the gateway could not be reached")
         })?;
 
     let status = response.status();
@@ -130,7 +170,10 @@ async fn post_json(
     // carries its own message, so it falls through to the body below.
     if status == reqwest::StatusCode::UNAUTHORIZED {
         log::warn!("[chat-api] POST {path} rejected: HTTP {status} — session no longer accepted");
-        return Err("this session is no longer valid — open OpenFrame and sign in again".into());
+        return Err(PostError::new(
+            Some(status),
+            "this session is no longer valid — open OpenFrame and sign in again",
+        ));
     }
     // Body only at debug: an error message can quote user content.
     let reason = response.text().await.ok().and_then(|raw| {
@@ -138,7 +181,10 @@ async fn post_json(
         error_message(&raw)
     });
     log::warn!("[chat-api] POST {path} rejected: HTTP {status}");
-    Err(reason.unwrap_or_else(|| format!("HTTP {status}")))
+    Err(PostError::new(
+        Some(status),
+        reason.unwrap_or_else(|| format!("HTTP {status}")),
+    ))
 }
 
 /// The gateway's error text: `message`, else `error` — the same two fields the

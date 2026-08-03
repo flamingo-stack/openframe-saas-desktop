@@ -241,6 +241,56 @@ original — same buttons, same payload, the reason in the body — so the decis
 still there to retry with. A failed reply carries the typed text back with it,
 since responding to a notification clears the inline field.
 
+#### Superseded notifications
+
+A notification is not always the last word on what it is about. The gateway
+**republishes** one when its subject changes — for an approval request, once it has
+been decided — under the same notification id, carrying:
+
+| Field | Meaning |
+|---|---|
+| `eventType` | `CREATED` for the first push, `UPDATED` for one that supersedes it. Absent → `CREATED`. |
+| `context.resolution` | Backend `ApprovalResolution`: `PENDING`, `APPROVED`, `REJECTED`, `CANCELLED`. Absent until decided. |
+| `context.resolvedByName` | Who decided it. |
+
+That is a *correction*, not a second notification, and the shell has to read it as
+one — otherwise the republished copy arrives as a fresh banner still offering a
+decision that has already been made, whose only possible outcome is the gateway
+refusing it (`HTTP 409`). The frontend's drawer resolves this by mutating the
+existing entry in place; the shell mirrors that decision by decision:
+
+- **It does not alert again.** An `UPDATED` envelope is posted with
+  `SuppressPopup`, so it lands in the Action Center without raising a banner, and it
+  does not increment the unread badge. The user was already interrupted once for
+  this notification; what changed is the outcome of a decision, not a new one.
+- **It lands on the banner it supersedes.** Approval toasts are tagged on Windows
+  with their `approvalRequestId` (`notification_actions::approval_request_id`), and a
+  tagged toast *replaces* the one already carrying that tag. The follow-up the shell
+  posts after its own press carries the same payload, and so the same tag, so it
+  also lands on the toast it just resolved.
+- **A settled request loses its buttons.** `note_resolution` records the verdict off
+  the wire — from any envelope, whether or not it is displayed — and `live_kind_for`
+  posts anything still carrying that request with no decision attached. Only the
+  three terminal resolutions count: `PENDING` on the wire is still a decision to
+  make, the same line the frontend's `resolutionToStatus` draws.
+- **A press that beats the update is not an error.** Nothing recalls a banner the
+  user is already looking at, so a press can still arrive against a settled request.
+  It is caught one round-trip earlier than the gateway where the verdict is already
+  known, and past that the `409` itself is read as *already resolved*: the outcome
+  notification says so plainly instead of reporting a failure, and does not re-offer
+  a closed decision.
+
+The tag is deliberately approval-only. Messages are not republished, and replacing
+a message toast would hide one the user has not read.
+
+Two places where the shell is deliberately looser than the drawer: an `UPDATED`
+envelope for a banner that is no longer in the Action Center still lands there
+(silently, settled) rather than being dropped — the drawer refuses to resurrect a
+dismissed card, but `ToastNotificationHistory`'s `GetHistory` has no `WithId`
+variant, so an unpackaged app cannot ask what is still on screen. And the shell has
+no equivalent of the drawer's auto-read: the Action Center entry is the user's to
+dismiss.
+
 #### macOS (`macos_un.rs`)
 
 Three categories are registered at init (`setNotificationCategories` replaces the
@@ -279,6 +329,32 @@ against the app's AUMID.
   identifier instead of borrowing PowerShell's — which could never have carried our
   CLSID, and so could never have had working buttons. Unlike macOS, the buttons can
   be exercised without an installed build.
+- A toast can wear the app's **logo** in two places, and they are separate
+  mechanisms — neither covers the other:
+  - the **header icon**, beside the app name, from `IconUri` on the AUMID key. This
+    is the one in use. A Start Menu shortcut carrying the AUMID is not enough, even
+    when its icon is the app's own: verified against an MSI install whose shortcut
+    points at a world-readable copy of `icon.ico` and whose toasts still came up
+    blank until `IconUri` was written.
+  - the **image inside the notification**, from `<image placement="appLogoOverride">`
+    in the XML — the large logo beside the text. Deliberately **not** used: it is out
+    while the notification layout is being designed.
+
+  The file is embedded in the binary — so a dev build wears the same logo as a
+  shipped one — and laid down in the app-config directory on first use, because the
+  notification platform resolves it out of process and a toast left in the Action
+  Center still resolves it after the app has exited or been uninstalled.
+
+  > **The identity is cached per AUMID, and the cache outlives the registration.**
+  > Windows resolves name and icon the first time an AUMID posts, and the WPN user
+  > service holds that answer: a build that posted before `IconUri` existed leaves
+  > the AUMID stuck on the generic placeholder no matter what is written afterwards.
+  > Fresh installs are unaffected — `register` runs at startup, before the first
+  > toast — but a machine that ran an older build needs the cache dropped once
+  > (`Restart-Service WpnUserService_*`, a sign-out, or a reboot). Verified both
+  > ways on Windows 11 26200: a never-used AUMID with `IconUri` set renders the logo
+  > immediately, and the app's own AUMID kept the placeholder until that service was
+  > restarted. The shell does not restart system services to paper over this.
 - The class object is registered from an **MTA** thread, so activations arrive on an
   RPC thread and no message pump is involved — the only thread with a pump is
   Tauri's event loop, which must not block on a REST call. It is registered from the
@@ -295,6 +371,11 @@ against the app's AUMID.
 - Reject is styled `Critical` (red), the closest Windows has to Destructive. Windows
   renders these inline rather than behind a chevron, so the approval decision is
   actually visible on the banner — better than the macOS result above.
+- **`hint-buttonStyle` has exactly two values**, `Success` and `Critical`; there is
+  no arbitrary button color, and `useButtonStyle="true"` on the root is what enables
+  either. An unrecognized value — a hex color, a plausible-sounding `Warning` — is
+  not rejected, it is silently ignored and the button renders plain, so a colour
+  that "did not take" looks identical to one never set. Verified on Windows 11 26200.
 - The title and the body are clamped before the XML is built, because a document
   over the platform's ~5 KB cap is not rejected loudly — the toast simply never
   appears, and the title is repeated inside every button's arguments. One
@@ -319,3 +400,12 @@ against the app's AUMID.
   process exists only to serve a press.
 - Toast activation does not reach a process running **elevated**, so action buttons
   do nothing for a shell started as administrator.
+- A superseding notification is folded into the banner it supersedes on **Windows
+  only**. Each UN request is posted under a fresh UUID, so on macOS the update
+  arrives as a second banner, and it alerts. The platform-neutral halves — no
+  buttons on a settled request, a `409` read as already resolved — apply there as
+  they do here, so the second banner is inert rather than misleading. Giving
+  `macos_un::post` the same identity (`UNNotificationRequest` replaces a request
+  whose identifier it already holds) and honouring `Delivery::Update` would close
+  it; it is left alone because it cannot be built or exercised from the Windows
+  toolchain this was fixed on.

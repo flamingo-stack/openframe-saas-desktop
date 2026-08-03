@@ -23,7 +23,7 @@
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 use windows::core::{implement, Interface, Ref, Result as ComResult, BOOL, GUID, PCWSTR};
 use windows::Win32::Foundation::CLASS_E_NOAGGREGATION;
 use windows::Win32::System::Com::{
@@ -79,6 +79,9 @@ fn register(app: &AppHandle) {
     };
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let clsid = clsid_string();
+    // Lays the file down on first call, so it happens here rather than inside
+    // the registry chain below — that chain is otherwise pure registry writes.
+    let logo = windows_toast::ensure_logo(app);
 
     // Both of these are load-bearing: without the command COM cannot start us to
     // serve a press, and without CustomActivator the buttons resolve no activator
@@ -93,8 +96,19 @@ fn register(app: &AppHandle) {
         .and_then(|(key, _)| key.set_value("", &command))
         .and_then(|()| hkcu.create_subkey(&aumid))
         .and_then(|(key, _)| {
+            // The notification's identity: the name beside the header icon, and
+            // the header icon itself. Cosmetic, so neither is allowed to fail the
+            // registration that makes the buttons work.
+            //
+            // A shortcut carrying the AUMID is not enough for the icon even when
+            // it has the right one — verified on an MSI install whose Start Menu
+            // shortcut points at the app's own `icon.ico` and whose toasts came
+            // up blank until `IconUri` was set.
             let display_name = config.product_name.as_deref().unwrap_or("OpenFrame");
             let _ = key.set_value("DisplayName", &display_name);
+            if let Some(logo) = logo {
+                let _ = key.set_value("IconUri", &logo.display().to_string());
+            }
             key.set_value("CustomActivator", &clsid)
         });
     match written {

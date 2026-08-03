@@ -42,6 +42,24 @@ const CLICK_EVENT: &str = "notification:click";
 /// is deliberately exempt — a failed reply's banner carries the user's own
 /// words, and trimming those would discard the only copy left.
 pub(crate) const BODY_CHARS: usize = 140;
+/// The envelope `eventType` that supersedes an earlier push rather than being a
+/// new thing to tell the user about. See [`delivery_of`].
+const UPDATED_EVENT: &str = "UPDATED";
+
+/// Whether a notification is the first the user hears of something, or
+/// supersedes one they were already told about. An update must not interrupt
+/// again: the user has already been alerted once for this, and what changed is
+/// the outcome of a decision, not a new one to make.
+///
+/// Lives here, with the rest of the envelope's vocabulary, rather than beside
+/// the backends that honour it — `notification_actions` is not built on Linux,
+/// and this module is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Delivery {
+    New,
+    Update,
+}
+
 /// Custom URI scheme Windows toasts activate through, registered under HKCU at
 /// startup by `crate::register_url_scheme`. Windows-only: every other platform
 /// delivers clicks in-process (macOS) or not at all.
@@ -182,33 +200,98 @@ async fn notification_router(
 /// refuse to run under a different session (see
 /// `notification_actions::run_action`).
 fn maybe_notify(app: &AppHandle, envelope: &serde_json::Value, user_id: &str) {
+    // Bookkeeping first, ahead of both display gates: an envelope carrying a
+    // verdict is the gateway telling every consumer the decision is made, and
+    // that is true whether or not this envelope is one the user gets to see.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    crate::notification_actions::note_resolution(envelope.get("context"));
+
     let Some(title) = string_field(envelope, "title") else {
         log::debug!("[notifications] ignoring envelope without title");
         return;
     };
-    if !should_notify(app) {
+    let delivery = delivery_of(envelope);
+    let click = click_payload(envelope);
+    // An update that lands on the banner it supersedes is posted silently, so
+    // the usual "don't interrupt someone already looking at the app" gate would
+    // cost the replacement and buy nothing — the stale banner would keep the
+    // buttons of a decision already made. All three conditions are load-bearing:
+    // Windows is the only platform that can post without alerting, and an update
+    // with nothing to land on is not a correction but a second notification,
+    // which is exactly what the gate is for.
+    let silent_update = delivery == Delivery::Update
+        && cfg!(target_os = "windows")
+        && supersedes_a_banner(click.as_ref());
+    if !silent_update && !should_notify(app) {
         log::debug!("[notifications] window visible+focused — skipping notification");
         return;
     }
     let body = string_field(envelope, "description")
         .map(|d| truncate_for_notification(&d, BODY_CHARS))
         .unwrap_or_default();
-    let click = click_payload(envelope);
 
     let plane = app.state::<NotificationsPlane>();
-    let unread = plane.unread.fetch_add(1, Ordering::Relaxed) + 1;
-    set_badge(app, unread);
+    // An update supersedes something the user already owes attention to, so it
+    // must not be counted twice — the frontend's drawer leaves its own count
+    // alone on an update for the same reason.
+    if delivery == Delivery::New {
+        let unread = plane.unread.fetch_add(1, Ordering::Relaxed) + 1;
+        set_badge(app, unread);
+    }
 
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
-        use crate::notification_actions::{kind_for, post};
-        let kind = kind_for(click.as_ref());
-        post(app, title, body, click, Some(user_id.to_string()), kind);
+        use crate::notification_actions::{live_kind_for, post};
+        // `live_kind_for`, not `kind_for`: a settled request keeps its payload
+        // but must not keep its buttons.
+        let kind = live_kind_for(click.as_ref());
+        post(
+            app,
+            title,
+            body,
+            click,
+            Some(user_id.to_string()),
+            kind,
+            delivery,
+        );
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = (title, body, click, user_id);
         log::debug!("[notifications] no OS notification backend on this platform");
+    }
+}
+
+/// Whether a payload names something a later notification takes the place of.
+/// The one caller is the silent-update decision above, and it is the same fact
+/// the Windows backend tags a toast by — an update that supersedes nothing has
+/// no banner to correct, and posting it quietly would only hide it.
+fn supersedes_a_banner(click: Option<&serde_json::Value>) -> bool {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        crate::notification_actions::approval_request_id(click).is_some()
+    }
+    // Linux has no notification backend, so nothing is ever on screen to
+    // supersede — and `notification_actions` is not built here to ask.
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = click;
+        false
+    }
+}
+
+/// `eventType` on the envelope: `CREATED` for the first push of a notification,
+/// `UPDATED` for one that supersedes it under the same notification id. Absent
+/// means the first push.
+///
+/// Matched exactly, where `note_resolution` reads its verdict case-insensitively
+/// — deliberately, because each mirrors how the frontend reads the same field
+/// (`payload.eventType === 'UPDATED'` against `resolutionToStatus`'s
+/// `toUpperCase()`), and the gateway feeds both consumers the same envelope.
+fn delivery_of(envelope: &serde_json::Value) -> Delivery {
+    match string_field(envelope, "eventType").as_deref() {
+        Some(UPDATED_EVENT) => Delivery::Update,
+        _ => Delivery::New,
     }
 }
 
@@ -367,6 +450,11 @@ pub(crate) fn reset_click_gate(app: &AppHandle) {
 /// it does so once per document — closing it here would strand every later
 /// click on the logout paths that don't reload the page.
 pub(crate) fn end_session(app: &AppHandle) {
+    // Before the spawn, not inside it: the decisions belong to the session that
+    // made them, and a fast sign-out/sign-in could otherwise land this clear on
+    // top of what the next session has already learned from the wire.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    crate::notification_actions::forget_resolved();
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         drop_subscription(&app, "session ended").await;
@@ -448,7 +536,10 @@ pub(crate) fn truncate_for_notification(text: &str, max: usize) -> String {
     out
 }
 
-fn lock<T>(mutex: &StdMutex<T>) -> MutexGuard<'_, T> {
+/// A poisoned lock is not a reason to take the process down: every mutex behind
+/// this guards display state, and a panic that poisoned one has already been
+/// reported. Shared with `notification_actions`, which guards its own.
+pub(crate) fn lock<T>(mutex: &StdMutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -521,6 +612,23 @@ mod tests {
     #[test]
     fn click_uri_prefix_uses_the_registered_scheme() {
         assert_eq!(CLICK_URI_PREFIX.split_once("://").unwrap().0, URI_SCHEME);
+    }
+
+    /// `UPDATED` is the gateway saying "you already know about this one" —
+    /// anything else, including an envelope from a build that sends no
+    /// `eventType` at all, is something the user has not seen yet.
+    #[test]
+    fn only_an_updated_envelope_supersedes() {
+        let updated = serde_json::json!({ "title": "Approval", "eventType": "UPDATED" });
+        assert_eq!(delivery_of(&updated), Delivery::Update);
+        for envelope in [
+            serde_json::json!({ "title": "Approval", "eventType": "CREATED" }),
+            serde_json::json!({ "title": "Approval" }),
+            serde_json::json!({ "title": "Approval", "eventType": "" }),
+            serde_json::json!({ "title": "Approval", "eventType": 7 }),
+        ] {
+            assert_eq!(delivery_of(&envelope), Delivery::New, "{envelope}");
+        }
     }
 
     #[test]

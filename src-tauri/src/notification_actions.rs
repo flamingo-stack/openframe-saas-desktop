@@ -9,9 +9,13 @@
 // implementation: it is the only thing standing between a banner that has been
 // sitting around for days and an authenticated write.
 
+use std::collections::VecDeque;
+use std::sync::Mutex;
+
 use tauri::AppHandle;
 
-use crate::{chat_api, notifications::string_field};
+use crate::chat_api;
+use crate::notifications::{lock, string_field, Delivery};
 
 /// Envelope `context.type` values that earn action buttons. The rest of the set
 /// (tickets, client chats) has no action the shell can complete on its own.
@@ -32,16 +36,117 @@ pub(crate) enum ActionKind {
 /// Buttons are offered only when the id the action needs actually survived the
 /// payload projection — an Approve that can resolve nothing is worse than no
 /// Approve at all.
-pub(crate) fn kind_for(click: Option<&serde_json::Value>) -> ActionKind {
-    match context_str(click, "type").as_deref() {
-        Some(APPROVAL_CONTEXT_TYPE) if context_str(click, "approvalRequestId").is_some() => {
-            ActionKind::Approval
-        }
-        Some(MESSAGE_CONTEXT_TYPE) if context_str(click, "dialogId").is_some() => {
-            ActionKind::Message
-        }
-        _ => ActionKind::Default,
+///
+/// Private: [`live_kind_for`] is what callers outside this module get, because
+/// what a payload *could* earn and what it may still be offered are different
+/// questions once a decision has been made.
+fn kind_for(click: Option<&serde_json::Value>) -> ActionKind {
+    if approval_request_id(click).is_some() {
+        return ActionKind::Approval;
     }
+    if dialog_id(click).is_some() {
+        return ActionKind::Message;
+    }
+    ActionKind::Default
+}
+
+/// The approval request a payload is about — the primitive fact the Approval
+/// button set is derived from, rather than the other way round. `None` unless
+/// the context says it is an approval **and** the id survived the payload
+/// projection, because an Approve that can resolve nothing is worse than no
+/// Approve at all.
+///
+/// The single place that rule is written down: which buttons to offer, which
+/// toast this replaces, and which request a press resolves are all the same
+/// question.
+pub(crate) fn approval_request_id(click: Option<&serde_json::Value>) -> Option<String> {
+    (context_str(click, "type").as_deref() == Some(APPROVAL_CONTEXT_TYPE))
+        .then(|| context_str(click, "approvalRequestId"))
+        .flatten()
+}
+
+/// The conversation a payload is about, on the same terms as
+/// [`approval_request_id`].
+fn dialog_id(click: Option<&serde_json::Value>) -> Option<String> {
+    (context_str(click, "type").as_deref() == Some(MESSAGE_CONTEXT_TYPE))
+        .then(|| context_str(click, "dialogId"))
+        .flatten()
+}
+
+/// [`kind_for`], minus any decision that is already settled. The gateway
+/// republishes a decided approval request under the same notification id, and
+/// the shell's own press settles one a moment before that republish lands —
+/// either way, offering the decision again would offer one that cannot be made.
+pub(crate) fn live_kind_for(click: Option<&serde_json::Value>) -> ActionKind {
+    match approval_request_id(click) {
+        Some(id) if is_resolved(&id) => {
+            log::debug!("[notifications] approval already settled — posting without buttons");
+            ActionKind::Default
+        }
+        _ => kind_for(click),
+    }
+}
+
+/// Backend `ApprovalResolution`, absent while a request is still pending. Only
+/// these three settle it — `PENDING` on the wire is still a decision to make,
+/// and the frontend's `resolutionToStatus` draws the line in the same place.
+const SETTLED_RESOLUTIONS: [&str; 3] = ["APPROVED", "REJECTED", "CANCELLED"];
+
+/// Record the verdict an envelope carries, if it carries one. The gateway
+/// republishes an approval request once it is decided — same notification id,
+/// `eventType: "UPDATED"`, the verdict in `context.resolution` — so that every
+/// consumer can bring its copy up to date. Taking it at face value is what lets
+/// a decision made anywhere (the web UI, another device, another admin) reach
+/// the banner sitting in this machine's Action Center.
+///
+/// Takes the envelope's `context` object, not the projected click payload the
+/// rest of this module reads: `resolution` is not one of the fields that
+/// survives the projection.
+pub(crate) fn note_resolution(context: Option<&serde_json::Value>) {
+    let Some(context) = context else { return };
+    let settled = string_field(context, "resolution").is_some_and(|resolution| {
+        SETTLED_RESOLUTIONS
+            .iter()
+            .any(|settled| resolution.eq_ignore_ascii_case(settled))
+    });
+    if !settled {
+        return;
+    }
+    if let Some(request_id) = string_field(context, "approvalRequestId") {
+        remember_resolved(&request_id);
+    }
+}
+
+/// Approval requests known to be settled, oldest first. Bounded because this is
+/// a working set and not a record: the authority on whether a request is still
+/// pending is the gateway, which says so with a 409. Losing the oldest entries
+/// only costs a press that lands there instead.
+static RESOLVED: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+const RESOLVED_MEMORY: usize = 64;
+
+/// Taken over the ring rather than the static so the eviction behaviour can be
+/// exercised without a test flooding the set every other test shares.
+fn remember(resolved: &mut VecDeque<String>, request_id: &str) {
+    if resolved.iter().any(|id| id == request_id) {
+        return;
+    }
+    if resolved.len() >= RESOLVED_MEMORY {
+        resolved.pop_front();
+    }
+    resolved.push_back(request_id.to_string());
+}
+
+fn remember_resolved(request_id: &str) {
+    remember(&mut lock(&RESOLVED), request_id);
+}
+
+fn is_resolved(request_id: &str) -> bool {
+    lock(&RESOLVED).iter().any(|id| id == request_id)
+}
+
+/// Sign-out: the decisions belong to the session that made them.
+pub(crate) fn forget_resolved() {
+    lock(&RESOLVED).clear();
 }
 
 pub(crate) enum Action {
@@ -102,6 +207,14 @@ pub(crate) fn spawn(app: &AppHandle, context: ActionContext, action: Action) {
     });
 }
 
+/// What a press amounted to. `AlreadyResolved` is a third thing, neither the
+/// success that reports "Approved" nor a failure that offers the decision
+/// again: the request is settled, just not by this press.
+enum Outcome {
+    Done,
+    AlreadyResolved,
+}
+
 /// The session gate. A notification sitting in Notification Center or the Action
 /// Center is not authority to act on anything: the shell acts only while the
 /// user it was delivered to is still signed in, so an approval cannot be granted
@@ -112,7 +225,7 @@ async fn run_action(
     app: &AppHandle,
     context: &ActionContext,
     action: &Action,
-) -> Result<(), String> {
+) -> Result<Outcome, String> {
     let session = chat_api::active_session(app)
         .await
         .ok_or("no one is signed in — open OpenFrame and sign in, then try again")?;
@@ -122,15 +235,32 @@ async fn run_action(
 
     match action {
         Action::Approve | Action::Reject => {
-            let request_id = context_str(context.payload.as_ref(), "approvalRequestId")
+            let request_id = approval_request_id(context.payload.as_ref())
                 .ok_or("this notification carries no approval request")?;
+            // A banner that was already on screen when the request was settled
+            // keeps its buttons — nothing recalls a toast the user is looking at
+            // — so the press still has to be caught here: one round-trip earlier
+            // than the gateway's 409, and without spending a write on a request
+            // that has no decision left to make.
+            if is_resolved(&request_id) {
+                return Ok(Outcome::AlreadyResolved);
+            }
             let approve = matches!(action, Action::Approve);
-            chat_api::resolve_approval(app, &session, &request_id, approve).await
+            let outcome = chat_api::resolve_approval(app, &session, &request_id, approve).await?;
+            // Remembered for either outcome: whoever resolved it, it is settled,
+            // and the republished copy must not offer it again.
+            remember_resolved(&request_id);
+            Ok(match outcome {
+                chat_api::ApprovalOutcome::Resolved => Outcome::Done,
+                chat_api::ApprovalOutcome::AlreadyResolved => Outcome::AlreadyResolved,
+            })
         }
         Action::Reply(text) => {
-            let dialog_id = context_str(context.payload.as_ref(), "dialogId")
+            let dialog_id = dialog_id(context.payload.as_ref())
                 .ok_or("this notification carries no conversation")?;
-            chat_api::send_message(app, &session, &dialog_id, text).await
+            chat_api::send_message(app, &session, &dialog_id, text)
+                .await
+                .map(|()| Outcome::Done)
         }
     }
 }
@@ -138,22 +268,47 @@ async fn run_action(
 /// A background action has no window to report into, so the outcome comes back
 /// as another notification. Failures re-post the original — same buttons, same
 /// payload — so the decision is still there to retry with.
-fn report(app: &AppHandle, context: &ActionContext, action: &Action, outcome: Result<(), String>) {
+fn report(
+    app: &AppHandle,
+    context: &ActionContext,
+    action: &Action,
+    outcome: Result<Outcome, String>,
+) {
     match outcome {
-        Ok(()) => post(
-            app,
-            action.done().to_string(),
-            context.title.clone(),
-            context.payload.clone(),
-            None,
-            ActionKind::Default,
-        ),
+        // Both carry the original payload, which on Windows is also the toast's
+        // identity — so the confirmation replaces the notification it resolved
+        // rather than stacking under a decision that is no longer open.
+        // Delivered as `New` all the same: the user pressed a button a moment
+        // ago and is owed a visible answer, which is exactly the interruption an
+        // update is not.
+        Ok(outcome) => {
+            let title = match outcome {
+                Outcome::Done => action.done().to_string(),
+                Outcome::AlreadyResolved => {
+                    log::info!(
+                        "[notifications] nothing to {} — already settled",
+                        action.verb()
+                    );
+                    "Already resolved".to_string()
+                }
+            };
+            post(
+                app,
+                title,
+                context.title.clone(),
+                context.payload.clone(),
+                None,
+                ActionKind::Default,
+                Delivery::New,
+            )
+        }
         Err(reason) => {
             // The reason quotes the gateway, which can quote user content —
             // same policy as chat_api's error bodies, so it stays at debug.
             log::warn!("[notifications] could not {}", action.verb());
             log::debug!("[notifications] {} failed: {reason}", action.verb());
-            let kind = kind_for(context.payload.as_ref());
+            // The retry is only worth offering while the decision is still open.
+            let kind = live_kind_for(context.payload.as_ref());
             post(
                 app,
                 context.title.clone(),
@@ -161,6 +316,7 @@ fn report(app: &AppHandle, context: &ActionContext, action: &Action, outcome: Re
                 context.payload.clone(),
                 context.user_id.clone(),
                 kind,
+                Delivery::New,
             )
         }
     }
@@ -177,14 +333,19 @@ pub(crate) fn post(
     click: Option<serde_json::Value>,
     user_id: Option<String>,
     kind: ActionKind,
+    delivery: Delivery,
 ) {
     #[cfg(target_os = "macos")]
     {
-        let _ = app;
+        // `delivery` is dropped here rather than passed on: each UN request is
+        // posted under a fresh identifier, so macOS has nothing to supersede and
+        // an update would alert again. See the known gap in
+        // docs/auth-and-notifications.md.
+        let _ = (app, delivery);
         crate::macos_un::post(title, body, click, user_id, kind);
     }
     #[cfg(target_os = "windows")]
-    crate::windows_toast::post(app, title, body, click, user_id, kind);
+    crate::windows_toast::post(app, title, body, click, user_id, kind, delivery);
 }
 
 /// A string field of the click payload's `context`, if present and non-empty.
@@ -241,6 +402,110 @@ mod tests {
             ActionKind::Default
         );
         assert_eq!(kind_for(None), ActionKind::Default);
+    }
+
+    fn approval(request_id: &str) -> serde_json::Value {
+        click(serde_json::json!({
+            "type": "ADMIN_APPROVAL_REQUEST",
+            "approvalRequestId": request_id,
+        }))
+    }
+
+    /// The verdict on the wire is what settles a request, wherever it was made.
+    /// `PENDING` is not a verdict — the backend sends it while the decision is
+    /// still open, and stripping the buttons then would strand it.
+    #[test]
+    fn only_a_terminal_resolution_settles_a_request() {
+        let pending = serde_json::json!({
+            "type": "ADMIN_APPROVAL_REQUEST",
+            "approvalRequestId": "wire-pending",
+            "resolution": "PENDING",
+        });
+        note_resolution(Some(&pending));
+        assert!(!is_resolved("wire-pending"));
+
+        for (i, resolution) in ["APPROVED", "rejected", "CANCELLED"].iter().enumerate() {
+            let id = format!("wire-settled-{i}");
+            note_resolution(Some(&serde_json::json!({
+                "type": "ADMIN_APPROVAL_REQUEST",
+                "approvalRequestId": id,
+                "resolution": resolution,
+            })));
+            assert!(is_resolved(&id), "{resolution} should settle the request");
+        }
+
+        // Nothing to record: no verdict, no id, no context at all.
+        note_resolution(Some(
+            &serde_json::json!({ "approvalRequestId": "wire-bare" }),
+        ));
+        assert!(!is_resolved("wire-bare"));
+        note_resolution(None);
+    }
+
+    /// The bug this exists for: the gateway republishes a decided approval
+    /// request under the same notification id. It must come without the
+    /// decision — pressing it can only be refused.
+    #[test]
+    fn a_resolved_request_loses_its_buttons() {
+        let payload = approval("resolved-req-1");
+        assert_eq!(live_kind_for(Some(&payload)), ActionKind::Approval);
+        remember_resolved("resolved-req-1");
+        assert_eq!(live_kind_for(Some(&payload)), ActionKind::Default);
+        // Only that request: a decision still open keeps its buttons.
+        assert_eq!(
+            live_kind_for(Some(&approval("resolved-req-2"))),
+            ActionKind::Approval
+        );
+        // And the contract for what the payload *could* earn is unchanged.
+        assert_eq!(kind_for(Some(&payload)), ActionKind::Approval);
+    }
+
+    /// Bounded on purpose — but the window has to be deep enough that an
+    /// approval decided a moment ago is still in it.
+    ///
+    /// Runs against its own ring: flooding the shared one would evict what the
+    /// other tests just recorded, and they run in parallel.
+    #[test]
+    fn the_resolved_window_forgets_oldest_first() {
+        let mut ring = VecDeque::new();
+        for i in 0..RESOLVED_MEMORY + 8 {
+            remember(&mut ring, &format!("evicted-{i}"));
+        }
+        assert_eq!(ring.len(), RESOLVED_MEMORY);
+        assert!(!ring.iter().any(|id| id == "evicted-0"));
+        assert!(ring
+            .iter()
+            .any(|id| *id == format!("evicted-{}", RESOLVED_MEMORY + 7)));
+        // Repeats do not consume the window.
+        remember(&mut ring, "evicted-70");
+        assert_eq!(ring.len(), RESOLVED_MEMORY);
+    }
+
+    /// Two notifications share a banner only when the later one supersedes the
+    /// earlier, which is what having a request id means. Messages are not
+    /// republished and must keep stacking — replacing one would hide a message
+    /// the user has not read.
+    #[test]
+    fn only_approvals_have_an_identity_to_supersede() {
+        assert_eq!(
+            approval_request_id(Some(&approval("req-1"))).as_deref(),
+            Some("req-1")
+        );
+        assert!(approval_request_id(Some(&click(serde_json::json!({
+            "type": "ADMIN_AI_MESSAGE", "dialogId": "dlg-1",
+        }))))
+        .is_none());
+        assert!(approval_request_id(Some(&click(
+            serde_json::json!({ "type": "TICKET_ASSIGNED", "ticketId": "t-1" })
+        )))
+        .is_none());
+        assert!(approval_request_id(None).is_none());
+        // The id an approval carries is the id a press resolves: a payload whose
+        // id did not survive the projection has neither.
+        assert!(approval_request_id(Some(&click(
+            serde_json::json!({ "type": "ADMIN_APPROVAL_REQUEST", "ticketId": "t-1" })
+        )))
+        .is_none());
     }
 
     /// The typed text is the one thing a failed reply cannot reconstruct — the

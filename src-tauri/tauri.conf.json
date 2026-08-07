@@ -13,9 +13,21 @@
       "csp": null
     }
   },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDJFQjlGQzQ2MTdEQUExNTkKUldSWm9kb1hSdnk1TG5GRDNrcnN5eGhhYUZZb2tzK2xzRk1qbFU5VHZXdUxsQjZhZ2x3MnlCRFMK",
+      "endpoints": [
+        "https://updates.openframe.invalid/{{target}}/{{arch}}/{{current_version}}"
+      ],
+      "windows": {
+        "installMode": "quiet"
+      }
+    }
+  },
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -29,6 +41,9 @@
       "timestampUrl": "",
       "webviewInstallMode": {
         "type": "downloadBootstrapper"
+      },
+      "nsis": {
+        "installMode": "currentUser"
       }
     }
   }

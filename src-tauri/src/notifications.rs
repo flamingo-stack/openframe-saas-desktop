@@ -10,9 +10,14 @@
 //     userInfo.
 //   - Windows: toasts activate an `openframe-desktop://notify` URI, which
 //     reaches a running instance through single-instance argv forwarding or
-//     launches the app cold (`handle_notification_uri`).
+//     launches the app cold (`handle_notification_uri`). Their action buttons
+//     take the other route, through the COM activator (`windows_activator`).
 //   - macOS dev builds (unbundled — UN APIs abort there) and other platforms
 //     have no OS notification backend.
+//
+// On both desktop platforms a notification that carries an actionable context
+// gets buttons that complete the work with no window and no webview; what they
+// do, and the session gate they do it under, is `notification_actions`.
 //
 // Unlike chat, the shell does not map notifications to routes: the payload
 // forwarded on `notification:click` is the envelope's `context` in wire shape,
@@ -32,6 +37,29 @@ use crate::{show_primary_window, tokens, MAIN_LABEL};
 /// Consumed by `onNativeNotificationClick` in the frontend's native-shell.ts —
 /// a rename here silently stops routing there.
 const CLICK_EVENT: &str = "notification:click";
+/// Length limit for text the shell did not write: an incoming envelope's
+/// `description` and the gateway's error text. A body the shell composes itself
+/// is deliberately exempt — a failed reply's banner carries the user's own
+/// words, and trimming those would discard the only copy left.
+pub(crate) const BODY_CHARS: usize = 140;
+/// The envelope `eventType` that supersedes an earlier push rather than being a
+/// new thing to tell the user about. See [`delivery_of`].
+const UPDATED_EVENT: &str = "UPDATED";
+
+/// Whether a notification is the first the user hears of something, or
+/// supersedes one they were already told about. An update must not interrupt
+/// again: the user has already been alerted once for this, and what changed is
+/// the outcome of a decision, not a new one to make.
+///
+/// Lives here, with the rest of the envelope's vocabulary, rather than beside
+/// the backends that honour it — `notification_actions` is not built on Linux,
+/// and this module is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Delivery {
+    New,
+    Update,
+}
+
 /// Custom URI scheme Windows toasts activate through, registered under HKCU at
 /// startup by `crate::register_url_scheme`. Windows-only: every other platform
 /// delivers clicks in-process (macOS) or not at all.
@@ -57,9 +85,10 @@ struct SubscriptionSlot {
     task: tauri::async_runtime::JoinHandle<()>,
 }
 
-/// Register the plane's state and, on macOS, the notification-center delegate.
-/// Must run before `crate::nats::spawn`, whose Connected handler subscribes
-/// through this module.
+/// Register the plane's state and the platform's click/action backend — the
+/// notification-center delegate on macOS, the COM activator on Windows. Must run
+/// before `crate::nats::spawn`, whose Connected handler subscribes through this
+/// module.
 pub(crate) fn init(app: &AppHandle) {
     app.manage(NotificationsPlane {
         subscription: tokio::sync::Mutex::new(None),
@@ -69,6 +98,8 @@ pub(crate) fn init(app: &AppHandle) {
     });
     #[cfg(target_os = "macos")]
     crate::macos_un::init(app);
+    #[cfg(target_os = "windows")]
+    crate::windows_activator::init(app);
 }
 
 /// Runs on every NATS Connected event. async-nats replays plain SUBs across
@@ -117,7 +148,7 @@ pub(crate) async fn ensure_subscription(app: &AppHandle, client: async_nats::Cli
     let task_app = app.clone();
     let task_subject = subject.clone();
     let task = tauri::async_runtime::spawn(async move {
-        notification_router(task_app, task_subject, subscriber).await;
+        notification_router(task_app, task_subject, user_id, subscriber).await;
     });
     *slot = Some(SubscriptionSlot { subject, task });
 }
@@ -125,6 +156,7 @@ pub(crate) async fn ensure_subscription(app: &AppHandle, client: async_nats::Cli
 async fn notification_router(
     app: AppHandle,
     subject: String,
+    user_id: String,
     mut subscriber: async_nats::Subscriber,
 ) {
     while let Some(message) = subscriber.next().await {
@@ -145,7 +177,7 @@ async fn notification_router(
                 continue;
             }
         };
-        maybe_notify(&app, &payload);
+        maybe_notify(&app, &payload, &user_id);
     }
     // The stream only closes when the client is torn down — clear the slot
     // (only if it is still ours; a user switch may have replaced it) so the
@@ -162,53 +194,105 @@ async fn notification_router(
 /// Every envelope on this subject is user-displayable by contract — anything
 /// with a `title` fires unless the user is already looking at the app (the
 /// webview's own subscription drives the in-app drawer either way).
-fn maybe_notify(app: &AppHandle, envelope: &serde_json::Value) {
+///
+/// `user_id` is the subject's user — whoever the notification was delivered to.
+/// It rides along to the platform backend so an action taken hours later can
+/// refuse to run under a different session (see
+/// `notification_actions::run_action`).
+fn maybe_notify(app: &AppHandle, envelope: &serde_json::Value, user_id: &str) {
+    // Bookkeeping first, ahead of both display gates: an envelope carrying a
+    // verdict is the gateway telling every consumer the decision is made, and
+    // that is true whether or not this envelope is one the user gets to see.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    crate::notification_actions::note_resolution(envelope.get("context"));
+
     let Some(title) = string_field(envelope, "title") else {
         log::debug!("[notifications] ignoring envelope without title");
         return;
     };
-    if !should_notify(app) {
+    let delivery = delivery_of(envelope);
+    let click = click_payload(envelope);
+    // An update that lands on the banner it supersedes is posted silently, so
+    // the usual "don't interrupt someone already looking at the app" gate would
+    // cost the replacement and buy nothing — the stale banner would keep the
+    // buttons of a decision already made. All three conditions are load-bearing:
+    // Windows is the only platform that can post without alerting, and an update
+    // with nothing to land on is not a correction but a second notification,
+    // which is exactly what the gate is for.
+    let silent_update = delivery == Delivery::Update
+        && cfg!(target_os = "windows")
+        && supersedes_a_banner(click.as_ref());
+    if !silent_update && !should_notify(app) {
         log::debug!("[notifications] window visible+focused — skipping notification");
         return;
     }
     let body = string_field(envelope, "description")
-        .map(|d| truncate_for_notification(&d, 140))
+        .map(|d| truncate_for_notification(&d, BODY_CHARS))
         .unwrap_or_default();
-    let click = click_payload(envelope);
 
     let plane = app.state::<NotificationsPlane>();
-    let unread = plane.unread.fetch_add(1, Ordering::Relaxed) + 1;
-    set_badge(app, unread);
+    // An update supersedes something the user already owes attention to, so it
+    // must not be counted twice — the frontend's drawer leaves its own count
+    // alone on an update for the same reason.
+    if delivery == Delivery::New {
+        let unread = plane.unread.fetch_add(1, Ordering::Relaxed) + 1;
+        set_badge(app, unread);
+    }
 
-    #[cfg(target_os = "macos")]
-    crate::macos_un::fire(title, body, click);
-    #[cfg(target_os = "windows")]
-    fire_toast(app, title, body, click);
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        use crate::notification_actions::{live_kind_for, post};
+        // `live_kind_for`, not `kind_for`: a settled request keeps its payload
+        // but must not keep its buttons.
+        let kind = live_kind_for(click.as_ref());
+        post(
+            app,
+            title,
+            body,
+            click,
+            Some(user_id.to_string()),
+            kind,
+            delivery,
+        );
+    }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        let _ = (title, body, click);
+        let _ = (title, body, click, user_id);
         log::debug!("[notifications] no OS notification backend on this platform");
     }
 }
 
-#[cfg(target_os = "windows")]
-fn fire_toast(app: &AppHandle, title: String, body: String, click: Option<serde_json::Value>) {
-    // Dev builds have no registered AUMID; PowerShell's works out of the box.
-    const POWERSHELL_APP_ID: &str =
-        "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe";
-    let app_id = if tauri::is_dev() {
-        POWERSHELL_APP_ID.to_string()
-    } else {
-        app.config().identifier.clone()
-    };
-    let uri = click_uri(click.as_ref());
+/// Whether a payload names something a later notification takes the place of.
+/// The one caller is the silent-update decision above, and it is the same fact
+/// the Windows backend tags a toast by — an update that supersedes nothing has
+/// no banner to correct, and posting it quietly would only hide it.
+fn supersedes_a_banner(click: Option<&serde_json::Value>) -> bool {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        crate::notification_actions::approval_request_id(click).is_some()
+    }
+    // Linux has no notification backend, so nothing is ever on screen to
+    // supersede — and `notification_actions` is not built here to ask.
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = click;
+        false
+    }
+}
 
-    std::thread::spawn(
-        move || match crate::windows_toast::show(&app_id, &title, &body, &uri) {
-            Ok(()) => log::info!("[notifications] toast fired: {title}"),
-            Err(err) => log::warn!("[notifications] toast show failed: {err:?}"),
-        },
-    );
+/// `eventType` on the envelope: `CREATED` for the first push of a notification,
+/// `UPDATED` for one that supersedes it under the same notification id. Absent
+/// means the first push.
+///
+/// Matched exactly, where `note_resolution` reads its verdict case-insensitively
+/// — deliberately, because each mirrors how the frontend reads the same field
+/// (`payload.eventType === 'UPDATED'` against `resolutionToStatus`'s
+/// `toUpperCase()`), and the gateway feeds both consumers the same envelope.
+fn delivery_of(envelope: &serde_json::Value) -> Delivery {
+    match string_field(envelope, "eventType").as_deref() {
+        Some(UPDATED_EVENT) => Delivery::Update,
+        _ => Delivery::New,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -217,14 +301,16 @@ fn fire_toast(app: &AppHandle, title: String, body: String, click: Option<serde_
 
 /// The webview's `notification:click` payload: the envelope's routing context
 /// in wire shape, which the frontend's `resolveNatsNotificationRoute` maps to a
-/// route. Only the three fields that mapping reads survive — the rest of
-/// `context` can be arbitrarily large (an approval request carries the whole
-/// `toolCalls` array), and it has to fit in a Windows activation URI, which the
-/// shell truncates at ~2 KB. `None` when the envelope points at nothing
-/// openable; the click then only raises the window.
+/// route. Only the fields that mapping reads — plus `approvalRequestId`, which
+/// the Approve/Reject buttons resolve against the chat API — survive. The rest
+/// of `context` can be arbitrarily large (an approval request carries the whole
+/// `toolCalls` array), and it has to fit both in a Windows activation URI and in
+/// a toast payload that repeats it once per button; every id kept here is a
+/// UUID. `None` when the envelope points at nothing openable; the click then
+/// only raises the window.
 fn click_payload(envelope: &serde_json::Value) -> Option<serde_json::Value> {
     let context = envelope.get("context")?;
-    let routing: serde_json::Map<_, _> = ["type", "ticketId", "dialogId"]
+    let routing: serde_json::Map<_, _> = ["type", "ticketId", "dialogId", "approvalRequestId"]
         .into_iter()
         .filter_map(|key| Some((key.to_string(), context.get(key)?.clone())))
         .collect();
@@ -233,7 +319,7 @@ fn click_payload(envelope: &serde_json::Value) -> Option<serde_json::Value> {
 
 /// `openframe-desktop://notify?context=<percent-encoded JSON>`.
 #[cfg(any(target_os = "windows", test))]
-fn click_uri(click: Option<&serde_json::Value>) -> String {
+pub(crate) fn click_uri(click: Option<&serde_json::Value>) -> String {
     use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
     match click.and_then(|c| c.get("context")) {
         Some(context) => format!(
@@ -256,7 +342,16 @@ fn parse_click_uri(uri: &str) -> Option<serde_json::Value> {
     let json = percent_encoding::percent_decode_str(encoded)
         .decode_utf8()
         .ok()?;
-    let context: serde_json::Value = serde_json::from_str(&json).ok()?;
+    payload_from_context_json(&json)
+}
+
+/// Wrap a decoded `context` object back into the shape every click path carries
+/// it in. Both Windows activation transports land here — the URI a toast body
+/// activates and the arguments a toast button carries — so the envelope shape
+/// the webview and `kind_for` depend on is asserted once.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn payload_from_context_json(json: &str) -> Option<serde_json::Value> {
+    let context: serde_json::Value = serde_json::from_str(json).ok()?;
     context
         .is_object()
         .then(|| serde_json::json!({ "context": context }))
@@ -355,6 +450,11 @@ pub(crate) fn reset_click_gate(app: &AppHandle) {
 /// it does so once per document — closing it here would strand every later
 /// click on the logout paths that don't reload the page.
 pub(crate) fn end_session(app: &AppHandle) {
+    // Before the spawn, not inside it: the decisions belong to the session that
+    // made them, and a fast sign-out/sign-in could otherwise land this clear on
+    // top of what the next session has already learned from the wire.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    crate::notification_actions::forget_resolved();
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         drop_subscription(&app, "session ended").await;
@@ -419,7 +519,7 @@ fn set_badge(app: &AppHandle, count: u32) {
     }
 }
 
-fn string_field(value: &serde_json::Value, key: &str) -> Option<String> {
+pub(crate) fn string_field(value: &serde_json::Value, key: &str) -> Option<String> {
     value
         .get(key)
         .and_then(|v| v.as_str())
@@ -427,7 +527,7 @@ fn string_field(value: &serde_json::Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn truncate_for_notification(text: &str, max: usize) -> String {
+pub(crate) fn truncate_for_notification(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_string();
     }
@@ -436,7 +536,10 @@ fn truncate_for_notification(text: &str, max: usize) -> String {
     out
 }
 
-fn lock<T>(mutex: &StdMutex<T>) -> MutexGuard<'_, T> {
+/// A poisoned lock is not a reason to take the process down: every mutex behind
+/// this guards display state, and a panic that poisoned one has already been
+/// reported. Shared with `notification_actions`, which guards its own.
+pub(crate) fn lock<T>(mutex: &StdMutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -480,20 +583,26 @@ mod tests {
     }
 
     /// The bulk a context can carry (an approval request's toolCalls) must not
-    /// reach the activation URI — Windows truncates it at ~2 KB.
+    /// reach the activation URI — Windows truncates it at ~2 KB. The ids the
+    /// macOS action buttons act on must survive it.
     #[test]
     fn click_payload_keeps_only_routing_fields() {
         let envelope = serde_json::json!({
             "context": {
                 "type": "ADMIN_APPROVAL_REQUEST",
                 "ticketId": "abc",
+                "approvalRequestId": "0a2a0b3c-9d1e-4f5a-8b7c-6d5e4f3a2b1c",
                 "toolCalls": [{ "toolExplanation": "x".repeat(4096) }],
             }
         });
         let payload = click_payload(&envelope).unwrap();
         assert_eq!(
             payload,
-            serde_json::json!({ "context": { "type": "ADMIN_APPROVAL_REQUEST", "ticketId": "abc" } })
+            serde_json::json!({ "context": {
+                "type": "ADMIN_APPROVAL_REQUEST",
+                "ticketId": "abc",
+                "approvalRequestId": "0a2a0b3c-9d1e-4f5a-8b7c-6d5e4f3a2b1c",
+            } })
         );
         assert!(click_uri(Some(&payload)).len() < 2048);
     }
@@ -503,6 +612,23 @@ mod tests {
     #[test]
     fn click_uri_prefix_uses_the_registered_scheme() {
         assert_eq!(CLICK_URI_PREFIX.split_once("://").unwrap().0, URI_SCHEME);
+    }
+
+    /// `UPDATED` is the gateway saying "you already know about this one" —
+    /// anything else, including an envelope from a build that sends no
+    /// `eventType` at all, is something the user has not seen yet.
+    #[test]
+    fn only_an_updated_envelope_supersedes() {
+        let updated = serde_json::json!({ "title": "Approval", "eventType": "UPDATED" });
+        assert_eq!(delivery_of(&updated), Delivery::Update);
+        for envelope in [
+            serde_json::json!({ "title": "Approval", "eventType": "CREATED" }),
+            serde_json::json!({ "title": "Approval" }),
+            serde_json::json!({ "title": "Approval", "eventType": "" }),
+            serde_json::json!({ "title": "Approval", "eventType": 7 }),
+        ] {
+            assert_eq!(delivery_of(&envelope), Delivery::New, "{envelope}");
+        }
     }
 
     #[test]

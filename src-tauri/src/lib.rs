@@ -1,10 +1,25 @@
+// The background notification actions and the REST calls behind them exist on
+// both desktop platforms; Linux has no notification backend at all, so neither
+// module is built there.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod chat_api;
 #[cfg(target_os = "macos")]
 mod macos_un;
+#[cfg(target_os = "macos")]
+mod macos_wake;
 mod nats;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod notification_actions;
 mod notifications;
 mod tokens;
 mod updater;
 #[cfg(target_os = "windows")]
+mod windows_activator;
+// Also compiled for a macOS test run: the toast XML and the button-argument
+// codec fail inside the notification platform rather than in a stack trace, so
+// they are worth testing on the host the rest of CI already uses. Not on Linux,
+// where `notification_actions` — which this depends on — does not exist.
+#[cfg(any(target_os = "windows", all(target_os = "macos", test)))]
 mod windows_toast;
 
 use std::sync::{
@@ -76,6 +91,26 @@ pub(crate) fn shared_host(cfg: &AppConfig) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The tenant origin login learned, if there is one. Everything the shell talks
+/// to on the tenant — NATS, the chat API, refresh's fallback base — resolves it
+/// through here rather than reading `learned_host` directly, so "unset" and
+/// "empty string" cannot mean different things in different callers.
+pub(crate) fn tenant_host(cfg: &AppConfig) -> Option<String> {
+    cfg.learned_host
+        .as_deref()
+        .filter(|host| !host.is_empty())
+        .map(str::to_string)
+}
+
+/// RFC 3986 unreserved set. Anything the shell interpolates into a URL — an id
+/// into a path, a bearer into a query — is escaped against this, so a value can
+/// never smuggle in a path or a parameter of its own.
+pub(crate) const UNRESERVED: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~');
+
 fn config_path(app: &AppHandle) -> std::path::PathBuf {
     app.path()
         .app_config_dir()
@@ -139,10 +174,20 @@ fn normalize_host(input: &str) -> Result<String, String> {
 ///     supplied; `NEXT_PUBLIC_TENANT_HOST_URL` is deliberately absent so
 ///     `runtimeEnv.tenantHostUrl()` falls through to the host login learned
 ///     (`getStoredTenantHost`), which is what lets one binary serve any tenant.
-/// (2) a minimal Capacitor-compatible bridge — the frontend's native-shell.ts
-///     detects the shell via `window.Capacitor.isNativePlatform()` and drives
-///     login + token custody through `Plugins.NativeAuth`, which is backed here
-///     by the native_auth_* Tauri commands.
+/// (2) `window.__OPENFRAME_SHELL__.nativeAuth` — the login + token-custody
+///     bridge, backed here by the native_auth_* Tauri commands. Load-bearing:
+///     drop it and the frontend's `nativeAuthPlugin()` is null, which kills
+///     desktop sign-in.
+///
+///   This used to be injected as a fake `window.Capacitor` with an
+///   `isNativePlatform()` returning true, so the frontend's one "is this
+///   native?" check covered desktop too. That impersonation is gone: the
+///   frontend detects us from Tauri's own IPC globals (`lib/platform.ts`) and
+///   reads this namespace for the bridge. Nothing here claims to be mobile, so
+///   phone-only features (FCM push, biometrics, safe-area insets, Android
+///   back) cannot switch on by accident. Method names still match
+///   openframe-mobile's NativeAuthPlugin — one frontend interface, two
+///   implementations — but only the methods desktop actually implements.
 fn env_init_script(app: &AppHandle) -> String {
     let env = serde_json::json!({
         "NEXT_PUBLIC_SHARED_HOST_URL": shared_host(&load_config(app)).unwrap_or_default(),
@@ -151,38 +196,32 @@ fn env_init_script(app: &AppHandle) -> String {
     });
     format!(
         r#"window.__ENV = {env};
-window.Capacitor = {{
-  isNativePlatform: function () {{ return true; }},
-  Plugins: {{
-    NativeAuth: {{
-      start: function (o) {{
-        return window.__TAURI_INTERNALS__.invoke('native_auth_start', {{
-          url: o.url, callbackHost: o.callbackHost, callbackPath: o.callbackPath
-        }});
-      }},
-      exchangeTicket: function (o) {{
-        return window.__TAURI_INTERNALS__.invoke('native_auth_exchange_ticket', {{ url: o.url }});
-      }},
-      getTokens: function () {{
-        return window.__TAURI_INTERNALS__.invoke('native_auth_get_tokens');
-      }},
-      setTokens: function (o) {{
-        return window.__TAURI_INTERNALS__.invoke('native_auth_set_tokens', {{
-          accessToken: o.accessToken || null, refreshToken: o.refreshToken || null
-        }});
-      }},
-      clearTokens: function () {{
-        return window.__TAURI_INTERNALS__.invoke('native_auth_clear_tokens');
-      }},
-      refreshTokens: function () {{
-        return window.__TAURI_INTERNALS__.invoke('native_auth_refresh_tokens');
-      }},
-      setTenantHost: function (o) {{
-        return window.__TAURI_INTERNALS__.invoke('native_auth_set_tenant_host', {{ origin: o.origin }});
-      }},
-      getSafeAreaInsets: function () {{
-        return Promise.resolve({{ top: 0, bottom: 0, left: 0, right: 0 }});
-      }}
+window.__OPENFRAME_SHELL__ = {{
+  nativeAuth: {{
+    start: function (o) {{
+      return window.__TAURI_INTERNALS__.invoke('native_auth_start', {{
+        url: o.url, callbackHost: o.callbackHost, callbackPath: o.callbackPath
+      }});
+    }},
+    exchangeTicket: function (o) {{
+      return window.__TAURI_INTERNALS__.invoke('native_auth_exchange_ticket', {{ url: o.url }});
+    }},
+    getTokens: function () {{
+      return window.__TAURI_INTERNALS__.invoke('native_auth_get_tokens');
+    }},
+    setTokens: function (o) {{
+      return window.__TAURI_INTERNALS__.invoke('native_auth_set_tokens', {{
+        accessToken: o.accessToken || null, refreshToken: o.refreshToken || null
+      }});
+    }},
+    clearTokens: function () {{
+      return window.__TAURI_INTERNALS__.invoke('native_auth_clear_tokens');
+    }},
+    refreshTokens: function () {{
+      return window.__TAURI_INTERNALS__.invoke('native_auth_refresh_tokens');
+    }},
+    setTenantHost: function (o) {{
+      return window.__TAURI_INTERNALS__.invoke('native_auth_set_tenant_host', {{ origin: o.origin }});
     }}
   }}
 }};
@@ -262,14 +301,15 @@ fn reopen_main_window(app: &AppHandle) {
     tauri::async_runtime::spawn(async move {
         for _ in 0..50 {
             if app.get_webview_window(MAIN_LABEL).is_none() {
-                if let Err(e) = open_main_window(&app) {
-                    log::error!("reopen main window: {e}");
-                }
+                raise_or_open_main_window(&app);
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        log::error!("reopen main window: destroyed window never released the label");
+        // Either the destroyed window never released the label, or something
+        // else (the tray, a notification) already rebuilt it — both leave the
+        // label taken, and only the first is a problem.
+        log::warn!("reopen main window: label still taken after destroy");
     });
 }
 
@@ -393,6 +433,11 @@ fn open_external(url: &str) -> std::io::Result<()> {
     cmd.arg(url).spawn().map(|_| ())
 }
 
+/// Raise the main window. Deliberately a no-op when there is none: on Windows a
+/// click delivered during setup would otherwise build the window itself, and
+/// setup's own `open_main_window` would then find it and reveal it unpainted.
+/// Leaving the payload stashed keeps the reveal with `handle_page_load`.
+/// Callers acting on a direct user request want [`raise_or_open_main_window`].
 pub(crate) fn show_primary_window(app: &AppHandle) {
     if let Some(win) = app.get_webview_window(MAIN_LABEL) {
         #[cfg(target_os = "macos")]
@@ -400,6 +445,20 @@ pub(crate) fn show_primary_window(app: &AppHandle) {
         let _ = win.show();
         let _ = win.unminimize();
         let _ = win.set_focus();
+        // The window may have sat in the tray for hours. Get the session current
+        // before the page's first request 401s into the refresh-or-logout path.
+        tokens::refresh_soon(app, "window shown");
+    }
+}
+
+/// The user asked for the app — from the tray, a relaunch, or a notification
+/// button that turned out to need a window. Unlike [`show_primary_window`] this
+/// builds one when the process has none, which a `-ToastActivated` launch does:
+/// it opens no window in setup, so without this the tray would be inert for the
+/// life of that process.
+pub(crate) fn raise_or_open_main_window(app: &AppHandle) {
+    if let Err(e) = open_main_window(app) {
+        log::error!("open main window: {e}");
     }
 }
 
@@ -423,7 +482,7 @@ fn sign_out(app: &AppHandle) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// NativeAuth bridge — backs the window.Capacitor.Plugins.NativeAuth shim (see
+// NativeAuth bridge — backs window.__OPENFRAME_SHELL__.nativeAuth (see
 // env_init_script). Mirrors openframe-mobile's NativeAuthPlugin.swift: login
 // window -> ?devTicket= capture -> native token exchange -> local token store.
 // ---------------------------------------------------------------------------
@@ -577,17 +636,40 @@ async fn native_auth_get_tokens(app: AppHandle) -> Result<NativeAuthTokens, Stri
 /// Shell-owned refresh, delegated to by the webview's token-refresh-manager on
 /// upstream 401s. Force-refreshes (exp can't predict revocation), dampened by
 /// the previous access token so parallel callers don't rotate twice.
+///
+/// A transient failure resolves with the tokens we still hold rather than
+/// rejecting. The webview cannot act on the difference: it maps every refresh
+/// that doesn't yield an access token to `forceLogout`, which calls back into
+/// `native_auth_clear_tokens` and deletes a refresh token that is good for days
+/// — so a rejection here turns one failed request into a lost session. Resolving
+/// with the stored set makes the caller retry that request (and fail it, which
+/// is not terminal) while the shell keeps retrying the rotation on its own.
+/// Deciding a session is over stays where custody is: `tokens::refresh` clears
+/// the store itself and then resolves empty, which the webview does act on.
 #[tauri::command]
 async fn native_auth_refresh_tokens(app: AppHandle) -> Result<NativeAuthTokens, String> {
     log::info!("[tokens] webview requested a refresh (upstream 401)");
     let prev_access = tokens::load_tokens(&app).access_token;
-    tokens::refresh(&app, true, prev_access).await
+    match tokens::refresh(&app, true, prev_access, "webview upstream 401").await {
+        Ok(tokens) => Ok(tokens),
+        Err(e) => {
+            let stored = tokens::load_tokens(&app);
+            if stored.access_token.is_some() && stored.refresh_token.is_some() {
+                log::warn!(
+                    "[tokens] delegated refresh failed transiently ({e}) — keeping the session"
+                );
+                return Ok(stored);
+            }
+            Err(e)
+        }
+    }
 }
 
-/// Merge semantics: only fields that arrive are overwritten — token-rotation
-/// responses may carry one token or both (matches the mobile Keychain plugin).
+/// Merge semantics and the lock they need both live in `tokens::merge_and_save`:
+/// a write from the webview must not land on top of a rotation the shell
+/// completed in between.
 #[tauri::command]
-fn native_auth_set_tokens(
+async fn native_auth_set_tokens(
     app: AppHandle,
     access_token: Option<String>,
     refresh_token: Option<String>,
@@ -597,14 +679,7 @@ fn native_auth_set_tokens(
         access_token.is_some(),
         refresh_token.is_some()
     );
-    let mut stored = tokens::load_tokens(&app);
-    if access_token.is_some() {
-        stored.access_token = access_token;
-    }
-    if refresh_token.is_some() {
-        stored.refresh_token = refresh_token;
-    }
-    tokens::save_tokens(&app, &stored)?;
+    tokens::merge_and_save(&app, access_token, refresh_token).await?;
     // A sign-in on a connection that never dropped (the previous user signed
     // out under it) gets no Connected event — subscribe for the new user here.
     nats::resubscribe(&app);
@@ -656,15 +731,18 @@ fn take_pending_notification_click(window: WebviewWindow) -> Option<serde_json::
     notifications::take_startup_click(window.app_handle())
 }
 
-/// Deliver a notification-activation URI carried in a process's arguments —
-/// the Windows toast click path, either our own argv (cold start) or a second
-/// launch forwarded by the single-instance plugin (warm click). Returns true
-/// when one was found and delivered; the caller then skips its own
-/// window-raising, since delivery raises the window itself.
+/// Deliver a notification-activation URI carried in a process's arguments — the
+/// Windows toast click path, either our own argv (cold start) or a second launch
+/// forwarded by the single-instance plugin (warm click). Delivery raises the
+/// window only when there already is one, so callers still have to decide
+/// whether this process should have one at all.
 #[cfg(target_os = "windows")]
-fn handle_notification_argv(app: &AppHandle, args: impl IntoIterator<Item = String>) -> bool {
-    args.into_iter()
-        .any(|arg| notifications::handle_notification_uri(app, &arg))
+fn handle_notification_argv(app: &AppHandle, args: &[String]) {
+    for arg in args {
+        if notifications::handle_notification_uri(app, arg) {
+            return;
+        }
+    }
 }
 
 /// Register the `openframe-desktop://` URI scheme (HKCU, no elevation).
@@ -675,19 +753,32 @@ fn register_url_scheme() {
     use winreg::{enums::*, RegKey};
 
     let Ok(exe) = std::env::current_exe() else {
-        log::warn!("url scheme: current_exe unavailable — skipping registration");
+        log::warn!(
+            "url scheme: current_exe unavailable — notification clicks will not open the app"
+        );
         return;
     };
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let path = format!(r"Software\Classes\{}", notifications::URI_SCHEME);
-    let Ok((key, _)) = hkcu.create_subkey(&path) else {
-        log::warn!("url scheme: failed to create registry key {path}");
-        return;
-    };
-    let _ = key.set_value("", &"URL:OpenFrame Desktop");
-    let _ = key.set_value("URL Protocol", &"");
-    if let Ok((command, _)) = key.create_subkey(r"shell\open\command") {
-        let _ = command.set_value("", &format!("\"{}\" \"%1\"", exe.display()));
+    // `URL Protocol` is what marks the key as a protocol handler and the command
+    // under it is what the shell dispatches to; with either missing, a toast
+    // activates a scheme that resolves to nothing and the click is lost in the
+    // shell, not here. So they are written as one fallible sequence rather than
+    // four discarded results — same reason `windows_activator::register` is.
+    // The display name is cosmetic and stays out of it.
+    let written = hkcu
+        .create_subkey(&path)
+        .and_then(|(key, _)| {
+            let _ = key.set_value("", &"URL:OpenFrame Desktop");
+            key.set_value("URL Protocol", &"")?;
+            key.create_subkey(r"shell\open\command")
+        })
+        .and_then(|(command, _)| command.set_value("", &format!("\"{}\" \"%1\"", exe.display())));
+    match written {
+        Ok(()) => log::info!("url scheme {} registered", notifications::URI_SCHEME),
+        Err(err) => log::warn!(
+            "url scheme not registered ({err}) — notification clicks will not open the app"
+        ),
     }
 }
 
@@ -721,11 +812,11 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
                 ..
             } = event
             {
-                show_primary_window(tray.app_handle());
+                raise_or_open_main_window(tray.app_handle());
             }
         })
         .on_menu_event(|app, event| match event.id.as_ref() {
-            "show" => show_primary_window(app),
+            "show" => raise_or_open_main_window(app),
             "signout" => {
                 if let Err(e) = sign_out(app) {
                     log::error!("sign_out failed: {e}");
@@ -744,16 +835,26 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             // A Windows toast click activates the openframe-desktop:// URI,
             // which reaches the running instance as a second launch carrying it
-            // in argv. Anything else is the user re-launching the app.
+            // in argv. Anything else is the user re-launching the app — except a
+            // COM server launch, which only happens if this instance failed to
+            // register the activator, and must not put a window on screen for a
+            // press meant to run in the background.
             #[cfg(target_os = "windows")]
-            let handled = handle_notification_argv(app, argv);
+            let handled = {
+                // Deliver first, decide about the window after: a click only
+                // stashes its payload when there is no window to emit at, and
+                // this process may well have none — a COM server launch opens
+                // none, and it is the one case that must stay windowless.
+                handle_notification_argv(app, &argv);
+                windows_activator::is_activation_launch(&argv)
+            };
             #[cfg(not(target_os = "windows"))]
             let handled = {
                 let _ = argv;
                 false
             };
             if !handled {
-                show_primary_window(app);
+                raise_or_open_main_window(app);
             }
         }))
         .plugin(
@@ -793,7 +894,10 @@ pub fn run() {
             build_tray(app)?;
             #[cfg(target_os = "windows")]
             register_url_scheme();
+            tokens::spawn_wake_watch(app.handle().clone());
             tokens::spawn_refresh_loop(app.handle().clone());
+            #[cfg(target_os = "macos")]
+            macos_wake::observe(app.handle().clone());
             notifications::init(app.handle());
             nats::spawn(app.handle().clone());
 
@@ -815,10 +919,24 @@ pub fn run() {
             // handle_page_load still owns the reveal, so no unpainted flash.
             // `args_os`, not `args`: the latter panics on non-UTF-8 arguments.
             #[cfg(target_os = "windows")]
-            handle_notification_argv(
-                &handle,
-                std::env::args_os().filter_map(|arg| arg.into_string().ok()),
-            );
+            {
+                let argv: Vec<String> = std::env::args_os()
+                    .filter_map(|arg| arg.into_string().ok())
+                    .collect();
+                handle_notification_argv(&handle, &argv);
+                // COM started this process only to serve a button press, and a
+                // press that completes in the background must not put a window
+                // on screen for it. Which press it is arrives after setup, so
+                // the activator raises the window itself for the ones that need
+                // one. The process stays resident afterwards rather than exiting
+                // — the same outcome as a macOS relaunch, and it means a press
+                // on a stale toast after the user chose Quit brings the app back
+                // to the tray.
+                if windows_activator::is_activation_launch(&argv) {
+                    log::info!("started to serve a toast activation — not opening a window");
+                    return Ok(());
+                }
+            }
 
             updater::spawn_poll_loop(handle.clone());
             let startup_handle = handle.clone();

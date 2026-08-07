@@ -9,6 +9,12 @@
 // `notification:click` JSON), so it survives process restarts and no
 // in-process id→target registry is needed.
 //
+// Notifications that carry an actionable context get buttons that complete the
+// work without opening a window: Approve/Reject on an AI tool-approval request,
+// inline Reply on a Mingo message. What this file owns of that is the macOS
+// half — categories, the delegate, and decoding a response; the decision itself
+// and its session gate live in `notification_actions`, shared with Windows.
+//
 // UN APIs abort in processes without a bundle identifier, so `init` refuses to
 // activate for dev builds (`tauri dev` runs a bare binary) — those have no OS
 // notifications.
@@ -28,15 +34,31 @@ use objc2_user_notifications::{
     UNAuthorizationOptions, UNMutableNotificationContent, UNNotification, UNNotificationAction,
     UNNotificationActionOptions, UNNotificationCategory, UNNotificationCategoryOptions,
     UNNotificationPresentationOptions, UNNotificationRequest, UNNotificationResponse,
-    UNUserNotificationCenter, UNUserNotificationCenterDelegate,
+    UNTextInputNotificationAction, UNTextInputNotificationResponse, UNUserNotificationCenter,
+    UNUserNotificationCenterDelegate,
 };
 use tauri::AppHandle;
 
-use crate::notifications::deliver_click;
+use crate::{
+    notification_actions::{Action, ActionContext, ActionKind},
+    notifications::deliver_click,
+};
 
-const CATEGORY_ID: &str = "openframe-desktop-notification";
+/// Keeps its original id: notifications already sitting in Notification Center
+/// resolve their category by identifier, and a rename would strip their button.
+const CATEGORY_DEFAULT: &str = "openframe-desktop-notification";
+const CATEGORY_APPROVAL: &str = "openframe-desktop-approval";
+const CATEGORY_MESSAGE: &str = "openframe-desktop-message";
+
 const OPEN_ACTION_ID: &str = "open";
+const APPROVE_ACTION_ID: &str = "approve";
+const REJECT_ACTION_ID: &str = "reject";
+const REPLY_ACTION_ID: &str = "reply";
+
 const PAYLOAD_KEY: &str = "of-click-payload";
+/// The user the notification was delivered to, stamped at fire time. An action
+/// taken later is refused unless the session still belongs to them.
+const USER_KEY: &str = "of-user-id";
 
 /// The delegate has no state of its own; clicks are routed back into the shell
 /// through this slot. Set once at `init`, before the delegate is installed.
@@ -47,10 +69,10 @@ fn active() -> bool {
     ACTIVE.load(Ordering::Acquire)
 }
 
-/// Install the delegate and register the action category. Called from
+/// Install the delegate and register the action categories. Called from
 /// `notifications::init` during Tauri setup — early enough that a cold-start
 /// click's response (delivered right after launch) finds the delegate.
-pub fn init(app: &AppHandle) {
+pub(crate) fn init(app: &AppHandle) {
     if tauri::is_dev() {
         return;
     }
@@ -67,7 +89,7 @@ pub fn init(app: &AppHandle) {
         let delegate = NotificationDelegate::new();
         let center = UNUserNotificationCenter::currentNotificationCenter();
         center.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
-        register_category(&center);
+        register_categories(&center);
         delegate
     });
 
@@ -78,7 +100,7 @@ pub fn init(app: &AppHandle) {
 /// Ask macOS for notification permission once. Denial is not an error —
 /// notifications just won't display, which the user controls in System
 /// Settings.
-pub fn ensure_authorized() {
+pub(crate) fn ensure_authorized() {
     if !active() {
         return;
     }
@@ -105,7 +127,17 @@ pub fn ensure_authorized() {
         );
 }
 
-pub fn fire(title: String, body: String, click: Option<serde_json::Value>) {
+/// Post a notification. `user_id` is the user it is delivered to, stamped into
+/// `userInfo` so a button pressed hours later can check it still matches the
+/// signed-in session; a follow-up that reports an action's outcome carries none.
+pub(crate) fn post(
+    title: String,
+    body: String,
+    click: Option<serde_json::Value>,
+    user_id: Option<String>,
+    kind: ActionKind,
+) {
+    let category = category_for(kind).to_string();
     if !active() {
         log::debug!("[notifications] UN backend inactive (dev/unbundled build) — dropping");
         return;
@@ -118,12 +150,20 @@ pub fn fire(title: String, body: String, click: Option<serde_json::Value>) {
         if !body.is_empty() {
             content.setBody(&NSString::from_str(&body));
         }
-        content.setCategoryIdentifier(&NSString::from_str(CATEGORY_ID));
+        content.setCategoryIdentifier(&NSString::from_str(&category));
 
-        if let Some(click) = &click {
-            let key = NSString::from_str(PAYLOAD_KEY);
-            let value = NSString::from_str(&click.to_string());
-            let dict = NSDictionary::from_slices(&[&*key], &[&*value]);
+        let entries = [
+            (PAYLOAD_KEY, click.as_ref().map(|click| click.to_string())),
+            (USER_KEY, user_id),
+        ];
+        let entries: Vec<(Retained<NSString>, Retained<NSString>)> = entries
+            .into_iter()
+            .filter_map(|(key, value)| Some((NSString::from_str(key), NSString::from_str(&value?))))
+            .collect();
+        if !entries.is_empty() {
+            let keys: Vec<&NSString> = entries.iter().map(|(key, _)| &**key).collect();
+            let values: Vec<&NSString> = entries.iter().map(|(_, value)| &**value).collect();
+            let dict = NSDictionary::from_slices(&keys, &values);
             // Erase the generics: setUserInfo takes an untyped NSDictionary.
             // Layout-identical (generics on objc2 collections are phantom);
             // NSStrings satisfy the plist requirement.
@@ -156,31 +196,134 @@ pub fn fire(title: String, body: String, click: Option<serde_json::Value>) {
     });
 }
 
-fn register_category(center: &UNUserNotificationCenter) {
-    // Foreground: clicking "Open" activates the app (a body click does so
-    // inherently). No CustomDismissAction — it would make macOS relaunch the
-    // app just to report a dismissal after the user quit it.
-    let action = UNNotificationAction::actionWithIdentifier_title_options(
-        &NSString::from_str(OPEN_ACTION_ID),
-        &NSString::from_str("Open"),
-        UNNotificationActionOptions::Foreground,
-    );
-    let category = UNNotificationCategory::categoryWithIdentifier_actions_intentIdentifiers_options(
-        &NSString::from_str(CATEGORY_ID),
-        &NSArray::from_retained_slice(&[action]),
-        &NSArray::new(),
-        UNNotificationCategoryOptions::empty(),
-    );
-    center.setNotificationCategories(&NSSet::from_retained_slice(&[category]));
+fn category_for(kind: ActionKind) -> &'static str {
+    match kind {
+        ActionKind::Approval => CATEGORY_APPROVAL,
+        ActionKind::Message => CATEGORY_MESSAGE,
+        ActionKind::Default => CATEGORY_DEFAULT,
+    }
 }
 
-fn payload_from_response(response: &UNNotificationResponse) -> Option<serde_json::Value> {
-    let user_info = response.notification().request().content().userInfo();
-    let key = NSString::from_str(PAYLOAD_KEY);
+/// `setNotificationCategories` replaces the whole set, so all three are
+/// registered in one call at init.
+///
+/// **How many buttons the user sees is macOS's call, not ours.** A banner folds
+/// every action behind the "Options" chevron regardless of count — two actions
+/// collapse just like three (verified on 15.x), and no `UNNotificationAction`
+/// or category option overrides it. Only the Alerts notification style, which
+/// the user chooses in System Settings, renders actions as buttons.
+///
+/// What the app does control is what is in that menu, so the approval category
+/// carries the decision and nothing else: "Open" is left off there, since a
+/// click on the notification body already activates the app. The other two
+/// categories keep it — with nothing to decide, it is the only action they
+/// offer.
+fn register_categories(center: &UNUserNotificationCenter) {
+    // Foreground: clicking "Open" activates the app (a body click does so
+    // inherently). No CustomDismissAction on any category — it would make macOS
+    // relaunch the app just to report a dismissal after the user quit it.
+    let open = || {
+        UNNotificationAction::actionWithIdentifier_title_options(
+            &NSString::from_str(OPEN_ACTION_ID),
+            &NSString::from_str("Open"),
+            UNNotificationActionOptions::Foreground,
+        )
+    };
+    // AuthenticationRequired is the device-lock gate only; the gate that
+    // matters — that a signed-in session still owns this notification — is
+    // enforced in `notification_actions::run_action`, because macOS has no
+    // notion of our session.
+    let approve = UNNotificationAction::actionWithIdentifier_title_options(
+        &NSString::from_str(APPROVE_ACTION_ID),
+        &NSString::from_str("Approve"),
+        UNNotificationActionOptions::AuthenticationRequired,
+    );
+    // Destructive (red) and one click: denying a tool execution is the fail-safe
+    // direction, so it must not be harder than approving.
+    let reject = UNNotificationAction::actionWithIdentifier_title_options(
+        &NSString::from_str(REJECT_ACTION_ID),
+        &NSString::from_str("Reject"),
+        UNNotificationActionOptions::Destructive,
+    );
+    let reply = UNTextInputNotificationAction::actionWithIdentifier_title_options_textInputButtonTitle_textInputPlaceholder(
+        &NSString::from_str(REPLY_ACTION_ID),
+        &NSString::from_str("Reply"),
+        UNNotificationActionOptions::empty(),
+        &NSString::from_str("Send"),
+        &NSString::from_str("Reply to Mingo"),
+    );
+
+    let category = |id: &str, actions: &[Retained<UNNotificationAction>]| {
+        UNNotificationCategory::categoryWithIdentifier_actions_intentIdentifiers_options(
+            &NSString::from_str(id),
+            &NSArray::from_retained_slice(actions),
+            &NSArray::new(),
+            UNNotificationCategoryOptions::empty(),
+        )
+    };
+    center.setNotificationCategories(&NSSet::from_retained_slice(&[
+        category(CATEGORY_DEFAULT, &[open()]),
+        category(CATEGORY_APPROVAL, &[approve, reject]),
+        category(CATEGORY_MESSAGE, &[reply.into_super(), open()]),
+    ]));
+}
+
+// ---------------------------------------------------------------------------
+// Response routing
+// ---------------------------------------------------------------------------
+
+/// Everything a background action needs, lifted out of the ObjC response before
+/// the async work starts — none of it can cross a thread boundary otherwise.
+/// The category identifier is deliberately not read back: the button set a
+/// re-post needs is derived from the payload, which is where the category came
+/// from at fire time.
+fn action_context(response: &UNNotificationResponse) -> ActionContext {
+    let content = response.notification().request().content();
+    let user_info = content.userInfo();
+    ActionContext {
+        title: content.title().to_string(),
+        payload: user_info_str(&user_info, PAYLOAD_KEY)
+            .and_then(|json| serde_json::from_str(&json).ok()),
+        user_id: user_info_str(&user_info, USER_KEY),
+    }
+}
+
+fn handle_response(app: &AppHandle, action_id: &str, response: &UNNotificationResponse) {
+    let context = action_context(response);
+    let action = match action_id {
+        APPROVE_ACTION_ID => Action::Approve,
+        REJECT_ACTION_ID => Action::Reject,
+        REPLY_ACTION_ID => {
+            // A reply must arrive as the text-input subclass; anything else is
+            // macOS behaving unexpectedly, and silently dropping the user's
+            // words — the field is already cleared — would leave no trace.
+            let Some(response) = response.downcast_ref::<UNTextInputNotificationResponse>() else {
+                log::warn!("[notifications] reply response carried no text input — dropping");
+                return;
+            };
+            let text = response.userText().to_string().trim().to_string();
+            if text.is_empty() {
+                // Nothing was typed — not a failure worth a banner.
+                return;
+            }
+            Action::Reply(text)
+        }
+        // The notification body, "Open", and anything unrecognized (a category
+        // from an older build): raise the window, today's behaviour.
+        _ => {
+            deliver_click(app, context.payload);
+            return;
+        }
+    };
+
+    crate::notification_actions::spawn(app, context, action);
+}
+
+fn user_info_str(user_info: &NSDictionary, key: &str) -> Option<String> {
+    let key = NSString::from_str(key);
     let key: &AnyObject = &key;
     let value = user_info.objectForKey(key)?;
-    let json = value.downcast_ref::<NSString>()?.to_string();
-    serde_json::from_str(&json).ok()
+    Some(value.downcast_ref::<NSString>()?.to_string())
 }
 
 define_class!(
@@ -192,9 +335,10 @@ define_class!(
 
     unsafe impl UNUserNotificationCenterDelegate for NotificationDelegate {
         /// Without this, macOS silently drops notifications while the app is
-        /// frontmost. `should_notify` already gates on window focus, so
-        /// anything reaching this point should display. Banner only — the
-        /// pre-UN path was silent.
+        /// frontmost. Incoming ones are already gated on window focus by
+        /// `should_notify`; an action's follow-up deliberately is not — it
+        /// answers something the user just did. No Sound option: the pre-UN
+        /// path was silent.
         #[unsafe(method(userNotificationCenter:willPresentNotification:withCompletionHandler:))]
         fn will_present_notification(
             &self,
@@ -202,12 +346,23 @@ define_class!(
             _notification: &UNNotification,
             completion_handler: &DynBlock<dyn Fn(UNNotificationPresentationOptions)>,
         ) {
-            completion_handler.call((UNNotificationPresentationOptions::Banner,));
+            // List as well as Banner: an action's follow-up must survive in
+            // Notification Center, because a failed reply's banner is the only
+            // place the typed text still exists once macOS clears the field.
+            let options =
+                UNNotificationPresentationOptions::Banner | UNNotificationPresentationOptions::List;
+            completion_handler.call((options,));
         }
 
-        /// Every response is a user click (notification body or the Open
-        /// button): dismiss events are only reported with CustomDismissAction,
-        /// which the category deliberately does not set.
+        /// A response is a body click, an action button, or a submitted inline
+        /// reply: dismiss events are only reported with CustomDismissAction,
+        /// which no category sets.
+        ///
+        /// The completion handler is called before the background actions
+        /// finish, because it cannot be moved onto another thread (blocks are
+        /// not `Send`) and this runs on the main thread. That is safe here: the
+        /// shell is a normal app with a live event loop, not an extension the
+        /// system tears down on completion.
         #[unsafe(method(userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:))]
         fn did_receive_response(
             &self,
@@ -215,12 +370,10 @@ define_class!(
             response: &UNNotificationResponse,
             completion_handler: &DynBlock<dyn Fn()>,
         ) {
-            log::info!(
-                "[notifications] response (action={})",
-                response.actionIdentifier()
-            );
+            let action_id = response.actionIdentifier().to_string();
+            log::info!("[notifications] response (action={action_id})");
             if let Some(app) = ROUTER.get() {
-                deliver_click(app, payload_from_response(response));
+                handle_response(app, &action_id, response);
             }
             completion_handler.call(());
         }

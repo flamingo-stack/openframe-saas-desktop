@@ -40,16 +40,15 @@ runs:
         cache-targets: true
         cache-on-failure: true
 
-    # Empty entries are skipped: `rustup target add ""` is a hard error.
+    # Split on commas and let word splitting drop blanks, so `rustup target add ""`
+    # can't happen and no empty array is expanded — bash 3.2, which is what the
+    # macOS runner ships, rejects that under `set -u`.
     - name: Add Rust targets, if needed
       shell: bash
       env:
         TARGETS: ${{ inputs.targets }}
       run: |
         set -euo pipefail
-        IFS=',' read -ra ARCHITECTURES <<< "$TARGETS"
-        for RUST_TARGET in "${ARCHITECTURES[@]}"; do
-          RUST_TARGET=$(echo "$RUST_TARGET" | tr -d '[:space:]')
-          [ -n "$RUST_TARGET" ] || continue
-          rustup target list --installed | grep -q "^${RUST_TARGET}$" || (echo "Adding $RUST_TARGET" && rustup target add "$RUST_TARGET")
+        for RUST_TARGET in $(echo "$TARGETS" | tr ',' ' '); do
+          rustup target list --installed | grep -q "^${RUST_TARGET}$" || { echo "Adding $RUST_TARGET"; rustup target add "$RUST_TARGET"; }
         done

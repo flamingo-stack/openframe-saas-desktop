@@ -170,7 +170,7 @@ jobs:
           BUNDLE="src-tauri/target/${TARGET}/release/bundle"
 
           set -- "$BUNDLE"/dmg/*.dmg "$BUNDLE"/macos/*.app.tar.gz{,.sig} "$BUNDLE"/nsis/*-setup.exe{,.sig}
-          [ $# -gt 0 ] || { echo "::error::no artifacts found under $BUNDLE"; ls -R "$BUNDLE" 2>/dev/null | head -50; exit 1; }
+          [ $# -gt 0 ] || { echo "::error::no artifacts found under $BUNDLE"; find "$BUNDLE" 2>/dev/null | head -50; exit 1; }
 
           mkdir -p artifacts
           for f; do cp "$f" "artifacts/$(basename "$f" | tr ' ' '-')"; done
@@ -287,8 +287,8 @@ jobs:
             row "macOS (Universal) — update"       final-artifacts/*.app.tar.gz
             row "Windows x64 — install + update"   final-artifacts/*_x64-setup.exe
             row "Windows arm64 — install + update" final-artifacts/*_arm64-setup.exe
-            printf '\nBuilt against shared auth host `%s`.\n' "$SHARED_HOST"
-            [ -f final-artifacts/latest.json ] && printf '\nUpdater manifest: `latest.json`.\n' || true
+            printf "\nBuilt against shared auth host \`%s\`.\n" "$SHARED_HOST"
+            if [ -f final-artifacts/latest.json ]; then printf "\nUpdater manifest: \`latest.json\`.\n"; fi
             printf '\n---\n'
           } > RELEASE_HEADER.md
           cat RELEASE_HEADER.md

@@ -66,10 +66,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          latest="$LATEST"
-
           # First release only: nothing to bump from, so it must be explicit.
-          if [[ -z "$latest" ]]; then
+          if [[ -z "$LATEST" ]]; then
             if [[ -z "$INPUT_VERSION" ]]; then
               echo "::error::No published releases to bump from. Pass an explicit version (x.y.z) for the first release."
               exit 1
@@ -84,24 +82,20 @@ jobs:
             exit 0
           fi
 
-          IFS='.' read -r cur_major cur_minor cur_patch <<< "$latest"
+          IFS='.' read -r cur_major cur_minor cur_patch <<< "$LATEST"
+          next_major="$((cur_major + 1)).0.0"
+          next_minor="${cur_major}.$((cur_minor + 1)).0"
+          next_patch="${cur_major}.${cur_minor}.$((cur_patch + 1))"
 
           if [ -z "$INPUT_VERSION" ]; then
-            version="${cur_major}.${cur_minor}.$((cur_patch + 1))"
-            echo "No version provided, auto patch bump: ${latest} -> ${version}"
+            version="$next_patch"
+            echo "No version provided, auto patch bump: ${LATEST} -> ${version}"
           else
-            if ! [[ "$INPUT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-              echo "Invalid version format: ${INPUT_VERSION} (expected x.y.z)"
-              exit 1
-            fi
-            IFS='.' read -r new_major new_minor new_patch <<< "$INPUT_VERSION"
-            if ! ([ "$new_major" -eq $((cur_major + 1)) ] && [ "$new_minor" -eq 0 ] && [ "$new_patch" -eq 0 ]) &&
-               ! ([ "$new_major" -eq "$cur_major" ] && [ "$new_minor" -eq $((cur_minor + 1)) ] && [ "$new_patch" -eq 0 ]) &&
-               ! ([ "$new_major" -eq "$cur_major" ] && [ "$new_minor" -eq "$cur_minor" ] && [ "$new_patch" -eq $((cur_patch + 1)) ]); then
-              echo "Invalid version bump: ${latest} -> ${INPUT_VERSION} (expected $((cur_major + 1)).0.0, ${cur_major}.$((cur_minor + 1)).0, or ${cur_major}.${cur_minor}.$((cur_patch + 1)))"
-              exit 1
-            fi
-            version="$INPUT_VERSION"
+            # Matching one of the three legal successors also validates the format.
+            case "$INPUT_VERSION" in
+              "$next_major"|"$next_minor"|"$next_patch") version="$INPUT_VERSION" ;;
+              *) echo "::error::Invalid version bump: ${LATEST} -> ${INPUT_VERSION} (expected ${next_major}, ${next_minor}, or ${next_patch})"; exit 1 ;;
+            esac
             echo "Using provided version: ${version}"
           fi
 

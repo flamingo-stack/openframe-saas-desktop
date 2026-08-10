@@ -24,7 +24,7 @@ on:
         type: string
         default: ''
       shared_host_url:
-        description: "Shared auth host to bake in. Leave empty to use the OPENFRAME_SHARED_HOST_URL repo variable."
+        description: "Shared auth host to bake in. Leave empty to use the OPENFRAME_SHARED_HOST_URL repo secret."
         required: false
         type: string
         default: ''
@@ -93,10 +93,11 @@ jobs:
 
       - name: Resolve shared auth host
         env:
-          HOST: ${{ inputs.shared_host_url || vars.OPENFRAME_SHARED_HOST_URL }}
+          HOST: ${{ inputs.shared_host_url || secrets.OPENFRAME_SHARED_HOST_URL }}
         run: |
-          [ -n "$HOST" ] || { echo "::error::No shared auth host. Set the OPENFRAME_SHARED_HOST_URL repository variable, or pass shared_host_url on workflow_dispatch."; exit 1; }
-          echo "OPENFRAME_SHARED_HOST_URL=$HOST" | tee -a "$GITHUB_ENV"
+          [ -n "$HOST" ] || { echo "::error::No shared auth host. Set the OPENFRAME_SHARED_HOST_URL repository secret, or pass shared_host_url on workflow_dispatch."; exit 1; }
+          echo "OPENFRAME_SHARED_HOST_URL=$HOST" >> "$GITHUB_ENV"
+          echo "shared auth host resolved (masked in logs)"
 
       - name: Check updater signing key
         env:
@@ -271,7 +272,7 @@ jobs:
 
       - name: Generate release header
         env:
-          SHARED_HOST: ${{ inputs.shared_host_url || vars.OPENFRAME_SHARED_HOST_URL }}
+          SHARED_HOST: ${{ inputs.shared_host_url || secrets.OPENFRAME_SHARED_HOST_URL }}
         run: |
           set -euo pipefail
           shopt -s nullglob   # unmatched globs vanish, so .sig and latest.json skip themselves

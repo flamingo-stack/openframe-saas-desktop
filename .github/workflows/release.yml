@@ -1,0 +1,312 @@
+name: OpenFrame Desktop Release
+
+# =============================================================================
+# WORKFLOW CONFIGURATION
+# =============================================================================
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src-tauri/**'
+      - 'scripts/**'
+      - 'Makefile'
+      - 'package.json'
+      - 'package-lock.json'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to Release (x.y.z). Leave empty for auto patch bump."
+        required: false
+        type: string
+        default: ''
+      shared_host_url:
+        description: "Shared auth host to bake in. Leave empty to use the OPENFRAME_SHARED_HOST_URL repo variable."
+        required: false
+        type: string
+        default: ''
+      frontend_ref:
+        description: "openframe-oss-frontend branch or tag to bundle. Default main."
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# =============================================================================
+# JOBS
+# =============================================================================
+
+jobs:
+  version:
+    name: Resolve Version
+    permissions:
+      contents: read
+    uses: ./.github/workflows/version.yml
+    with:
+      version: ${{ inputs.version }}
+
+  build:
+    name: "Build: ${{ matrix.leg }}"
+    needs: [version]
+    permissions:
+      contents: read
+    runs-on: "${{ matrix.runner }}"
+    timeout-minutes: 120
+    env:
+      CARGO_INCREMENTAL: 0
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: macos-universal
+            runner: macos-latest
+            target: universal-apple-darwin
+            archs: aarch64-apple-darwin,x86_64-apple-darwin
+            bundles: app,dmg
+          - leg: windows-x64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            archs: x86_64-pc-windows-msvc
+            bundles: nsis
+          # Cross-compiled: no Windows/ARM64 runner on this plan.
+          - leg: windows-arm64
+            runner: windows-latest
+            target: aarch64-pc-windows-msvc
+            archs: aarch64-pc-windows-msvc
+            bundles: nsis
+
+    steps:
+      # `make build` runs npm and cargo over third-party code — leave it no credential.
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Resolve shared auth host
+        env:
+          HOST: ${{ inputs.shared_host_url || vars.OPENFRAME_SHARED_HOST_URL }}
+        run: |
+          [ -n "$HOST" ] || { echo "::error::No shared auth host. Set the OPENFRAME_SHARED_HOST_URL repository variable, or pass shared_host_url on workflow_dispatch."; exit 1; }
+          echo "OPENFRAME_SHARED_HOST_URL=$HOST" | tee -a "$GITHUB_ENV"
+
+      - name: Check updater signing key
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          wants=$(jq -r '.bundle.createUpdaterArtifacts // false' src-tauri/tauri.conf.json)
+          if [ "$wants" = true ] && [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "::error::createUpdaterArtifacts is set but TAURI_SIGNING_PRIVATE_KEY is empty. Generate with 'npx @tauri-apps/cli signer generate', then add TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD to this repo's Actions secrets."
+            exit 1
+          fi
+          echo "UPDATER_ARTIFACTS=$wants" | tee -a "$GITHUB_ENV"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Prepare Rust tools
+        uses: ./.github/steps/rust-setup
+        with:
+          path: src-tauri
+          toolchain: stable
+          targets: ${{ matrix.archs }}
+          shared-key: ${{ runner.os }}-${{ matrix.target }}
+
+      - name: Setup macOS code signing
+        if: runner.os == 'macOS'
+        uses: ./.github/steps/setup-macos-signing
+        with:
+          apple_certificate_p12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          apple_certificate_password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+
+      - name: Build desktop shell
+        env:
+          TARGET: ${{ matrix.target }}
+          BUNDLES: ${{ matrix.bundles }}
+          FRONTEND_REF: ${{ inputs.frontend_ref }}
+          # Never the 'latest' tag: this Makefile applies it and tauri needs semver.
+          OPENFRAME_VERSION: ${{ needs.version.outputs.app_version }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # macOS signing + notarization, performed by tauri during the build.
+          APPLE_SIGNING_IDENTITY: ${{ env.SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID_USERNAME }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: make build
+
+      - name: Authenticode-sign Windows installer
+        if: runner.os == 'Windows'
+        uses: ./.github/steps/sign-windows-package
+        with:
+          azure_tenant_id: ${{ secrets.AZURE_TENANT_ID }}
+          azure_client_id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure_client_secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          signing_endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          code_signing_account_name: ${{ secrets.AZURE_CODE_SIGNING_ACCOUNT_NAME }}
+          certificate_profile_name: ${{ secrets.AZURE_CERTIFICATE_PROFILE_NAME }}
+          tauri_signing_private_key: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          tauri_signing_private_key_password: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          target_path: ./src-tauri/target
+          target: ${{ matrix.target }}
+
+      - name: Collect artifacts
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          BUNDLE="src-tauri/target/${TARGET}/release/bundle"
+
+          set -- "$BUNDLE"/dmg/*.dmg "$BUNDLE"/macos/*.app.tar.gz{,.sig} "$BUNDLE"/nsis/*-setup.exe{,.sig}
+          [ $# -gt 0 ] || { echo "::error::no artifacts found under $BUNDLE"; ls -R "$BUNDLE" 2>/dev/null | head -50; exit 1; }
+
+          mkdir -p artifacts
+          for f; do cp "$f" "artifacts/$(basename "$f" | tr ' ' '-')"; done
+
+          if [ "${UPDATER_ARTIFACTS:-}" = true ]; then
+            set -- artifacts/*.sig
+            [ $# -gt 0 ] || { echo "::error::createUpdaterArtifacts is on but no .sig was produced for $TARGET"; exit 1; }
+          fi
+          ls -lh artifacts/
+
+      - name: Record bundled frontend commit
+        if: always()
+        env:
+          LEG: ${{ matrix.leg }}
+        run: |
+          sha=$(git -C .frontend rev-parse HEAD 2>/dev/null) || exit 0
+          echo "**$LEG** bundled \`openframe-oss-frontend@$sha\`" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: "openframe-desktop-${{ matrix.leg }}"
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Cleanup keychain
+        if: always() && runner.os == 'macOS'
+        run: |
+          if [[ -n "${KEYCHAIN_PATH:-}" ]] && [[ -f "${KEYCHAIN_PATH}" ]]; then
+            security delete-keychain "$KEYCHAIN_PATH"
+          fi
+
+
+  release:
+    name: "Create Release"
+    needs: [version, build]
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Prepare release artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p final-artifacts
+          find release-artifacts -type f -exec cp {} final-artifacts/ \;
+          if [ -z "$(ls -A final-artifacts)" ]; then
+            echo "::error::no artifacts to publish"
+            exit 1
+          fi
+          ls -lh final-artifacts/
+
+      - name: Generate updater manifest (latest.json)
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          REPO: ${{ github.repository }}
+          SERVER: ${{ github.server_url }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob   # a glob matching nothing must vanish, not pass itself through
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "not a release — skipping latest.json"; exit 0; }
+
+          base="$SERVER/$REPO/releases/download/$VERSION"
+          entries=""
+
+          # $1=platform key, rest=glob expansion, which must land on exactly one file.
+          emit() {
+            local key=$1; shift
+            [ $# -eq 1 ] || { echo "::error::$key: expected 1 artifact, found $#. Did tauri's naming change?"; ls -1 final-artifacts/; exit 1; }
+            [ -f "$1.sig" ] || { echo "::error::$(basename "$1") has no .sig"; exit 1; }
+            entries+=$(jq -nc --arg k "$key" --arg sig "$(cat "$1.sig")" --arg url "$base/$(basename "$1")" \
+              '{key: $k, value: {signature: $sig, url: $url}}')$'\n'
+            echo "$key -> $(basename "$1")"
+          }
+
+          # tauri resolves '{os}-{arch}' only, never 'darwin-universal', so the one
+          # universal tarball is listed under both mac arches.
+          emit darwin-aarch64  final-artifacts/*.app.tar.gz
+          emit darwin-x86_64   final-artifacts/*.app.tar.gz
+          emit windows-x86_64  final-artifacts/*_x64-setup.exe
+          emit windows-aarch64 final-artifacts/*_arm64-setup.exe
+
+          jq -s --arg version "$VERSION" --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{version: $version, notes: "OpenFrame Desktop \($version)", pub_date: $pub_date, platforms: from_entries}' \
+            <<< "$entries" > final-artifacts/latest.json
+
+          jq '.platforms |= map_values(.signature |= "<\(. | length) bytes>")' final-artifacts/latest.json
+
+      - name: Generate release header
+        env:
+          SHARED_HOST: ${{ inputs.shared_host_url || vars.OPENFRAME_SHARED_HOST_URL }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob   # unmatched globs vanish, so .sig and latest.json skip themselves
+          row() { local label=$1; shift; for f in "$@"; do echo "| $label | \`$(basename "$f")\` |"; done; }
+          {
+            echo "## OpenFrame Desktop"
+            echo
+            echo "Native shell bundling the openframe-oss-frontend static export."
+            echo
+            echo "| Platform | Artifact |"
+            echo "|---|---|"
+            row "macOS (Universal) — install"      final-artifacts/*.dmg
+            row "macOS (Universal) — update"       final-artifacts/*.app.tar.gz
+            row "Windows x64 — install + update"   final-artifacts/*_x64-setup.exe
+            row "Windows arm64 — install + update" final-artifacts/*_arm64-setup.exe
+            printf '\nBuilt against shared auth host `%s`.\n' "$SHARED_HOST"
+            [ -f final-artifacts/latest.json ] && printf '\nUpdater manifest: `latest.json`.\n' || true
+            printf '\n---\n'
+          } > RELEASE_HEADER.md
+          cat RELEASE_HEADER.md
+
+      - name: Delete existing latest release
+        if: ${{ github.event_name == 'push' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release delete latest --yes --cleanup-tag || true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.version }}
+          name: "🦩 ${{ needs.version.outputs.version }}"
+          draft: false
+          prerelease: ${{ github.event_name == 'push' }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          body_path: RELEASE_HEADER.md
+          files: |
+            final-artifacts/*

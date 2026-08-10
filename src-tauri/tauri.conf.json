@@ -45,6 +45,7 @@
       },
       "nsis": {
         "installMode": "currentUser"
+      },
       "wix": {
         "bannerPath": "installer/wix-banner.bmp",
         "dialogImagePath": "installer/wix-dialog.bmp"

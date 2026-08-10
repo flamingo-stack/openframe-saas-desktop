@@ -1,0 +1,55 @@
+name: Prepare Rust tools
+description: Set up Rust toolchain and Cargo cache
+inputs:
+  path:
+    description: Cargo workspace path (this repo's crate lives in src-tauri)
+    required: true
+  toolchain:
+    description: Rust toolchain (e.g. stable, 1.79.0, nightly)
+    required: false
+    default: stable
+  targets:
+    description: Comma-separated targets to add
+    required: false
+    default: ""
+  components:
+    description: Comma-separated components (e.g. clippy, rustfmt)
+    required: false
+    default: ""
+  shared-key:
+    description: Shared key to cache
+    required: false
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: ${{ inputs.toolchain }}
+        targets: ${{ inputs.targets }}
+        components: ${{ inputs.components }}
+
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: ${{ inputs.path }}
+        prefix-key: "v1-rust"
+        shared-key: ${{ inputs.shared-key }}
+        cache-targets: true
+        cache-on-failure: true
+
+    # Empty entries are skipped: `rustup target add ""` is a hard error.
+    - name: Add Rust targets, if needed
+      shell: bash
+      env:
+        TARGETS: ${{ inputs.targets }}
+      run: |
+        set -euo pipefail
+        IFS=',' read -ra ARCHITECTURES <<< "$TARGETS"
+        for RUST_TARGET in "${ARCHITECTURES[@]}"; do
+          RUST_TARGET=$(echo "$RUST_TARGET" | tr -d '[:space:]')
+          [ -n "$RUST_TARGET" ] || continue
+          rustup target list --installed | grep -q "^${RUST_TARGET}$" || (echo "Adding $RUST_TARGET" && rustup target add "$RUST_TARGET")
+        done

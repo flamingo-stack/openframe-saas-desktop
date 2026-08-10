@@ -1,0 +1,117 @@
+name: OpenFrame Desktop Test
+
+# =============================================================================
+# WORKFLOW CONFIGURATION
+# =============================================================================
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: pr-${{ github.head_ref || github.ref }}
+  cancel-in-progress: false
+
+# =============================================================================
+# JOBS
+# =============================================================================
+
+jobs:
+  lint:
+    name: "Lint"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/steps/yaml-lint
+
+      - uses: docker://rhysd/actionlint:1.7.7
+        with:
+          args: -color
+
+      - name: shellcheck
+        run: shellcheck scripts/*.sh
+
+      - name: Parse-check tauri.conf.json
+        run: |
+          set -euo pipefail
+          conf=src-tauri/tauri.conf.json
+          jq . "$conf" > /dev/null
+          if jq -e '.bundle.createUpdaterArtifacts and (.plugins.updater.pubkey // "") == ""' "$conf" > /dev/null; then
+            echo "::error file=$conf::createUpdaterArtifacts is on but plugins.updater.pubkey is empty"
+            exit 1
+          fi
+
+
+  test_shell:
+    name: "Test Shell: ${{ matrix.os }}"
+    runs-on: "${{ matrix.os }}-latest"
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    env:
+      CARGO_INCREMENTAL: 0
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos
+            extra_targets: ''
+          - os: windows
+            extra_targets: aarch64-pc-windows-msvc
+
+    steps:
+      # Runs PR-authored build scripts; never hand them a persisted credential.
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Prepare Rust tools
+        uses: ./.github/steps/rust-setup
+        with:
+          path: src-tauri
+          toolchain: stable
+          targets: ${{ matrix.extra_targets }}
+          components: clippy, rustfmt
+          shared-key: ${{ runner.os }}-${{ runner.arch }}
+
+      - name: Run lint
+        run: make lint
+
+      - name: Run tests
+        run: make test
+
+      # ARM64 is cross-compiled and never executed: this is its only check.
+      - name: Cross-compile check (${{ matrix.extra_targets }})
+        if: matrix.extra_targets != ''
+        run: |
+          set -euo pipefail
+          make web-placeholder
+          cd src-tauri && cargo check --all-targets --target "${{ matrix.extra_targets }}"
+
+
+  all-checks:
+    name: "All Checks"
+    needs: [lint, test_shell]
+    permissions: {}
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: exit 1
+      - run: echo "All checks passed"

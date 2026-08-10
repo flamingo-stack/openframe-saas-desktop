@@ -1,0 +1,138 @@
+name: Authenticode-sign Windows installers
+description: >-
+  Authenticode-sign the NSIS installer, then regenerate the Tauri updater
+  signature over the signed bytes — Authenticode rewrites the file, so the .sig
+  from the build no longer matches and every auto-update would fail.
+  No-ops with a warning when no Azure credentials are configured.
+
+inputs:
+  azure_tenant_id:
+    description: 'Azure AD tenant ID. Empty disables Authenticode signing.'
+    required: false
+    default: ''
+  azure_client_id:
+    description: 'Azure AD application (client) ID'
+    required: false
+    default: ''
+  azure_client_secret:
+    description: 'Azure AD client secret'
+    required: false
+    default: ''
+  signing_endpoint:
+    description: 'Azure Trusted Signing endpoint URL'
+    required: false
+    default: ''
+  code_signing_account_name:
+    description: 'Azure Trusted Signing account name'
+    required: false
+    default: ''
+  certificate_profile_name:
+    description: 'Certificate profile name'
+    required: false
+    default: ''
+  tauri_signing_private_key:
+    description: 'Tauri updater (minisign) private key, to re-sign after Authenticode'
+    required: false
+    default: ''
+  tauri_signing_private_key_password:
+    description: 'Password for the updater private key'
+    required: false
+    default: ''
+  target_path:
+    description: 'Cargo target directory (e.g. ./src-tauri/target)'
+    required: true
+  target:
+    description: 'Rust build target (e.g. x86_64-pc-windows-msvc)'
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Report signing mode
+      shell: bash
+      env:
+        TENANT: ${{ inputs.azure_tenant_id }}
+        TARGET_PATH: ${{ inputs.target_path }}
+        TARGET: ${{ inputs.target }}
+      run: |
+        set -euo pipefail
+        NSIS_DIR="$TARGET_PATH/$TARGET/release/bundle/nsis"
+        if [[ ! -d "$NSIS_DIR" ]]; then
+          echo "::error::no NSIS output at $NSIS_DIR"
+          ls -R "$TARGET_PATH/$TARGET/release/bundle" 2>/dev/null | head -50 || true
+          exit 1
+        fi
+        echo "NSIS_DIR=$NSIS_DIR" >> "$GITHUB_ENV"
+        ls -l "$NSIS_DIR"
+
+        if [[ -z "$TENANT" ]]; then
+          echo "SIGN_WINDOWS=false" >> "$GITHUB_ENV"
+          echo "::warning::AZURE_TENANT_ID is not set — the Windows installer is NOT Authenticode-signed. SmartScreen will warn on download and install."
+        else
+          echo "SIGN_WINDOWS=true" >> "$GITHUB_ENV"
+        fi
+
+    - name: Authenticode-sign installer
+      if: env.SIGN_WINDOWS == 'true'
+      uses: azure/trusted-signing-action@v0.5.0
+      with:
+        azure-tenant-id: ${{ inputs.azure_tenant_id }}
+        azure-client-id: ${{ inputs.azure_client_id }}
+        azure-client-secret: ${{ inputs.azure_client_secret }}
+        endpoint: ${{ inputs.signing_endpoint }}
+        trusted-signing-account-name: ${{ inputs.code_signing_account_name }}
+        certificate-profile-name: ${{ inputs.certificate_profile_name }}
+        files-folder: ${{ github.workspace }}/${{ inputs.target_path }}/${{ inputs.target }}/release/bundle/nsis
+        files-folder-filter: exe
+        file-digest: SHA256
+        timestamp-rfc3161: http://timestamp.acs.microsoft.com
+        timestamp-digest: SHA256
+
+    - name: Verify Authenticode signature
+      if: env.SIGN_WINDOWS == 'true'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = "Stop"
+        $files = Get-ChildItem -Path $env:NSIS_DIR -Filter *.exe
+        if (-not $files) { Write-Error "no installers to verify"; exit 1 }
+        foreach ($f in $files) {
+          $sig = Get-AuthenticodeSignature -FilePath $f.FullName
+          Write-Host "$($f.Name): $($sig.Status)"
+          if ($sig.SignerCertificate) { Write-Host "  Signer: $($sig.SignerCertificate.Subject)" }
+          if ($sig.TimeStamperCertificate) { Write-Host "  Timestamped: Yes" }
+          if ($sig.Status -ne "Valid") {
+            Write-Error "Signature verification failed for $($f.Name): $($sig.Status) — $($sig.StatusMessage)"
+            exit 1
+          }
+        }
+        Write-Host "All installer signatures verified"
+
+    - name: Regenerate updater signature over the signed installer
+      if: env.SIGN_WINDOWS == 'true' && inputs.tauri_signing_private_key != ''
+      shell: bash
+      env:
+        TAURI_SIGNING_PRIVATE_KEY: ${{ inputs.tauri_signing_private_key }}
+        TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ inputs.tauri_signing_private_key_password }}
+      run: |
+        set -euo pipefail
+        shopt -s nullglob
+        found=0
+        for f in "$NSIS_DIR"/*-setup.exe; do
+          found=1
+          echo "Re-signing updater signature for $(basename "$f")"
+          rm -f "$f.sig"
+          npx tauri signer sign \
+            --private-key "$TAURI_SIGNING_PRIVATE_KEY" \
+            --password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" \
+            "$f"
+          if [[ ! -f "$f.sig" ]]; then
+            echo "::error::tauri signer sign produced no $(basename "$f").sig"
+            exit 1
+          fi
+          if [[ "$f.sig" -ot "$f" ]]; then
+            echo "::error::$(basename "$f").sig is older than the installer it signs"
+            exit 1
+          fi
+        done
+        [[ "$found" -eq 1 ]] || { echo "::error::no *-setup.exe found in $NSIS_DIR"; exit 1; }
+        echo "Updater signatures regenerated"

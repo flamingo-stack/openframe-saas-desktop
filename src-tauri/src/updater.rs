@@ -1,14 +1,14 @@
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 use tauri_plugin_updater::{Update, UpdaterExt};
 use tokio::sync::Mutex;
 
-use crate::{load_config, shared_host, tokens, AppConfig, MAIN_LABEL};
+use crate::{load_config, tokens, AppConfig, MAIN_LABEL};
 
-const UPDATE_CONFIG_PATH: &str = "/api/desktop/update-config";
-const UPDATE_CONFIG_TIMEOUT: Duration = Duration::from_secs(15);
+const DEFAULT_MANIFEST_URL: &str =
+    "https://github.com/flamingo-stack/openframe-saas-desktop/releases/latest/download/updater.json";
 const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 const RUNTIME_POLL_INTERVAL: Duration = Duration::from_secs(45 * 60);
@@ -23,17 +23,10 @@ const EVENT_ERROR: &str = "update:error";
 #[derive(Default)]
 pub struct UpdateManager {
     apply_lock: Mutex<()>,
-    manifest_url_cache: Mutex<Option<String>>,
 }
 
 fn self_update_enabled(cfg: &AppConfig) -> bool {
     cfg.self_update_enabled.unwrap_or(true)
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UpdateConfigResponse {
-    manifest_url: String,
 }
 
 #[derive(Serialize)]
@@ -82,63 +75,15 @@ struct ErrorPayload {
     message: String,
 }
 
-async fn resolve_manifest_url(
-    app: &AppHandle,
-    manager: &UpdateManager,
-    force_refresh: bool,
-) -> Option<String> {
-    let cfg = load_config(app);
-
-    if let Some(dev) = cfg.update_manifest_url.as_deref().filter(|s| !s.is_empty()) {
-        return Some(dev.to_string());
-    }
-
-    if !force_refresh {
-        if let Some(cached) = manager.manifest_url_cache.lock().await.clone() {
-            return Some(cached);
-        }
-    }
-
-    let host = shared_host(&cfg)?;
-    match fetch_manifest_url(&host).await {
-        Ok(url) => {
-            *manager.manifest_url_cache.lock().await = Some(url.clone());
-            Some(url)
-        }
-        Err(e) => {
-            log::warn!("[updater] update-config fetch failed: {e}");
-            manager.manifest_url_cache.lock().await.clone()
-        }
-    }
+fn resolve_manifest_url(app: &AppHandle) -> String {
+    load_config(app)
+        .update_manifest_url
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_MANIFEST_URL.to_string())
 }
 
-async fn fetch_manifest_url(shared_host: &str) -> Result<String, String> {
-    let endpoint = format!("{shared_host}{UPDATE_CONFIG_PATH}");
-    let client = reqwest::Client::builder()
-        .timeout(UPDATE_CONFIG_TIMEOUT)
-        .build()
-        .map_err(|e| e.to_string())?;
-    let response = client
-        .get(&endpoint)
-        .send()
-        .await
-        .map_err(|e| format!("request to {endpoint} failed: {e}"))?;
-    if !response.status().is_success() {
-        return Err(format!("{endpoint} returned HTTP {}", response.status()));
-    }
-    let body = response.text().await.map_err(|e| e.to_string())?;
-    let parsed: UpdateConfigResponse = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-    Ok(parsed.manifest_url)
-}
-
-async fn check_for_update(
-    app: &AppHandle,
-    manager: &UpdateManager,
-    force_refresh_url: bool,
-) -> Result<Option<Update>, String> {
-    let Some(manifest_url) = resolve_manifest_url(app, manager, force_refresh_url).await else {
-        return Ok(None);
-    };
+async fn check_for_update(app: &AppHandle) -> Result<Option<Update>, String> {
+    let manifest_url = resolve_manifest_url(app);
     let endpoint = url::Url::parse(&manifest_url)
         .map_err(|e| format!("invalid manifest URL '{manifest_url}': {e}"))?;
 
@@ -203,7 +148,7 @@ pub async fn run_startup_update(app: &AppHandle) {
         return;
     }
     let manager = app.state::<UpdateManager>();
-    match check_for_update(app, &manager, true).await {
+    match check_for_update(app).await {
         Ok(Some(update)) => {
             log::info!(
                 "[updater] startup: {} available, applying before window",
@@ -225,8 +170,7 @@ pub fn spawn_poll_loop(app: AppHandle) {
             if !self_update_enabled(&load_config(&app)) {
                 continue;
             }
-            let manager = app.state::<UpdateManager>();
-            match check_for_update(&app, &manager, false).await {
+            match check_for_update(&app).await {
                 Ok(Some(update)) => {
                     log::info!(
                         "[updater] runtime: {} available — surfacing",
@@ -253,8 +197,7 @@ pub async fn update_check(
     if window.label() != MAIN_LABEL {
         return Ok(UpdateAvailability::none());
     }
-    let manager = app.state::<UpdateManager>();
-    match check_for_update(&app, &manager, false).await? {
+    match check_for_update(&app).await? {
         Some(update) => {
             let availability = UpdateAvailability::from_update(&update);
             let _ = app.emit_to(MAIN_LABEL, EVENT_AVAILABLE, availability.clone());
@@ -270,7 +213,7 @@ pub async fn update_apply_now(app: AppHandle, window: WebviewWindow) -> Result<(
         return Err("updates can only be applied from the main window".into());
     }
     let manager = app.state::<UpdateManager>();
-    match check_for_update(&app, &manager, false).await? {
+    match check_for_update(&app).await? {
         Some(update) => apply(&app, &manager, update).await,
         None => Ok(()),
     }

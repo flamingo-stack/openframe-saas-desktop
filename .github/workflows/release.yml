@@ -24,7 +24,7 @@ on:
         type: string
         default: ''
       shared_host_url:
-        description: "Shared auth host to bake in. Leave empty to use the OPENFRAME_SHARED_HOST_URL repo secret."
+        description: "Shared auth host to bake in. Leave empty for OPENFRAME_SHARED_HOST_URL repo secret."
         required: false
         type: string
         default: ''
@@ -227,12 +227,12 @@ jobs:
       - name: Generate updater manifest (latest.json)
         env:
           VERSION: ${{ needs.version.outputs.version }}
+          APP_VERSION: ${{ needs.version.outputs.app_version }}
           REPO: ${{ github.repository }}
           SERVER: ${{ github.server_url }}
         run: |
           set -euo pipefail
           shopt -s nullglob   # a glob matching nothing must vanish, not pass itself through
-          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "not a release — skipping latest.json"; exit 0; }
 
           base="$SERVER/$REPO/releases/download/$VERSION"
           entries=""
@@ -254,7 +254,7 @@ jobs:
           emit windows-x86_64  final-artifacts/*_x64-setup.exe
           emit windows-aarch64 final-artifacts/*_arm64-setup.exe
 
-          jq -s --arg version "$VERSION" --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          jq -s --arg version "$APP_VERSION" --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             '{version: $version, notes: "OpenFrame Desktop \($version)", pub_date: $pub_date, platforms: from_entries}' \
             <<< "$entries" > final-artifacts/latest.json
 
@@ -278,8 +278,7 @@ jobs:
             row "macOS (Universal) — update"       final-artifacts/*.app.tar.gz
             row "Windows x64 — install + update"   final-artifacts/*_x64-setup.exe
             row "Windows arm64 — install + update" final-artifacts/*_arm64-setup.exe
-            printf "\nBuilt against shared auth host \`%s\`.\n" "$SHARED_HOST"
-            if [ -f final-artifacts/latest.json ]; then printf "\nUpdater manifest: \`latest.json\`.\n"; fi
+            printf "\nBuilt against shared auth host \`%s\`. Updater manifest: \`latest.json\`.\n" "$SHARED_HOST"
             printf '\n---\n'
           } > RELEASE_HEADER.md
           cat RELEASE_HEADER.md

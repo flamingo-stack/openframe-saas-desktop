@@ -28,11 +28,6 @@ on:
         required: false
         type: string
         default: ''
-      frontend_ref:
-        description: "openframe-oss-frontend branch or tag to bundle. Default main."
-        required: false
-        type: string
-        default: ''
 
 # =============================================================================
 # JOBS
@@ -131,7 +126,6 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
           BUNDLES: ${{ matrix.bundles }}
-          FRONTEND_REF: ${{ inputs.frontend_ref }}
           # Never the 'latest' tag: this Makefile applies it and tauri needs semver.
           OPENFRAME_VERSION: ${{ needs.version.outputs.app_version }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}

@@ -44,6 +44,7 @@ runs:
 
         echo "$APPLE_CERTIFICATE_P12" | base64 --decode > "$CERTIFICATE_PATH"
         security create-keychain -p "$APPLE_CERTIFICATE_PASSWORD" "$KEYCHAIN_PATH"
+        security set-keychain-settings "$KEYCHAIN_PATH"
         security default-keychain -s "$KEYCHAIN_PATH"
         security unlock-keychain -p "$APPLE_CERTIFICATE_PASSWORD" "$KEYCHAIN_PATH"
 

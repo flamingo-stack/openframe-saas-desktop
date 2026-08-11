@@ -12,6 +12,7 @@ mod nats;
 mod notification_actions;
 mod notifications;
 mod tokens;
+mod updater;
 #[cfg(target_os = "windows")]
 mod windows_activator;
 // Also compiled for a macOS test run: the toast XML and the button-argument
@@ -73,6 +74,10 @@ pub(crate) struct AppConfig {
     /// via NativeAuth.setTenantHost. Shell-side networking (token refresh,
     /// NATS) uses it. Written by the shell, not by hand.
     pub(crate) learned_host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) self_update_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) update_manifest_url: Option<String>,
 }
 
 /// The shared auth host in effect: config.json override, else the compile-time
@@ -868,8 +873,10 @@ pub fn run() {
                 .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepOne)
                 .build(),
         )
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AuthState::default())
         .manage(tokens::TokenLifecycle::default())
+        .manage(updater::UpdateManager::default())
         .invoke_handler(tauri::generate_handler![
             native_auth_start,
             native_auth_exchange_ticket,
@@ -879,7 +886,9 @@ pub fn run() {
             native_auth_clear_tokens,
             native_auth_set_tenant_host,
             take_pending_notification_click,
-            webview_log
+            webview_log,
+            updater::update_check,
+            updater::update_apply_now
         ])
         .setup(|app| {
             build_tray(app)?;
@@ -929,7 +938,15 @@ pub fn run() {
                 }
             }
 
-            open_main_window(&handle).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            updater::spawn_poll_loop(handle.clone());
+            let startup_handle = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                updater::run_startup_update(&startup_handle).await;
+                if let Err(e) = open_main_window(&startup_handle) {
+                    log::error!("failed to open main window, exiting: {e}");
+                    startup_handle.exit(1);
+                }
+            });
 
             Ok(())
         })

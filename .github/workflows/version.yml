@@ -1,0 +1,103 @@
+name: Resolve Version
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "Version to release (x.y.z). Leave empty for auto patch bump."
+        required: false
+        type: string
+        default: ''
+    outputs:
+      version:
+        description: "Release tag: 'latest' for a rolling build, x.y.z for a release"
+        value: ${{ jobs.version.outputs.version }}
+      app_version:
+        description: "Version baked into the binary: x.y.z, or x.y.z-dev.N for a rolling build"
+        value: ${{ jobs.version.outputs.app_version }}
+
+jobs:
+  version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version_push.outputs.version || steps.version_dispatch.outputs.version }}
+      app_version: ${{ steps.version_push.outputs.app_version || steps.version_dispatch.outputs.app_version }}
+    steps:
+      - name: Last published release
+        id: published
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          latest=$(gh release list --limit 100 --exclude-drafts --exclude-pre-releases \
+            --json tagName --jq '.[].tagName' \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)
+          echo "last published release: ${latest:-<none>}"
+          echo "latest=${latest}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve version (push)
+        id: version_push
+        if: github.event_name != 'workflow_dispatch'
+        env:
+          LATEST: ${{ steps.published.outputs.latest }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$LATEST" ]]; then
+            IFS='.' read -r cur_major cur_minor cur_patch <<< "$LATEST"
+            app_version="${cur_major}.${cur_minor}.$((cur_patch + 1))-dev.${RUN_NUMBER}"
+          else
+            app_version="0.0.0-dev.${RUN_NUMBER}"
+          fi
+          echo "push event: version resolves to latest, app version ${app_version}"
+          echo "version=latest" >> "$GITHUB_OUTPUT"
+          echo "app_version=${app_version}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve version (dispatch)
+        id: version_dispatch
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          LATEST: ${{ steps.published.outputs.latest }}
+        run: |
+          set -euo pipefail
+
+          # First release only: nothing to bump from, so it must be explicit.
+          if [[ -z "$LATEST" ]]; then
+            if [[ -z "$INPUT_VERSION" ]]; then
+              echo "::error::No published releases to bump from. Pass an explicit version (x.y.z) for the first release."
+              exit 1
+            fi
+            if ! [[ "$INPUT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Invalid version format: ${INPUT_VERSION} (expected x.y.z)"
+              exit 1
+            fi
+            echo "No published releases yet, first release: ${INPUT_VERSION}"
+            echo "version=${INPUT_VERSION}" >> "$GITHUB_OUTPUT"
+            echo "app_version=${INPUT_VERSION}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          IFS='.' read -r cur_major cur_minor cur_patch <<< "$LATEST"
+          next_major="$((cur_major + 1)).0.0"
+          next_minor="${cur_major}.$((cur_minor + 1)).0"
+          next_patch="${cur_major}.${cur_minor}.$((cur_patch + 1))"
+
+          if [ -z "$INPUT_VERSION" ]; then
+            version="$next_patch"
+            echo "No version provided, auto patch bump: ${LATEST} -> ${version}"
+          else
+            # Matching one of the three legal successors also validates the format.
+            case "$INPUT_VERSION" in
+              "$next_major"|"$next_minor"|"$next_patch") version="$INPUT_VERSION" ;;
+              *) echo "::error::Invalid version bump: ${LATEST} -> ${INPUT_VERSION} (expected ${next_major}, ${next_minor}, or ${next_patch})"; exit 1 ;;
+            esac
+            echo "Using provided version: ${version}"
+          fi
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "app_version=${version}" >> "$GITHUB_OUTPUT"

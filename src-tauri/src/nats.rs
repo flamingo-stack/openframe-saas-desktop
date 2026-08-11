@@ -317,7 +317,8 @@ async fn handle_event(event: Event, connector: &Arc<Connector>) {
                     log::warn!("[nats] Connected event but no client stored — skipping subscribe");
                     return;
                 };
-                notifications::ensure_subscription(&connector.app, client).await;
+                notifications::ensure_subscription(&connector.app, client.clone()).await;
+                crate::updater::publish_version_report(&connector.app, &client).await;
             });
         }
         Event::Disconnected => log::info!("[nats] disconnected"),

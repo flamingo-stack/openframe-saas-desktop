@@ -58,7 +58,7 @@ else
 fi
 
 echo "▸ Building static export…"
-( cd "$FRONTEND_DIR" && OPENFRAME_BUILD_TARGET=export npm run build )
+( cd "$FRONTEND_DIR" && OPENFRAME_BUILD_TARGET="export" npm run build )
 
 if [ ! -d "$FRONTEND_DIR/dist" ]; then
   echo "✗ export produced no dist/ in $FRONTEND_DIR" >&2

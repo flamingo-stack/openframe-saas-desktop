@@ -33,7 +33,8 @@ use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     webview::{Color, NewWindowFeatures, NewWindowResponse, PageLoadEvent, PageLoadPayload},
-    AppHandle, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
+    AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
+    WindowEvent,
 };
 use tokens::NativeAuthTokens;
 
@@ -56,6 +57,195 @@ const LOGIN_LABEL: &str = "native-auth";
 const DEFAULT_SHARED_HOST: Option<&str> = option_env!("OPENFRAME_SHARED_HOST_URL");
 
 static WINDOW_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+/// Emitted to the main window each time it comes back in front of the user
+/// after having been away — revealed from the tray, or unminimized — with how
+/// long the absence lasted. The first reveal after launch announces nothing:
+/// the page is loading its data anyway, and a resync would only race it.
+///
+/// Everything the UI keeps live resyncs off this, chiefly the Mingo chat tail,
+/// which the user can talk to from a notification while the window is away.
+///
+/// Deliberately independent of the page's own `visibilitychange`, which
+/// [`set_webview_visible`] separately tries to make trustworthy on Windows.
+/// That mirroring rests on a reading of WebView2's visibility model; this event
+/// rests on nothing but the window events the shell already handles, so a wrong
+/// reading costs a redundant refetch rather than a frozen conversation. The two
+/// are coalesced page-side.
+///
+/// Addressed to the main window, though a `listen()` that names no target
+/// receives it in any window — the same reach `notification:click` and
+/// `native-auth:token-update` already have, and harmless here: a child window
+/// running this bundle was away for the same absence.
+///
+/// Consumed by `onNativeShellResumed` in the frontend's native-shell.ts.
+const RESUME_EVENT: &str = "shell:resumed";
+
+/// Whether the main window is in front of the user, since when it has not been,
+/// and what the webview was last told. Guarded because window events arrive on
+/// the event loop while `show_primary_window` can be called from a
+/// notification's async task.
+struct MainPresence {
+    present: bool,
+    /// Wall clock, not `Instant`. `Instant` is `CLOCK_UPTIME_RAW` on macOS and
+    /// stops while the machine sleeps (`tokens::spawn_wake_watch` measures the
+    /// gap: 398.7h of wall time against 140.2h monotonic on one machine), so a
+    /// window that sat in the tray overnight would report only the minutes the
+    /// machine was awake — and could fall under the page's threshold in exactly
+    /// the case the event exists for. The page judges this against `Date.now()`,
+    /// so the two have to be on the same clock.
+    hidden_since: Option<std::time::SystemTime>,
+    /// What the webview was last told, `None` until it has been told anything.
+    /// Purely to avoid repeating the call: `Resized` arrives per frame of a
+    /// drag, and a WebView2 visibility call is not something to spend per
+    /// frame. It is not a correctness signal — `mirror_webview` re-reads
+    /// `present` and converges on that.
+    webview_visible: Option<bool>,
+}
+
+/// Presence is tracked as a state machine rather than read off each event
+/// because the events are not edges: `Resized` fires for every pixel of a frame
+/// drag, and neither a resume announced on each one nor a WebView2 visibility
+/// call issued on each one is something the user should pay for.
+static MAIN_PRESENCE: Mutex<MainPresence> = Mutex::new(MainPresence {
+    present: false,
+    hidden_since: None,
+    webview_visible: None,
+});
+
+/// Serializes deciding the webview's visibility, making the call, and recording
+/// what was decided — three steps that must not interleave with another
+/// thread's, or a suppressed call pairs with an executed one.
+///
+/// Separate from [`MAIN_PRESENCE`] because the presence lock is taken from
+/// window-event handlers that must not be blocked behind an OS call. Always
+/// acquired FIRST, with `MAIN_PRESENCE` only in short spans inside it — one
+/// ordering, so the two cannot deadlock.
+static MIRROR: Mutex<()> = Mutex::new(());
+
+/// Record whether the main window is in front of the user, mirror that onto the
+/// webview, and — on the way back — say how long it was away so the UI can
+/// catch up on what it missed.
+fn set_main_presence(app: &AppHandle, present: bool) {
+    let away = {
+        let mut presence = notifications::lock(&MAIN_PRESENCE);
+        if presence.present == present {
+            None
+        } else {
+            presence.present = present;
+            if present {
+                // A clock stepped backwards mid-absence yields Err; report
+                // nothing rather than a nonsense duration — the page treats a
+                // missing figure as "not a resume", which is the safe read.
+                presence
+                    .hidden_since
+                    .take()
+                    .and_then(|since| since.elapsed().ok())
+            } else {
+                presence.hidden_since = Some(std::time::SystemTime::now());
+                None
+            }
+        }
+    };
+
+    mirror_webview(app);
+    // `None` is either no transition at all or the first reveal after launch.
+    let Some(away) = away else {
+        return;
+    };
+    // The absence is reported rather than judged: the page applies its own
+    // "long enough to have missed something" threshold, the same one it applies
+    // to a browser tab.
+    let payload = serde_json::json!({ "hiddenMs": away.as_millis() as u64 });
+    if let Err(e) = app.emit_to(MAIN_LABEL, RESUME_EVENT, payload) {
+        log::warn!("emit {RESUME_EVENT}: {e}");
+    }
+}
+
+/// Forget the main window entirely — it is gone, and the one that replaces it
+/// starts from nothing. Distinct from `set_main_presence(app, false)`, which
+/// starts the hidden-since clock a destroyed window has no use for.
+fn clear_main_presence() {
+    let mut presence = notifications::lock(&MAIN_PRESENCE);
+    presence.present = false;
+    presence.hidden_since = None;
+    presence.webview_visible = None;
+}
+
+/// Bring the webview's visibility into line with the presence recorded for the
+/// window, whatever that has become by now.
+///
+/// Converges rather than applies each caller's own decision: two threads can
+/// decide opposite things before either acts, and a caller acting on a stale
+/// decision could suppress its `show` against a memo the other thread was about
+/// to invalidate — leaving a blank window the memo believes is fine. Re-reading
+/// the intent inside [`MIRROR`] makes the last decision the one that runs.
+///
+/// One gap remains, and it is not closed here: `Webview::show`/`hide` run inline
+/// on the event-loop thread but are queued from any other, so a call issued
+/// earlier from a background thread can still land later. Every hide comes from
+/// a window event (inline), and only shows are ever issued off-thread, so the
+/// reachable skew is a webview left VISIBLE behind a hidden window — the state
+/// this mechanism is trying to improve on, not a regression from it, and the
+/// next presence edge corrects it.
+fn mirror_webview(app: &AppHandle) {
+    let _serialized = notifications::lock(&MIRROR);
+    let want = {
+        let presence = notifications::lock(&MAIN_PRESENCE);
+        if presence.webview_visible == Some(presence.present) {
+            return;
+        }
+        presence.present
+    };
+    // Resolved inside the lock, not handed in: waiting for `MIRROR` can outlast
+    // the window itself (sign-out destroys and rebuilds it), and telling a dead
+    // window anything would still record the live one as told. A destroyed
+    // window also leaves nothing to mirror — `clear_main_presence` forgets what
+    // it was told, so the replacement is mirrored on its first reveal.
+    let Some(window) = app.get_webview_window(MAIN_LABEL) else {
+        return;
+    };
+    if set_webview_visible(&window, want) {
+        notifications::lock(&MAIN_PRESENCE).webview_visible = Some(want);
+    }
+}
+
+/// Tell the webview whether it is visible.
+///
+/// `Window::hide`/`show` move the OS window and stop there, which on Windows
+/// leaves `CoreWebView2Controller.IsVisible` true and the page reporting itself
+/// visible to nobody; Microsoft's guidance is that the host drives `IsVisible`
+/// itself for exactly this reason. wry hides its own container child HWND, not
+/// the top-level window, so this does not disturb the taskbar entry.
+///
+/// macOS is deliberately left alone: WKWebView already tracks its window's
+/// occlusion, so `document.visibilityState` is correct there without help.
+/// Reports whether the call went out, so a failure is not memoized as applied.
+/// `Ok` means dispatched rather than applied — tauri-runtime-wry logs and
+/// swallows the wry error on the event-loop side — so the only failure reaching
+/// here is a dead event loop; leaving that unrecorded costs one redundant call
+/// on the next presence edge and nothing else.
+fn set_webview_visible(window: &WebviewWindow, visible: bool) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        let webview: &tauri::Webview<_> = window.as_ref();
+        let result = if visible {
+            webview.show()
+        } else {
+            webview.hide()
+        };
+        if let Err(e) = result {
+            log::warn!("set webview visible={visible}: {e}");
+            return false;
+        }
+        true
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (window, visible);
+        true
+    }
+}
 
 /// The shell knows exactly one configured URL: the **shared auth host**. There
 /// is no tenant host to configure — the bundle's /auth pages discover the
@@ -325,6 +515,9 @@ fn handle_page_load(window: WebviewWindow, payload: PageLoadPayload<'_>) {
         PageLoadEvent::Finished => {
             let _ = window.show();
             let _ = window.set_focus();
+            if window.label() == MAIN_LABEL {
+                set_main_presence(window.app_handle(), true);
+            }
         }
         _ => {}
     }
@@ -337,6 +530,9 @@ fn spawn_show_fallback(window: &WebviewWindow) {
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(2500));
         let _ = window.show();
+        if window.label() == MAIN_LABEL {
+            set_main_presence(window.app_handle(), true);
+        }
     });
 }
 
@@ -445,6 +641,11 @@ pub(crate) fn show_primary_window(app: &AppHandle) {
         let _ = win.show();
         let _ = win.unminimize();
         let _ = win.set_focus();
+        // After the reveal is requested, not after it lands: off the main
+        // thread these are queued messages, so the resume can reach the page a
+        // frame before the window does. Harmless — the page's work is a
+        // refetch, not a paint.
+        set_main_presence(app, true);
         // The window may have sat in the tray for hours. Get the session current
         // before the page's first request 401s into the refresh-or-logout path.
         tokens::refresh_soon(app, "window shown");
@@ -956,11 +1157,22 @@ pub fn run() {
                 if window.label() == MAIN_LABEL {
                     api.prevent_close();
                     let _ = window.hide();
+                    set_main_presence(window.app_handle(), false);
                     #[cfg(target_os = "macos")]
                     let _ = window
                         .app_handle()
                         .set_activation_policy(ActivationPolicy::Accessory);
                 }
+            }
+            // Minimize and restore reach the shell as a resize and nothing else
+            // — there is no minimize event on desktop — so presence is read back
+            // off the window rather than inferred from the payload. Cheap: both
+            // reads are inline Win32 calls on the event-loop thread, and the
+            // presence gate drops every resize that is not an edge.
+            WindowEvent::Resized(_) if window.label() == MAIN_LABEL => {
+                let present =
+                    !window.is_minimized().unwrap_or(false) && window.is_visible().unwrap_or(true);
+                set_main_presence(window.app_handle(), present);
             }
             // Login window closed by the user before the ticket arrived → cancel.
             WindowEvent::Destroyed if window.label() == LOGIN_LABEL => {
@@ -971,6 +1183,12 @@ pub fn run() {
             // them at a label that currently has no window.
             WindowEvent::Destroyed if window.label() == MAIN_LABEL => {
                 notifications::reset_click_gate(window.app_handle());
+                // A new window is a new page, which loads its own data — so it
+                // must reveal as a first reveal, not as a return from however
+                // long the destroyed one had been in the tray. Clearing the
+                // clock is the part `set_main_presence` cannot do for us: for
+                // an already-hidden window this is no transition at all.
+                clear_main_presence();
             }
             // The user is looking at the app — clear the unread badge.
             WindowEvent::Focused(true) if window.label() == MAIN_LABEL => {

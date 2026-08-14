@@ -300,7 +300,7 @@ fn delivery_of(envelope: &serde_json::Value) -> Delivery {
 // ---------------------------------------------------------------------------
 
 /// The webview's `notification:click` payload: the envelope's routing context
-/// in wire shape, which the frontend's `resolveNatsNotificationRoute` maps to a
+/// in wire shape, which the frontend's `resolveNatsNotificationAction` maps to a
 /// route. Only the fields that mapping reads — plus `approvalRequestId`, which
 /// the Approve/Reject buttons resolve against the chat API — survive. The rest
 /// of `context` can be arbitrarily large (an approval request carries the whole

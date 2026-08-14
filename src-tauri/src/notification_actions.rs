@@ -12,10 +12,20 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 
 use crate::chat_api;
 use crate::notifications::{lock, string_field, Delivery};
+use crate::MAIN_LABEL;
+
+/// Emitted after a button completes a write against a conversation, naming it.
+/// A background action reaches the gateway over REST from this process, so an
+/// open window has no way to know it happened: its own live tail may be down
+/// (that is usually why the user is answering from a notification at all), and
+/// the reply it just sent would then sit unshown until the tail next recovered.
+///
+/// Consumed by `onNativeChatDialogChanged` in the frontend's native-shell.ts.
+const DIALOG_CHANGED_EVENT: &str = "chat:dialog-changed";
 
 /// Envelope `context.type` values that earn action buttons. The rest of the set
 /// (tickets, client chats) has no action the shell can complete on its own.
@@ -203,8 +213,36 @@ pub(crate) fn spawn(app: &AppHandle, context: ActionContext, action: Action) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let outcome = run_action(&app, &context, &action).await;
+        // Only a press that actually wrote. `AlreadyResolved` changed nothing,
+        // and announcing it would cost an open window a consumer rebuild and a
+        // refetch to discover exactly what it already had.
+        if matches!(outcome, Ok(Outcome::Done)) {
+            announce_dialog_change(&app, &context);
+        }
         report(&app, &context, &action, outcome);
     });
+}
+
+/// Name the conversation a completed press just changed, for whatever window
+/// happens to be open. Silent when the payload carries no dialog — a
+/// ticket-linked approval is answered on the ticket, which has its own live
+/// tail — and cheap when there is no window: `emit_to` on a missing label is
+/// not an error worth reporting to the user, who is looking at a notification.
+fn announce_dialog_change(app: &AppHandle, context: &ActionContext) {
+    // Read raw rather than through [`dialog_id`], whose `ADMIN_AI_MESSAGE` gate
+    // exists to decide whether a REPLY has somewhere to go. An approval carries
+    // a conversation too, and resolving one changes it just as much — the gate
+    // would drop exactly the notification whose dialog most needs refetching.
+    let Some(dialog_id) = context_str(context.payload.as_ref(), "dialogId") else {
+        return;
+    };
+    if let Err(e) = app.emit_to(
+        MAIN_LABEL,
+        DIALOG_CHANGED_EVENT,
+        serde_json::json!({ "dialogId": dialog_id }),
+    ) {
+        log::warn!("emit {DIALOG_CHANGED_EVENT}: {e}");
+    }
 }
 
 /// What a press amounted to. `AlreadyResolved` is a third thing, neither the

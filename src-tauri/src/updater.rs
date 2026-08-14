@@ -76,10 +76,16 @@ struct ErrorPayload {
 }
 
 fn resolve_manifest_url(app: &AppHandle) -> String {
-    load_config(app)
+    if let Some(url) = load_config(app)
         .update_manifest_url
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_MANIFEST_URL.to_string())
+    {
+        return url;
+    }
+    if let Some(url) = option_env!("OPENFRAME_UPDATE_MANIFEST_URL").filter(|s| !s.is_empty()) {
+        return url.to_string();
+    }
+    DEFAULT_MANIFEST_URL.to_string()
 }
 
 async fn check_for_update(app: &AppHandle) -> Result<Option<Update>, String> {

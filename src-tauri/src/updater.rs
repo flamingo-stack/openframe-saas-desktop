@@ -5,7 +5,7 @@ use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 use tauri_plugin_updater::{Update, UpdaterExt};
 use tokio::sync::Mutex;
 
-use crate::{load_config, tokens, AppConfig, MAIN_LABEL};
+use crate::{autostart, load_config, tokens, AppConfig, MAIN_LABEL};
 
 const DEFAULT_MANIFEST_URL: &str =
     "https://github.com/flamingo-stack/openframe-saas-desktop/releases/latest/download/updater.json";
@@ -247,6 +247,18 @@ async fn apply(
             },
             move || {
                 log::info!("[updater] download complete, installing");
+                // Whether the restart should come back with a window is a
+                // question about now, not about which path reached here: a
+                // login-started session stays in the tray, but the user may
+                // have opened one from the tray or a notification — including
+                // during this download, which can run for minutes. Sampled here
+                // because it is the last point that runs on every platform:
+                // on Windows the install hands the argv to the installer and
+                // exits the process itself.
+                autostart::show_window_after_restart(
+                    &installing_app,
+                    installing_app.get_webview_window(MAIN_LABEL).is_some(),
+                );
                 // The bar is throttled, so it never quite reaches the end — and
                 // install is its own wait (on Windows, a whole NSIS run). Say
                 // which one the user is in rather than leaving a bar stuck a
@@ -257,6 +269,11 @@ async fn apply(
         .await;
 
     if let Err(e) = result {
+        // Reached only when the install failed and this process is still alive,
+        // so no restart is coming and the request must not outlive the attempt.
+        // A signature failure lands here too, after the download-finish
+        // callback already recorded one.
+        autostart::show_window_after_restart(app, false);
         let error = UpdateError::from_plugin(e);
         log::error!(
             "[updater] install failed ({}): {}",

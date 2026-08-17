@@ -89,6 +89,16 @@ The shared host is baked in at build time and can be overridden per install by
 Tokens live next to it in `tokens.json` (owner-readable only, plaintext —
 keychain storage is a known gap).
 
+Other keys, all optional:
+
+| Key | Purpose |
+|---|---|
+| `self_update_enabled` | `false` disables the startup and background update checks. |
+| `update_manifest_url` | Overrides the updater manifest endpoint. |
+| `autostart_enforced` | Pins **Start at Login** on (`true`) or off (`false`) for a managed install, and takes the toggle away from the user. Absent leaves the choice to them. |
+| `autostart_configured` | Shell-written. Records that the start-at-login default has been applied, so it is applied once rather than re-asserted over a user who turned it off. |
+| `autostart_show_window_next_start` | Shell-written, cleared on the next launch. Set by an update that restarts while a window is open, so the relaunch shows one even in a login session. |
+
 **Gateway prerequisite:** CORS must allow the shell's origins —
 `tauri://localhost` (macOS/Linux) and `http://tauri.localhost` (Windows) —
 including exposing the `Access-Token` and `Refresh-Token` response headers.
@@ -105,6 +115,11 @@ Without it the UI renders and every data call fails.
 - **Notifications** — a second, Rust-owned NATS connection delivers OS
   notifications and a badge while the window is hidden, and routes clicks back
   into the UI (including clicks that cold-start the app).
+- **Start at login** — registered per-user (a launchd agent on macOS, an `HKCU`
+  Run entry on Windows, an XDG autostart entry on Linux) and on by default. A
+  login start carries `--autostart` and stays in the tray; the window is only
+  built when the user asks for one, from the tray or a notification — or when an
+  update restarted a session that already had one open.
 
 See [docs/auth-and-notifications.md](docs/auth-and-notifications.md) for how
 those work, and [docs/architecture.md](docs/architecture.md) for the shell
@@ -127,5 +142,7 @@ src-tauri/
   src/macos_un.rs     UNUserNotificationCenter backend
   src/windows_toast.rs  toast XML + the button-argument codec
   src/windows_activator.rs  COM activator the toast buttons activate
+  src/autostart.rs    start-at-login registration and the headless start
+  src/updater.rs      silent startup update, background poll, update commands
 www/                  staged frontend bundle (generated, git-ignored)
 ```

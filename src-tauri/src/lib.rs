@@ -1,3 +1,4 @@
+mod autostart;
 // The background notification actions and the REST calls behind them exist on
 // both desktop platforms; Linux has no notification backend at all, so neither
 // module is built there.
@@ -30,7 +31,7 @@ use std::sync::{
 use serde::{Deserialize, Serialize};
 use tauri::{
     image::Image,
-    menu::{Menu, MenuItem},
+    menu::{CheckMenuItem, Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     webview::{Color, NewWindowFeatures, NewWindowResponse, PageLoadEvent, PageLoadPayload},
     AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
@@ -268,6 +269,21 @@ pub(crate) struct AppConfig {
     pub(crate) self_update_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) update_manifest_url: Option<String>,
+    /// Managed-install policy for start-at-login: `Some` pins it in that
+    /// direction and takes the toggle away from the user. Written by fleet
+    /// tooling, never by the shell. Absent leaves the choice to the user.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) autostart_enforced: Option<bool>,
+    /// Whether the start-at-login default has already been applied on this
+    /// machine. Shell-written, and the reason the default is applied once
+    /// rather than re-asserted at every launch over a user who turned it off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) autostart_configured: Option<bool>,
+    /// Set by an update that restarts while the user has a window open, so the
+    /// process that comes back opens one even in a login session. Shell-written
+    /// and cleared on the next launch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) autostart_show_window_next_start: Option<bool>,
 }
 
 /// The shared auth host in effect: config.json override, else the compile-time
@@ -315,7 +331,7 @@ pub(crate) fn load_config(app: &AppHandle) -> AppConfig {
         .unwrap_or_default()
 }
 
-fn save_config(app: &AppHandle, cfg: &AppConfig) -> Result<(), String> {
+pub(crate) fn save_config(app: &AppHandle, cfg: &AppConfig) -> Result<(), String> {
     let data = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
     write_atomic(&config_path(app), &data)
 }
@@ -629,13 +645,27 @@ fn open_external(url: &str) -> std::io::Result<()> {
     cmd.arg(url).spawn().map(|_| ())
 }
 
-/// Raise the main window. Deliberately a no-op when there is none: on Windows a
-/// click delivered during setup would otherwise build the window itself, and
-/// setup's own `open_main_window` would then find it and reveal it unpainted.
+/// Raise the main window. Deliberately a no-op when there is none — except in a
+/// headless session, where setup never builds one and the no-op would otherwise
+/// last the whole process. On Windows a click delivered during setup would
+/// otherwise build the window itself, and setup's own `open_main_window` would
+/// then find it and reveal it unpainted.
 /// Leaving the payload stashed keeps the reveal with `handle_page_load`.
 /// Callers acting on a direct user request want [`raise_or_open_main_window`].
 pub(crate) fn show_primary_window(app: &AppHandle) {
-    if let Some(win) = app.get_webview_window(MAIN_LABEL) {
+    let Some(win) = app.get_webview_window(MAIN_LABEL) else {
+        // The refusal above rests on setup building a window at all. A headless
+        // session never does — so there it protects nothing and would instead
+        // make every notification click do nothing for the life of the process.
+        // Keyed on the decision setup actually reached, not on the login flag:
+        // a login start that an update asked to show a window *does* build one,
+        // and racing it is the hazard.
+        if autostart::is_headless() {
+            raise_or_open_main_window(app);
+        }
+        return;
+    };
+    {
         #[cfg(target_os = "macos")]
         let _ = app.set_activation_policy(ActivationPolicy::Regular);
         let _ = win.show();
@@ -996,9 +1026,25 @@ fn tray_icon() -> Image<'static> {
 
 fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     let show_i = MenuItem::with_id(app, "show", "Show", true, None::<&str>)?;
+    // Built with placeholder flags and then synced, so how a `Status` maps onto
+    // the item — checked when enabled, greyed when a policy pins it — is
+    // decided in exactly one place. The sync below is what makes it true, and
+    // is not redundant with the startup reconcile: that one does not run at all
+    // in a debug build.
+    let autostart_i = CheckMenuItem::with_id(
+        app,
+        "autostart",
+        "Start at Login",
+        true,
+        false,
+        None::<&str>,
+    )?;
     let signout_i = MenuItem::with_id(app, "signout", "Sign Out", true, None::<&str>)?;
     let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show_i, &signout_i, &quit_i])?;
+    let menu = Menu::with_items(app, &[&show_i, &autostart_i, &signout_i, &quit_i])?;
+    // Held so the webview's toggle moves the same check mark the tray does.
+    app.manage(autostart::TrayCheck(autostart_i));
+    autostart::sync_tray(app.handle());
 
     TrayIconBuilder::new()
         .icon(tray_icon())
@@ -1018,6 +1064,7 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
         })
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => raise_or_open_main_window(app),
+            "autostart" => autostart::toggle_from_tray(app),
             "signout" => {
                 if let Err(e) = sign_out(app) {
                     log::error!("sign_out failed: {e}");
@@ -1089,7 +1136,9 @@ pub fn run() {
             take_pending_notification_click,
             webview_log,
             updater::update_check,
-            updater::update_apply_now
+            updater::update_apply_now,
+            autostart::autostart_status,
+            autostart::autostart_set
         ])
         .setup(|app| {
             build_tray(app)?;
@@ -1113,6 +1162,12 @@ pub fn run() {
                      shared_host in config.json; every auth call will fail"
                 ),
             }
+            // Read before the toast-activation return below, so a request left
+            // behind by an update that never landed is cleared rather than
+            // sitting in config.json until some later boot honours it. Costs
+            // nothing on that path, which opens no window either way.
+            let asked_for_a_window = autostart::take_show_window_request(&handle);
+
             // Cold start from a Windows toast click: the protocol launch put
             // the URI in our own argv. Runs before the window exists so the
             // payload is stashed (the webview pulls it via
@@ -1139,10 +1194,34 @@ pub fn run() {
                 }
             }
 
+            // After the toast-activation return above: a COM server launch is
+            // transient and has no business rewriting a login registration.
+            autostart::reconcile_on_startup(&handle);
+
+            // Started by the OS at login, not by the user. Everything the app
+            // is useful for while closed — notifications, a live session — is
+            // already running by this point; the window is the one thing a
+            // login start must not put on screen.
+            let headless = autostart::launched_at_login() && !asked_for_a_window;
+            // Recorded so `show_primary_window` can tell "no window yet" from
+            // "no window ever", which argv alone cannot answer.
+            autostart::set_headless(headless);
+            if headless {
+                log::info!("[autostart] started at login — staying in the tray");
+                #[cfg(target_os = "macos")]
+                let _ = handle.set_activation_policy(ActivationPolicy::Accessory);
+            }
+
             updater::spawn_poll_loop(handle.clone());
             let startup_handle = handle.clone();
             tauri::async_runtime::spawn(async move {
+                // Runs headless too: a login is the best moment to take an
+                // update, and `restart()` re-spawns with our own argv, so the
+                // relaunch is still a login start.
                 updater::run_startup_update(&startup_handle).await;
+                if headless {
+                    return;
+                }
                 if let Err(e) = open_main_window(&startup_handle) {
                     log::error!("failed to open main window, exiting: {e}");
                     startup_handle.exit(1);

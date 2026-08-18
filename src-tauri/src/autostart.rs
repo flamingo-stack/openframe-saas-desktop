@@ -130,12 +130,44 @@ impl AutostartError {
 // host breaks `cargo test` and `cargo clippy --all-targets` on the others.
 // ---------------------------------------------------------------------------
 
-/// `"<exe>" --autostart`. The quotes are load-bearing: without them the space in
-/// the install path lets `CreateProcessW` resolve a planted `OpenFrame.exe`
-/// first.
+/// `"<exe>" --autostart`, with `exe` spelled the way the shell can parse.
+///
+/// Two things about this string are load-bearing.
+///
+/// The quotes: without them the space in the install path lets `CreateProcessW`
+/// resolve a planted `OpenFrame.exe` first.
+///
+/// The [`win32_path`] call: [`binary`] comes from Tauri, which canonicalizes,
+/// and on Windows that yields a verbatim `\\?\C:\…` path. `CreateProcessW`
+/// accepts one, which is why this read as correct — but Explorer resolves every
+/// Run value through the shell namespace before launching it, and the shell
+/// rejects a verbatim prefix outright (`E_INVALIDARG`). The entry is then
+/// dropped in silence: no process, and no `Shell-Core` 9707 event to say one
+/// was ever attempted.
 #[cfg(any(target_os = "windows", test))]
 fn windows_run_command(exe: &std::path::Path) -> String {
-    format!("\"{}\" {FLAG}", exe.display())
+    format!("\"{}\" {FLAG}", win32_path(&exe.display().to_string()))
+}
+
+/// A verbatim (`\\?\`) path rewritten in the ordinary Win32 form the shell
+/// understands; anything else is already in that form and is left alone.
+///
+/// The `UNC\` arm is not decoration: `\\?\UNC\srv\share` is the verbatim
+/// spelling of `\\srv\share`, so stripping the prefix and nothing else would
+/// leave a path with its host sheared off.
+///
+/// The prefix also exists to escape `MAX_PATH`, which this gives up. Nothing is
+/// traded away by that: a Run entry the shell cannot parse is one that never
+/// launches at all, so the longer path was never reachable here.
+#[cfg(any(target_os = "windows", test))]
+fn win32_path(path: &str) -> std::borrow::Cow<'_, str> {
+    let Some(rest) = path.strip_prefix(r"\\?\") else {
+        return std::borrow::Cow::Borrowed(path);
+    };
+    match rest.strip_prefix(r"UNC\") {
+        Some(share) => std::borrow::Cow::Owned(format!(r"\\{share}")),
+        None => std::borrow::Cow::Borrowed(rest),
+    }
 }
 
 /// A launchd user agent. `AssociatedBundleIdentifiers` is what makes macOS 13+
@@ -1056,6 +1088,35 @@ mod tests {
         assert_eq!(
             windows_run_command(exe),
             r#""C:\Users\x\AppData\Local\OpenFrame Desktop\OpenFrame Desktop.exe" --autostart"#
+        );
+    }
+
+    /// The regression this file exists to not repeat: `binary` canonicalizes,
+    /// so what reaches here at runtime is the verbatim spelling, and Explorer
+    /// silently declines to launch it.
+    #[test]
+    fn the_windows_command_drops_the_verbatim_prefix_the_shell_cannot_parse() {
+        let exe =
+            Path::new(r"\\?\C:\Users\x\AppData\Local\OpenFrame Desktop\OpenFrame Desktop.exe");
+        assert_eq!(
+            windows_run_command(exe),
+            r#""C:\Users\x\AppData\Local\OpenFrame Desktop\OpenFrame Desktop.exe" --autostart"#
+        );
+    }
+
+    #[test]
+    fn a_verbatim_unc_path_keeps_its_host() {
+        assert_eq!(
+            win32_path(r"\\?\UNC\srv\share\OpenFrame Desktop.exe"),
+            r"\\srv\share\OpenFrame Desktop.exe"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_path_is_left_exactly_as_it_is() {
+        assert_eq!(
+            win32_path(r"C:\Program Files\OpenFrame Desktop\OpenFrame Desktop.exe"),
+            r"C:\Program Files\OpenFrame Desktop\OpenFrame Desktop.exe"
         );
     }
 

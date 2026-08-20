@@ -251,7 +251,7 @@ fn set_webview_visible(window: &WebviewWindow, visible: bool) -> bool {
 /// The shell knows exactly one configured URL: the **shared auth host**. There
 /// is no tenant host to configure — the bundle's /auth pages discover the
 /// tenant from the user's email (`/sas/tenant/discover` on the shared host) and
-/// login learns the tenant origin from the OAuth callback. Same model as
+/// the frontend pushes that tenant's origin down once login succeeds. Same model as
 /// openframe-mobile, minus mobile's optional build-time single-tenant pin.
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -261,9 +261,10 @@ pub(crate) struct AppConfig {
     /// Empty/absent falls back to [`DEFAULT_SHARED_HOST`]. Read through
     /// [`shared_host`], never directly.
     shared_host: Option<String>,
-    /// Tenant origin learned from the OAuth callback, pushed by the frontend
-    /// via NativeAuth.setTenantHost. Shell-side networking (token refresh,
-    /// NATS) uses it. Written by the shell, not by hand.
+    /// Tenant origin learned at login — the host discovery resolved, since the
+    /// scheme callback carries none — pushed by the frontend via
+    /// NativeAuth.setTenantHost. Shell-side networking (token refresh, NATS)
+    /// uses it. Written by the shell, not by hand.
     pub(crate) learned_host: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) self_update_enabled: Option<bool>,
@@ -406,7 +407,7 @@ window.__OPENFRAME_SHELL__ = {{
   nativeAuth: {{
     start: function (o) {{
       return window.__TAURI_INTERNALS__.invoke('native_auth_start', {{
-        url: o.url, callbackHost: o.callbackHost, callbackPath: o.callbackPath
+        url: o.url, callbackScheme: o.callbackScheme
       }});
     }},
     exchangeTicket: function (o) {{
@@ -733,6 +734,30 @@ fn url_carries_ticket(url: &url::Url) -> bool {
     url.query_pairs().any(|(k, _)| k == "devTicket")
 }
 
+/// What a navigation inside the login window means.
+enum LoginNav {
+    /// A callback carrying `?devTicket=`, on whatever scheme and host it
+    /// arrived. The gateway sends it to the app scheme when it honours the
+    /// requested redirect, and to the tenant landing when it does not — both
+    /// end the login here.
+    Ticket,
+    /// The app scheme without a ticket: the flow ended and failed. Allowing it
+    /// would ask the OS to open a scheme this app never registered.
+    SchemeWithoutTicket,
+    /// The login pages themselves.
+    Continue,
+}
+
+fn classify_login_nav(url: &url::Url, callback_scheme: Option<&str>) -> LoginNav {
+    if url_carries_ticket(url) {
+        return LoginNav::Ticket;
+    }
+    match callback_scheme {
+        Some(scheme) if url.scheme().eq_ignore_ascii_case(scheme) => LoginNav::SchemeWithoutTicket,
+        _ => LoginNav::Continue,
+    }
+}
+
 /// Resolve the pending native_auth_start() and tear down the login window.
 /// Only the first resolution wins; later calls (e.g. the Destroyed event after
 /// we destroy the window ourselves) are no-ops.
@@ -742,11 +767,11 @@ fn finish_login(app: &AppHandle, result: Result<String, String>) {
         return;
     };
     match &result {
-        // Origin only — the devTicket rides in the query string.
+        // Scheme and host only — the devTicket rides in the query string.
         Ok(callback) => log::info!(
-            "[auth] devTicket callback captured (host: {})",
+            "[auth] devTicket callback captured (from: {})",
             url::Url::parse(callback)
-                .map(|u| u.origin().ascii_serialization())
+                .map(|u| format!("{}://{}", u.scheme(), u.host_str().unwrap_or_default()))
                 .unwrap_or_else(|_| "<unparsed>".into())
         ),
         Err(e) => log::info!("[auth] login ended without a ticket: {e}"),
@@ -763,22 +788,27 @@ fn finish_login(app: &AppHandle, result: Result<String, String>) {
 }
 
 /// NativeAuth.start: run the gateway BFF OAuth flow in a dedicated window and
-/// resolve with the redirect URL carrying `?devTicket=`. Like the mobile
-/// plugin, ANY url carrying the ticket is accepted (the deployed BFF drops the
-/// redirectTo path and delivers the ticket on the tenant root), and the check
-/// runs in both on_navigation and on_page_load because server 302 hops don't
-/// always surface as navigation-policy callbacks. The window is not listed in
-/// any capability, so the remote login page cannot reach Tauri commands.
+/// resolve with the redirect URL carrying `?devTicket=`.
+///
+/// The login ends on `callback_scheme` — the app scheme mobile registers with
+/// the OS (`com.openframe.app`), which the shell reuses because it is the one
+/// redirect target the gateway honours verbatim in every environment. Here it
+/// is never handed to the OS and nothing is registered: the navigation to it is
+/// cancelled and read in-process, which is this window's equivalent of the
+/// mobile ASWebAuthenticationSession matching on it.
+///
+/// ANY url carrying the ticket is still accepted, because an environment that
+/// drops the requested redirect delivers it on the tenant landing instead, and
+/// the check runs in both on_navigation and on_page_load because server 302 hops
+/// don't always surface as navigation-policy callbacks. The window is not listed
+/// in any capability, so the remote login page cannot reach Tauri commands.
 #[tauri::command]
 async fn native_auth_start(
     app: AppHandle,
     state: State<'_, AuthState>,
     url: String,
-    callback_host: String,
-    callback_path: String,
+    callback_scheme: Option<String>,
 ) -> Result<NativeAuthStartResult, String> {
-    // Part of the NativeAuth plugin API; the desktop capture keys on ?devTicket= alone.
-    let _ = (callback_host, callback_path);
     let login_url = url::Url::parse(&url).map_err(|e| format!("Invalid login URL: {e}"))?;
     log::info!(
         "[auth] opening login window at {}",
@@ -799,13 +829,19 @@ async fn native_auth_start(
         .title("Sign in to OpenFrame")
         .inner_size(520.0, 720.0)
         .background_color(WINDOW_BG)
-        .on_navigation(move |u| {
-            if url_carries_ticket(u) {
-                finish_login(&nav_app, Ok(u.to_string()));
-                return false;
-            }
-            true
-        })
+        .on_navigation(
+            move |u| match classify_login_nav(u, callback_scheme.as_deref()) {
+                LoginNav::Ticket => {
+                    finish_login(&nav_app, Ok(u.to_string()));
+                    false
+                }
+                LoginNav::SchemeWithoutTicket => {
+                    finish_login(&nav_app, Err("callback carried no ticket".into()));
+                    false
+                }
+                LoginNav::Continue => true,
+            },
+        )
         .on_page_load(move |_win, payload| {
             if url_carries_ticket(payload.url()) {
                 finish_login(&load_app, Ok(payload.url().to_string()));
@@ -1277,4 +1313,62 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn nav(url: &str, scheme: Option<&str>) -> LoginNav {
+        classify_login_nav(&url::Url::parse(url).unwrap(), scheme)
+    }
+
+    // The callback the gateway sends when it honours the requested redirect
+    // (`openframe.gateway.redirect.allowed-uris`), which is the whole point of
+    // reusing the mobile scheme: a non-special URL still parses, and the ticket
+    // is still in its query.
+    #[test]
+    fn app_scheme_callback_carries_the_ticket() {
+        assert!(matches!(
+            nav(
+                "com.openframe.app://auth?devTicket=abc123",
+                Some("com.openframe.app")
+            ),
+            LoginNav::Ticket
+        ));
+    }
+
+    // What every environment with dev-ticket issuance on does with a redirect it
+    // does not allow-list: the ticket rides on the tenant landing instead.
+    #[test]
+    fn https_landing_carries_the_ticket_too() {
+        assert!(matches!(
+            nav(
+                "https://acme.openframe.example/?devTicket=abc123",
+                Some("com.openframe.app")
+            ),
+            LoginNav::Ticket
+        ));
+    }
+
+    // Never allowed through: this app registers no scheme, so the OS has nothing
+    // to open it with.
+    #[test]
+    fn app_scheme_without_a_ticket_ends_the_login() {
+        assert!(matches!(
+            nav("com.openframe.app://auth", Some("com.openframe.app")),
+            LoginNav::SchemeWithoutTicket
+        ));
+    }
+
+    #[test]
+    fn login_pages_navigate_normally() {
+        assert!(matches!(
+            nav(
+                "https://auth.openframe.example/oauth/login?tenantId=t1",
+                Some("com.openframe.app")
+            ),
+            LoginNav::Continue
+        ));
+    }
 }

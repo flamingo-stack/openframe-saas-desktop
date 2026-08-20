@@ -66,8 +66,8 @@ against the produced artifact, which is why `tauri.conf.json` sets
 
 The shell knows exactly one configured URL: the **shared auth host**. There is no
 tenant host to configure — the frontend's sign-in screen discovers the tenant
-from the user's email, and the shell learns the tenant origin from the OAuth
-callback.
+from the user's email, and the shell is told that tenant's origin once login
+succeeds.
 
 The shared host is baked in at build time and can be overridden per install by
 `shared_host` in `config.json`, which lives in the OS app-config directory:

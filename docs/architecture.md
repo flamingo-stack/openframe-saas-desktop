@@ -80,7 +80,8 @@ tenant host to configure anywhere.
   authoritative list.
 - Boot always goes straight to the main window. Unauthenticated, the bundle shows
   its own sign-in screen: email → tenant discovery on the shared host → provider
-  → native login. The tenant origin is learned from the OAuth callback and
+  → native login. The tenant origin is the one discovery resolved — the login
+  callback lands on the app's custom scheme and carries no host — and it is
   persisted both in the webview and shell-side.
 - Tray **Sign Out** clears tokens and the learned host and recreates the main
   window at the sign-in screen.

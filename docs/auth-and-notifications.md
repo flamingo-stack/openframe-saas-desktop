@@ -145,10 +145,47 @@ The bridge is shell-agnostic; the frontend feature-detects each method.
 | `refreshTokens` | Optional. Its presence means "the shell owns refresh", and the webview stops calling the refresh endpoint entirely. Rejects only when there is genuinely nothing to refresh with — a rejection is a logout on the frontend side. |
 | `setTenantHost` | Persists the login-learned tenant origin shell-side, so shell networking has a gateway without depending on webview storage. |
 
-Login accepts **any** callback URL carrying a dev ticket, checked in both the
-navigation and page-load callbacks — server-side redirect hops do not reliably
-surface as navigation-policy callbacks. Closing the window before capture rejects
-as a user cancellation.
+### Where the login ends
+
+The login window ends the flow on the **mobile app's custom scheme**,
+`com.openframe.app://auth`, the same callback openframe-mobile's
+ASWebAuthenticationSession completes on. Two gateway behaviours make that the
+only callback that works everywhere, and a native login needs both:
+
+- **`authMobile=true` is what produces a dev ticket at all.** The gateway
+  appends one when `dev-ticket-enabled` *or* the login asked for `authMobile`
+  (`OAuthBffController.callback`), and prod has dev-ticket issuance **off**. The
+  shell used to log in with `authMobile=false`, so against prod the callback
+  carried no ticket, nothing ever satisfied the capture, and the app sat on the
+  sign-in screen until the user closed the window. Non-prod hid it: dev tickets
+  are on there, so any callback carried one.
+- **The scheme is the only redirect target honoured verbatim.** The SaaS
+  gateway's `TenantDomainRedirectResolver` replaces a requested `redirectTo`
+  with the tenant's own domain unless it is in
+  `openframe.gateway.redirect.allowed-uris`, whose sole entry — in *every*
+  environment — is `com.openframe.app://auth`. An https callback of our own
+  naming never survives.
+
+Nothing is registered with the OS for it. The navigation to the scheme is
+cancelled in the window's own navigation callback and read in-process, which is
+this shell's equivalent of the mobile auth session matching on it — so no
+LaunchServices/HKCU registration, and no collision with an installed mobile app.
+A scheme callback **without** a ticket ends the login as a failure rather than
+being allowed through, since allowing it would ask the OS to open a scheme this
+app never claimed.
+
+Beyond that, login still accepts **any** callback URL carrying a dev ticket,
+checked in both the navigation and page-load callbacks — server-side redirect
+hops do not reliably surface as navigation-policy callbacks, and an environment
+that drops the requested redirect puts the ticket on the tenant landing instead.
+Closing the window before capture rejects as a user cancellation.
+
+> Verified on macOS 15 (WKWebView, wry 0.55): a **302** to the scheme, and a
+> script-driven navigation to it, both surface in the navigation callback and are
+> captured; a scheme callback carrying no ticket rejects and closes the window.
+> The equivalent WebView2 path (`NavigationStarting` + `SetCancel`) is documented
+> to fire for external URI schemes but is **not** exercised here — Windows is the
+> untested half of this.
 
 ## Notification plane
 

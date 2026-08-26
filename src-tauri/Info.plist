@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Merged into the bundle Info.plist the Tauri CLI generates (tauri build
+	     only — an unbundled `tauri dev` binary is not a bundle and LaunchServices
+	     cannot route a scheme to it, so sign-in has to be tested on a built .app
+	     that has been launched once from /Applications).
+
+	     This is what makes the OAuth callback reachable: the login runs in the
+	     default browser, the gateway redirects to openframe-console://auth, and
+	     LaunchServices hands that URL to this bundle, where it arrives as
+	     RunEvent::Opened. Keep the scheme identical to URI_SCHEME in
+	     src/lib.rs (a test asserts it) — the shell also pushes it as
+	     NEXT_PUBLIC_MOBILE_APP_SCHEME, which is what builds the redirect the
+	     gateway is asked to honour. -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.openframe.console.auth</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>openframe-console</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>

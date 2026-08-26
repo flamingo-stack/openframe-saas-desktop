@@ -11,13 +11,14 @@
 //!
 //! Written by hand rather than through `tauri-plugin-autostart`, which was the
 //! first choice until its source was read. It hands `auto-launch` an unquoted
-//! exe path, and this product installs to `…\OpenFrame Desktop\OpenFrame
-//! Desktop.exe` — Explorer runs Run entries through `CreateProcessW(NULL, …)`,
-//! which walks space-delimited prefixes, so anything that ever dropped a
-//! `%LOCALAPPDATA%\OpenFrame.exe` would own every login. Its macOS agent also
-//! carries no `AssociatedBundleIdentifiers` key, without which the Login Items
-//! entry is an unattributed background item rather than this app. Both backends
-//! below are a few lines each over dependencies the crate already has.
+//! exe path, and this product installs under `…\OpenFrame Console\`, a
+//! directory with a space in it — Explorer runs Run entries through
+//! `CreateProcessW(NULL, …)`, which walks space-delimited prefixes, so anything
+//! that ever dropped a `%LOCALAPPDATA%\OpenFrame.exe` would own every login. Its
+//! macOS agent also carries no `AssociatedBundleIdentifiers` key, without which
+//! the Login Items entry is an unattributed background item rather than this
+//! app. Both backends below are a few lines each over dependencies the crate
+//! already has.
 //!
 //! **The user can overrule a managed install, and that is reported rather than
 //! fought.** Windows keeps its own switch in `StartupApproved\Run` (Task
@@ -40,9 +41,30 @@ use crate::{load_config, notifications::lock, save_config, MAIN_LABEL};
 
 /// Argument the registration carries. Distinct from the toast activator's
 /// `-ToastActivated` (`windows_activator.rs`) and from the
-/// `openframe-desktop://` URIs `handle_notification_argv` looks for, so the
-/// three argv consumers cannot be confused for one another.
+/// scheme URIs `handle_scheme_argv` looks for (the OAuth callback and toast
+/// clicks), so the three argv consumers cannot be confused for one another.
 const FLAG: &str = "--autostart";
+
+/// The bundle identifier this app shipped under before it was renamed to
+/// OpenFrame Console. The macOS and Linux backends name their registration after
+/// the identifier, so pre-rename builds left one behind under this name; Windows
+/// keys off the product name instead and has its own `backend::LEGACY_VALUE`.
+/// An abandoned registration is not inert: it launches the *old* binary at every
+/// login, beside the new one. [`remove_legacy_registration`] deletes both.
+///
+/// The app had only test users at the time of the rename, so nothing else is
+/// migrated: the old app-config directory (`config.json`, `tokens.json`) is left
+/// where it is, which signs everyone out once.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const LEGACY_IDENTIFIER: &str = "com.openframe.desktop";
+
+/// Remove the login registration a pre-rename build wrote under its own
+/// identity. Idempotent and silent when there is nothing to remove, so it costs
+/// one absent-file (or absent-value) check per launch, and it can be deleted
+/// once no machine still has a pre-rename build on it.
+fn remove_legacy_registration(app: &AppHandle) {
+    backend::remove_legacy(app);
+}
 
 /// Whether the OS started this process at login.
 pub(crate) fn launched_at_login() -> bool {
@@ -376,10 +398,21 @@ mod backend {
         r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
     /// Value name under both keys. Deliberately the product name rather than
     /// `app.config().identifier` — this one is user-facing, sitting alongside
-    /// other applications' names in the Run key and in startup managers — and
-    /// deliberately a literal, so renaming the product cannot orphan a
-    /// registration an installed copy already wrote.
-    const VALUE: &str = "OpenFrame Desktop";
+    /// other applications' names in the Run key and in startup managers.
+    ///
+    /// It is a literal, so a product rename cannot silently orphan a
+    /// registration an installed copy already wrote. When the product *is*
+    /// renamed, changing this is only half the job: the value written under the
+    /// old name has to be deleted too, or it keeps launching the old build at
+    /// every login. See [`super::remove_legacy_registration`].
+    const VALUE: &str = "OpenFrame Console";
+    /// What [`VALUE`] was before the app was renamed to OpenFrame Console.
+    /// Must never be made equal to it: unlike the macOS/Linux backend, which
+    /// compares identifiers at runtime, this one deletes `LEGACY_VALUE`
+    /// unconditionally, so the two coinciding would clear the live registration
+    /// at every launch. Both are literals, so that is a rule for the next edit
+    /// rather than a branch.
+    const LEGACY_VALUE: &str = "OpenFrame Desktop";
 
     fn expected(app: &AppHandle) -> Result<String, String> {
         Ok(super::windows_run_command(&super::binary(app)?))
@@ -454,6 +487,33 @@ mod backend {
         }
     }
 
+    /// Delete the registration written under the pre-rename value name, and the
+    /// startup-approval record that shadows it. Both keys are per-user (HKCU),
+    /// so no elevation and nothing to fail loudly about.
+    pub(super) fn remove_legacy(_app: &AppHandle) {
+        for (key_path, what) in [(RUN_KEY, "run entry"), (APPROVED_KEY, "approval record")] {
+            let key = match RegKey::predef(HKEY_CURRENT_USER)
+                .open_subkey_with_flags(key_path, KEY_SET_VALUE)
+            {
+                Ok(key) => key,
+                // No key at all: nothing was ever registered here.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    log::warn!(
+                        "[autostart] could not open {key_path} to clear the legacy {what}: {e}"
+                    );
+                    continue;
+                }
+            };
+            match key.delete_value(LEGACY_VALUE) {
+                Ok(()) => log::info!("[autostart] removed the legacy {LEGACY_VALUE} {what}"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                // Worth a line: the pre-rename build keeps starting at login.
+                Err(e) => log::warn!("[autostart] could not remove the legacy {what}: {e}"),
+            }
+        }
+    }
+
     /// Drop Task Manager's "disabled" record, so the user's own request to turn
     /// this on is not silently overruled by a switch they flipped months ago.
     /// Reached only from an explicit [`super::set`] — never from the reconcile,
@@ -472,19 +532,26 @@ mod backend {
     use tauri::{AppHandle, Manager};
 
     #[cfg(target_os = "macos")]
-    fn path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    fn path_for(app: &AppHandle, identifier: &str) -> Result<std::path::PathBuf, String> {
         let home = app.path().home_dir().map_err(|e| e.to_string())?;
         Ok(home
             .join("Library/LaunchAgents")
-            .join(format!("{}.plist", app.config().identifier)))
+            .join(format!("{identifier}.plist")))
     }
 
     #[cfg(target_os = "linux")]
-    fn path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    fn path_for(app: &AppHandle, identifier: &str) -> Result<std::path::PathBuf, String> {
         let config = app.path().config_dir().map_err(|e| e.to_string())?;
         Ok(config
             .join("autostart")
-            .join(format!("{}.desktop", app.config().identifier)))
+            .join(format!("{identifier}.desktop")))
+    }
+
+    /// Both backends name the registration after the bundle identifier, which is
+    /// why renaming the app orphans one — and why the legacy path below is built
+    /// by the same function rather than derived from this one's output.
+    fn path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+        path_for(app, &app.config().identifier)
     }
 
     #[cfg(target_os = "macos")]
@@ -495,6 +562,23 @@ mod backend {
     #[cfg(target_os = "linux")]
     fn content(app: &AppHandle) -> Result<String, String> {
         super::linux_desktop_entry(&super::binary(app)?)
+    }
+
+    pub(super) fn remove_legacy(app: &AppHandle) {
+        // Revert the identifier and the legacy path becomes the live one, which
+        // this would then delete on every launch — autostart silently off, with
+        // the reconcile reading the deletion back as "never registered".
+        if app.config().identifier == super::LEGACY_IDENTIFIER {
+            return;
+        }
+        let Ok(path) = path_for(app, super::LEGACY_IDENTIFIER) else {
+            return;
+        };
+        match std::fs::remove_file(&path) {
+            Ok(()) => log::info!("[autostart] removed the legacy registration at {path:?}"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::warn!("[autostart] could not remove {path:?}: {e}"),
+        }
     }
 
     pub(super) fn registered(app: &AppHandle) -> bool {
@@ -698,6 +782,10 @@ pub(crate) fn reconcile_on_startup(app: &AppHandle) {
     std::thread::spawn(move || {
         {
             let _serialized = lock(&REGISTRATION);
+            // Before deciding anything: the old identity's registration is not
+            // this app's to keep, and leaving it would start the pre-rename
+            // build alongside whatever is decided below.
+            remove_legacy_registration(&app);
             let cfg = load_config(&app);
             let facts = Facts {
                 policy: cfg.autostart_enforced,
@@ -913,9 +1001,9 @@ mod tests {
     #[test]
     fn flag_is_found_among_the_other_argv_consumers() {
         let mut argv = vec![
-            OsString::from("/Applications/OpenFrame Desktop.app/Contents/MacOS/OpenFrame Desktop"),
+            OsString::from("/Applications/OpenFrame Console.app/Contents/MacOS/OpenFrame Console"),
             OsString::from("-ToastActivated"),
-            OsString::from("openframe-desktop://notification?id=1"),
+            OsString::from("openframe-console://notification?id=1"),
         ];
         assert!(!has_flag(argv.clone()));
         argv.push(OsString::from(FLAG));
@@ -1084,10 +1172,10 @@ mod tests {
 
     #[test]
     fn the_windows_command_quotes_a_path_containing_spaces() {
-        let exe = Path::new(r"C:\Users\x\AppData\Local\OpenFrame Desktop\OpenFrame Desktop.exe");
+        let exe = Path::new(r"C:\Users\x\AppData\Local\OpenFrame Console\OpenFrame Console.exe");
         assert_eq!(
             windows_run_command(exe),
-            r#""C:\Users\x\AppData\Local\OpenFrame Desktop\OpenFrame Desktop.exe" --autostart"#
+            r#""C:\Users\x\AppData\Local\OpenFrame Console\OpenFrame Console.exe" --autostart"#
         );
     }
 
@@ -1097,38 +1185,38 @@ mod tests {
     #[test]
     fn the_windows_command_drops_the_verbatim_prefix_the_shell_cannot_parse() {
         let exe =
-            Path::new(r"\\?\C:\Users\x\AppData\Local\OpenFrame Desktop\OpenFrame Desktop.exe");
+            Path::new(r"\\?\C:\Users\x\AppData\Local\OpenFrame Console\OpenFrame Console.exe");
         assert_eq!(
             windows_run_command(exe),
-            r#""C:\Users\x\AppData\Local\OpenFrame Desktop\OpenFrame Desktop.exe" --autostart"#
+            r#""C:\Users\x\AppData\Local\OpenFrame Console\OpenFrame Console.exe" --autostart"#
         );
     }
 
     #[test]
     fn a_verbatim_unc_path_keeps_its_host() {
         assert_eq!(
-            win32_path(r"\\?\UNC\srv\share\OpenFrame Desktop.exe"),
-            r"\\srv\share\OpenFrame Desktop.exe"
+            win32_path(r"\\?\UNC\srv\share\OpenFrame Console.exe"),
+            r"\\srv\share\OpenFrame Console.exe"
         );
     }
 
     #[test]
     fn an_ordinary_path_is_left_exactly_as_it_is() {
         assert_eq!(
-            win32_path(r"C:\Program Files\OpenFrame Desktop\OpenFrame Desktop.exe"),
-            r"C:\Program Files\OpenFrame Desktop\OpenFrame Desktop.exe"
+            win32_path(r"C:\Program Files\OpenFrame Console\OpenFrame Console.exe"),
+            r"C:\Program Files\OpenFrame Console\OpenFrame Console.exe"
         );
     }
 
     #[test]
     fn the_plist_is_attributed_and_does_not_keep_the_app_alive() {
         let plist = macos_plist(
-            Path::new("/Applications/OpenFrame Desktop.app/Contents/MacOS/OpenFrame Desktop"),
-            "com.openframe.desktop",
+            Path::new("/Applications/OpenFrame Console.app/Contents/MacOS/OpenFrame Console"),
+            "com.openframe.console",
         )
         .expect("a plain path renders");
         assert!(plist.contains("<key>AssociatedBundleIdentifiers</key>"));
-        assert!(plist.contains("<string>com.openframe.desktop</string>"));
+        assert!(plist.contains("<string>com.openframe.console</string>"));
         assert!(plist.contains("<key>RunAtLoad</key>"));
         // Spelled out rather than interpolated: these assertions pin the bytes
         // the OS is handed, so a change to FLAG should fail them.
@@ -1141,7 +1229,7 @@ mod tests {
     fn a_path_with_xml_syntax_in_it_stays_parseable() {
         let plist = macos_plist(
             Path::new("/Users/a & b/<x>/OpenFrame.app/x"),
-            "com.openframe.desktop",
+            "com.openframe.console",
         )
         .expect("escapable characters render");
         assert!(plist.contains("/Users/a &amp; b/&lt;x&gt;/OpenFrame.app/x"));
@@ -1153,16 +1241,16 @@ mod tests {
     fn a_path_with_a_control_character_is_refused() {
         assert!(macos_plist(
             Path::new("/Users/a\u{1}b/OpenFrame.app/x"),
-            "com.openframe.desktop"
+            "com.openframe.console"
         )
         .is_err());
     }
 
     #[test]
     fn the_desktop_entry_carries_the_flag() {
-        let entry = linux_desktop_entry(Path::new("/opt/openframe/openframe-desktop"))
+        let entry = linux_desktop_entry(Path::new("/opt/openframe/openframe-console"))
             .expect("a plain path renders");
-        assert!(entry.contains("Exec=\"/opt/openframe/openframe-desktop\" --autostart"));
+        assert!(entry.contains("Exec=\"/opt/openframe/openframe-console\" --autostart"));
     }
 
     /// The desktop environment's switch lives in the entry we wrote, so it has
@@ -1188,7 +1276,7 @@ mod tests {
     /// it at every launch and reverts the user's disable forever.
     #[test]
     fn a_desktop_environments_additions_do_not_read_as_staleness() {
-        let ours = linux_desktop_entry(Path::new("/opt/openframe/openframe-desktop")).unwrap();
+        let ours = linux_desktop_entry(Path::new("/opt/openframe/openframe-console")).unwrap();
         for addition in [
             "Hidden=true",
             "X-GNOME-Autostart-enabled=false",
@@ -1204,7 +1292,7 @@ mod tests {
             );
         }
         // A genuinely different binary must still read as stale.
-        let moved = linux_desktop_entry(Path::new("/opt/elsewhere/openframe-desktop")).unwrap();
+        let moved = linux_desktop_entry(Path::new("/opt/elsewhere/openframe-console")).unwrap();
         assert_ne!(linux_ours(&moved), linux_ours(&ours));
     }
 
@@ -1214,7 +1302,7 @@ mod tests {
     fn a_rewrite_carries_the_users_switch_across() {
         let existing = format!(
             "{}Hidden=true\nIcon=openframe\n",
-            linux_desktop_entry(Path::new("/old/openframe-desktop")).unwrap()
+            linux_desktop_entry(Path::new("/old/openframe-console")).unwrap()
         );
         let preserved = linux_preserved(&existing);
         assert!(preserved.contains("Hidden=true"));

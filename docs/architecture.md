@@ -114,7 +114,7 @@ to discover against, are out of scope for this shell.
 ## Start at login
 
 `src-tauri/src/autostart.rs`. Registration is per-user — a launchd agent at
-`~/Library/LaunchAgents/com.openframe.desktop.plist` on macOS, an `HKCU`
+`~/Library/LaunchAgents/com.openframe.console.plist` on macOS, an `HKCU`
 `…\CurrentVersion\Run` value on Windows, a `~/.config/autostart` desktop entry on
 Linux — and carries `--autostart`, which is the shell's only signal that a launch
 came from the OS rather than the user. That flag suppresses two things: building
@@ -168,15 +168,15 @@ and `write_atomic`, which the crate already has.
 - **Surfaces**: the tray's *Start at Login* check item, and the
   `autostart_status` / `autostart_set` commands for the frontend. Both go through
   the same state, so either moves the same check mark. As app-defined commands
-  they need no capability entry, which keeps the login window outside this as it
-  is outside all IPC.
+  they need no capability entry.
 
 ## Security model
 
 - **Capabilities.** Only `main.json` exists, scoped to `main` and `child-*`. The
   bundle is our own code, so it may invoke the IPC backing the NativeAuth bridge.
-  The remote `native-auth` login window is in **no** capability, so the login page
-  — which is third-party-influenced — cannot reach Tauri commands.
+  No window hosts a remote origin at all: the login page — which is
+  third-party-influenced — renders in the user's own browser, not in a window of
+  ours, and returns only a URL on the app's scheme.
 - **Gateway CORS is a prerequisite.** The gateway must allow `tauri://localhost`
   (macOS/Linux) and `http://tauri.localhost` (Windows), and expose the
   `Access-Token`/`Refresh-Token` headers. Without it the bundle renders and every
@@ -194,9 +194,9 @@ logs a boot marker with the injected `window.__ENV` and the page origin.
 
 | OS | Log |
 |---|---|
-| macOS | `~/Library/Logs/com.openframe.desktop/openframe-desktop.log` |
-| Windows | `%LOCALAPPDATA%\com.openframe.desktop\logs\openframe-desktop.log` |
-| Linux | `~/.local/share/com.openframe.desktop/logs/openframe-desktop.log` |
+| macOS | `~/Library/Logs/com.openframe.console/openframe-console.log` |
+| Windows | `%LOCALAPPDATA%\com.openframe.console\logs\openframe-console.log` |
+| Linux | `~/.local/share/com.openframe.console/logs/openframe-console.log` |
 
 ## Known gaps
 

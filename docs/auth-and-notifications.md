@@ -140,52 +140,109 @@ The bridge is shell-agnostic; the frontend feature-detects each method.
 
 | Method | Notes |
 |---|---|
-| `start` / `exchangeTicket` | OAuth in a shell-owned window, then a native token exchange — the response headers carrying tokens are invisible to a cross-origin webview fetch. |
+| `start` / `exchangeTicket` | OAuth in the user's default browser, then a native token exchange — the response headers carrying tokens are invisible to a cross-origin webview fetch. |
 | `get` / `set` / `clearTokens` | `set` merges per field: a rotation response may carry one token or both. |
 | `refreshTokens` | Optional. Its presence means "the shell owns refresh", and the webview stops calling the refresh endpoint entirely. Rejects only when there is genuinely nothing to refresh with — a rejection is a logout on the frontend side. |
 | `setTenantHost` | Persists the login-learned tenant origin shell-side, so shell networking has a gateway without depending on webview storage. |
 
 ### Where the login ends
 
-The login window ends the flow on the **mobile app's custom scheme**,
-`com.openframe.app://auth`, the same callback openframe-mobile's
-ASWebAuthenticationSession completes on. Two gateway behaviours make that the
-only callback that works everywhere, and a native login needs both:
+The login runs in the user's **default browser** and comes back on this app's own
+scheme, `openframe-console://auth`.
 
-- **`authMobile=true` is what produces a dev ticket at all.** The gateway
-  appends one when `dev-ticket-enabled` *or* the login asked for `authMobile`
+The browser is the whole point. A window of ours is a fresh cookie jar, so an
+identity provider the user is already signed into on this machine cannot see that
+session and asks for credentials again — the complaint that started this. The
+default browser holds the session. It also keeps the flow out of the embedded
+user agents Google rejects with `disallowed_useragent`.
+
+Three gateway behaviours have to line up, and a native login needs all three:
+
+- **`authMobile=true` is what produces a dev ticket at all.** The gateway appends
+  one when `dev-ticket-enabled` *or* the login asked for `authMobile`
   (`OAuthBffController.callback`), and prod has dev-ticket issuance **off**. The
   shell used to log in with `authMobile=false`, so against prod the callback
-  carried no ticket, nothing ever satisfied the capture, and the app sat on the
-  sign-in screen until the user closed the window. Non-prod hid it: dev tickets
-  are on there, so any callback carried one.
-- **The scheme is the only redirect target honoured verbatim.** The SaaS
-  gateway's `TenantDomainRedirectResolver` replaces a requested `redirectTo`
-  with the tenant's own domain unless it is in
-  `openframe.gateway.redirect.allowed-uris`, whose sole entry — in *every*
-  environment — is `com.openframe.app://auth`. An https callback of our own
-  naming never survives.
+  carried no ticket and the app sat on the sign-in screen. Non-prod hid it: dev
+  tickets are on there, so any callback carried one.
+- **The callback must be allow-listed verbatim.** The SaaS gateway's
+  `TenantDomainRedirectResolver` replaces a requested `redirectTo` with the
+  tenant's own domain unless it matches an entry of
+  `openframe.gateway.redirect.allowed-uris` by exact string equality. So
+  `openframe-console://auth` has to be in that list —
+  `openframe-saas-shared/configs/base/openframe-saas-gateway.yml`, inherited by
+  every environment — alongside mobile's `com.openframe.app://auth`. The OSS
+  gateway binds `DefaultRedirectTargetResolver` instead, which honours any
+  requested redirect, so it needs no configuration.
+- **`mobile-auth-enabled` gates the exchange.** `/oauth/dev-exchange` is refused
+  when both it and `dev-ticket-enabled` are off.
 
-Nothing is registered with the OS for it. The navigation to the scheme is
-cancelled in the window's own navigation callback and read in-process, which is
-this shell's equivalent of the mobile auth session matching on it — so no
-LaunchServices/HKCU registration, and no collision with an installed mobile app.
-A scheme callback **without** a ticket ends the login as a failure rather than
-being allowed through, since allowing it would ask the OS to open a scheme this
-app never claimed.
+Why not reuse mobile's `com.openframe.app://auth`, which is already allow-listed?
+Because the browser hands the callback to **LaunchServices/the registry**, not to
+a webview we can watch, so the app has to make a real machine-wide claim on the
+scheme it names. Mobile has already partitioned `com.openframe.app*` across its
+three lanes (`.stage`, `.dev`), the prod iOS lane registers the flat name, and an
+Apple Silicon Mac can install that build — leaving the desktop appropriating
+another app's identity with nowhere of its own to grow per-env lanes into. One
+line of gateway config buys a namespace this app owns.
 
-Beyond that, login still accepts **any** callback URL carrying a dev ticket,
-checked in both the navigation and page-load callbacks — server-side redirect
-hops do not reliably surface as navigation-policy callbacks, and an environment
-that drops the requested redirect puts the ticket on the tenant landing instead.
-Closing the window before capture rejects as a user cancellation.
+Registration is per-platform, and both halves are ours to keep in sync with
+`URI_SCHEME`:
 
-> Verified on macOS 15 (WKWebView, wry 0.55): a **302** to the scheme, and a
-> script-driven navigation to it, both surface in the navigation callback and are
-> captured; a scheme callback carrying no ticket rejects and closes the window.
-> The equivalent WebView2 path (`NavigationStarting` + `SetCancel`) is documented
-> to fire for external URI schemes but is **not** exercised here — Windows is the
-> untested half of this.
+- **macOS** — `CFBundleURLTypes` in `src-tauri/Info.plist`, which the Tauri CLI
+  merges into the generated bundle plist. Delivery is an Apple Event, surfacing
+  as `RunEvent::Opened`; argv never carries it. The plist is the one copy of the
+  scheme the compiler cannot see, so a test reads it back and fails if it and
+  `URI_SCHEME` ever drift — the failure it prevents is silent, sign-in simply
+  stops arriving.
+- **Windows** — an HKCU key written on every launch by `register_url_scheme`, the
+  same routine that registers the scheme toasts activate. Delivery is argv:
+  forwarded by the single-instance plugin when the app is running, in our own
+  argv when the callback cold-starts it.
+
+The scheme string reaches the frontend as `NEXT_PUBLIC_MOBILE_APP_SCHEME` in the
+injected `window.__ENV`, which is what makes `runtimeEnv.appScheme()` build
+`openframe-console://auth` as the `redirectTo`. The frontend needs no
+desktop-specific code for this; the two uses must not drift, so `start` rejects a
+`callbackScheme` that is not the registered one rather than opening a browser
+whose callback could only ever time out.
+
+A callback **without** a ticket ends the login as a failure: the gateway appends
+one to every `authMobile` callback, so its absence means the flow never reached
+the BFF callback.
+
+> **What the browser flow gave up.** The old login window also accepted *any*
+> URL carrying a ticket, which covered a gateway that dropped the requested
+> redirect and put the ticket on the tenant landing instead. That fallback is
+> gone — such a ticket now lands in the browser, out of this process's reach — so
+> against SaaS the allow-list entry is a hard requirement, not a nicety. The
+> symptom when it is missing is a login that hangs until `LOGIN_TIMEOUT` (5
+> minutes) and logs which URI never arrived.
+>
+> **Cancellation is weaker too.** Closing the window used to reject the pending
+> login immediately. A browser tab the user abandons signals nothing, so the
+> timeout is the only end. A stale callback arriving after it resolves nothing
+> and says so in the log.
+
+> **Two things the callback does not do, and mobile does not either.** It carries
+> no CSRF nonce — the allow-list matches the redirect by exact string equality,
+> so a `?state=` of ours cannot be added to it without a gateway change — and the
+> scheme claim is not exclusive on any desktop OS. A dev ticket is a one-time
+> UUID with a 120s TTL, which bounds but does not close either gap. Both are
+> worth revisiting if the allow-list ever learns to match ignoring the query.
+
+> **The gateway also sets auth cookies on the callback response**
+> (`buildFoundWithCookiesAndClearState`), so the user's real browser keeps the
+> same access/refresh pair the shell just took custody of. That collides with the
+> "exactly one refresher" invariant above if the user then opens the web app in
+> that browser: whichever side rotates first retires the other's token. Not
+> introduced here — mobile's `ASWebAuthenticationSession` shares Safari's jar the
+> same way — but it stops being confined to a webview we destroy.
+
+> Verified: `cargo test` covers the callback classification (our scheme + `auth`
+> host, ticket present after either `?` or `&`, a tenant landing rejected). The
+> end-to-end browser round trip is **not** verified — macOS cannot route a scheme
+> to an unbundled `tauri dev` binary, so it needs a built, signed `.app` launched
+> once from `/Applications`, and Windows needs a built install to write HKCU.
 
 ## Notification plane
 
@@ -262,15 +319,15 @@ cold-starts the app, went nowhere.
 > **A built `.app` is not enough on macOS — it has to be signed.** `tauri build`
 > ships the bundle carrying only the linker's ad-hoc signature (`codesign -dv`
 > reports `flags=…(adhoc,linker-signed)` and an `Identifier` derived from the
-> binary name, not `com.openframe.desktop`). UserNotifications refuses to serve
+> binary name, not `com.openframe.console`). UserNotifications refuses to serve
 > an app it cannot identify: `requestAuthorization` **and** every
 > `addNotificationRequest` fail with `UNErrorDomain error 1`
 > (`UNErrorCodeNotificationsNotAllowed`), which reads in the log as
 > "authorization failed" followed by "request rejected" for each notification —
 > the plane is otherwise working, envelopes arrive and are dispatched. Signing the
 > bundle with any real identity fixes it:
-> `codesign --force --sign "Apple Development: …" "path/to/OpenFrame Desktop.app"`, after
-> which `codesign -dv` shows `Identifier=com.openframe.desktop`. Every fresh build
+> `codesign --force --sign "Apple Development: …" "path/to/OpenFrame Console.app"`, after
+> which `codesign -dv` shows `Identifier=com.openframe.console`. Every fresh build
 > needs it again — signing runs against the produced artifact, which is why it is
 > not in the Makefile.
 

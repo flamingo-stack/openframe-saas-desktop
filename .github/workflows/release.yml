@@ -1,4 +1,4 @@
-name: OpenFrame Desktop Release
+name: OpenFrame Console Release
 
 # =============================================================================
 # WORKFLOW CONFIGURATION
@@ -183,7 +183,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: "openframe-desktop-${{ matrix.leg }}"
+          name: "openframe-console-${{ matrix.leg }}"
           path: artifacts/
           if-no-files-found: error
           retention-days: 30
@@ -255,7 +255,7 @@ jobs:
           emit windows-aarch64 final-artifacts/*_arm64-setup.exe
 
           jq -s --arg version "$APP_VERSION" --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            '{version: $version, notes: "OpenFrame Desktop \($version)", pub_date: $pub_date, platforms: from_entries}' \
+            '{version: $version, notes: "OpenFrame Console \($version)", pub_date: $pub_date, platforms: from_entries}' \
             <<< "$entries" > final-artifacts/updater.json
 
           jq '.platforms |= map_values(.signature |= "<\(. | length) bytes>")' final-artifacts/updater.json
@@ -268,7 +268,7 @@ jobs:
           shopt -s nullglob   # unmatched globs vanish, so .sig and updater.json skip themselves
           row() { local label=$1; shift; for f in "$@"; do echo "| $label | \`$(basename "$f")\` |"; done; }
           {
-            echo "## OpenFrame Desktop"
+            echo "## OpenFrame Console"
             echo
             echo "Native shell bundling the openframe-oss-frontend static export."
             echo

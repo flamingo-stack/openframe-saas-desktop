@@ -2,7 +2,7 @@
 //
 // Two activation paths, because no single one covers both halves of a toast:
 //
-//   - The body and "Open" activate the `openframe-desktop://notify` URI. Hand-
+//   - The body and "Open" activate the `openframe-console://notify` URI. Hand-
 //     built rather than taken from a toast crate because those only support
 //     foreground activation (in-process `Activated` handlers), which dies with
 //     the process: clicks on toasts left in the Action Center by a previous app
@@ -485,7 +485,7 @@ mod tests {
     fn strings_that_name_no_action_are_rejected() {
         assert!(parse_action_args("").is_none());
         assert!(parse_action_args("title=Mingo&user=u1").is_none());
-        assert!(parse_action_args("openframe-desktop://notify?context=%7B%7D").is_none());
+        assert!(parse_action_args("openframe-console://notify?context=%7B%7D").is_none());
         // A malformed pair is skipped, not fatal.
         assert_eq!(
             parse_action_args("garbage&action=approve").unwrap().action,

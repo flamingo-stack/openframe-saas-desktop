@@ -13,7 +13,11 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 const RUNTIME_POLL_INTERVAL: Duration = Duration::from_secs(45 * 60);
 
-const AGENT_TYPE: &str = "openframe-desktop";
+/// Reported over NATS on `user.<id>.installed-agent` and persisted server-side per
+/// install (`InstalledAgentListener` → `addInstalledAgent`). Renamed with the app;
+/// rows written by pre-rename builds stay filed under `openframe-desktop` and are
+/// not migrated, so a query spanning both eras has to accept either.
+const AGENT_TYPE: &str = "openframe-console";
 const REPORT_RETRIES: u32 = 5;
 
 const EVENT_AVAILABLE: &str = "update:available";

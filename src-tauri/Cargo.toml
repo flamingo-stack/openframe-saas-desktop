@@ -1,7 +1,7 @@
 [package]
-name = "openframe-desktop"
+name = "openframe-console"
 version = "0.1.0"
-description = "OpenFrame Desktop"
+description = "OpenFrame Console"
 authors = ["OpenFrame"]
 edition = "2021"
 rust-version = "1.77.2"
@@ -24,7 +24,7 @@ log = "0.4"
 url = "2"
 # NativeAuth bridge: native dev-ticket exchange (reads tokens off response
 # headers a cross-origin webview fetch can't) + the oneshot that parks
-# native_auth_start until the login window captures the ticket.
+# native_auth_start until the OS hands back the openframe-console://auth callback.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 # JWT payload decode (exp claim) for the shell-owned token refresh schedule.
@@ -43,7 +43,7 @@ uuid = { version = "1", features = ["v4"] }
 # the inline reply text — which arrive through a COM activator
 # (Win32_UI_Notifications for INotificationActivationCallback, Win32_System_Com
 # for the class object that serves it). winreg registers both that activator's
-# CLSID and the openframe-desktop:// scheme the toast body still activates.
+# CLSID and the openframe-console:// scheme the toast body still activates.
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.61", features = [
     "Data_Xml_Dom",

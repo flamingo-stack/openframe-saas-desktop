@@ -204,7 +204,12 @@ fn maybe_notify(app: &AppHandle, envelope: &serde_json::Value, user_id: &str) {
     // verdict is the gateway telling every consumer the decision is made, and
     // that is true whether or not this envelope is one the user gets to see.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    crate::notification_actions::note_resolution(envelope.get("context"));
+    {
+        // Attributes are the spec contract; context rides only while the backend
+        // still dual-writes it. Recording is idempotent, so both sources are read.
+        crate::notification_actions::note_resolution(envelope.get("attributes"));
+        crate::notification_actions::note_resolution(envelope.get("context"));
+    }
 
     let Some(title) = string_field(envelope, "title") else {
         log::debug!("[notifications] ignoring envelope without title");
@@ -299,21 +304,40 @@ fn delivery_of(envelope: &serde_json::Value) -> Delivery {
 // Click payload + delivery
 // ---------------------------------------------------------------------------
 
-/// The webview's `notification:click` payload: the envelope's routing context
+/// The webview's `notification:click` payload: the envelope's routing fields
 /// in wire shape, which the frontend's `resolveNatsNotificationAction` maps to a
 /// route. Only the fields that mapping reads — plus `approvalRequestId`, which
 /// the Approve/Reject buttons resolve against the chat API — survive. The rest
-/// of `context` can be arbitrarily large (an approval request carries the whole
-/// `toolCalls` array), and it has to fit both in a Windows activation URI and in
-/// a toast payload that repeats it once per button; every id kept here is a
-/// UUID. `None` when the envelope points at nothing openable; the click then
-/// only raises the window.
+/// of the envelope can be arbitrarily large (an approval request carries the
+/// whole `toolCalls` array), and the payload has to fit both in a Windows
+/// activation URI and in a toast payload that repeats it once per button; every
+/// id kept here is a UUID. `None` when the envelope points at nothing openable;
+/// the click then only raises the window.
+///
+/// Sources are read field by field: top-level `type` and the `attributes` map
+/// are the spec contract, the nested `context` object is the legacy fallback
+/// that disappears from the wire once the backend stops dual-writing it. The
+/// payload keeps its `context` wrapper — that name is this app's internal
+/// protocol with the webview and the Windows activation URI, not the backend's.
 fn click_payload(envelope: &serde_json::Value) -> Option<serde_json::Value> {
-    let context = envelope.get("context")?;
-    let routing: serde_json::Map<_, _> = ["type", "ticketId", "dialogId", "approvalRequestId"]
-        .into_iter()
-        .filter_map(|key| Some((key.to_string(), context.get(key)?.clone())))
-        .collect();
+    let attributes = envelope.get("attributes");
+    let context = envelope.get("context");
+    let mut routing = serde_json::Map::new();
+    let kind = envelope
+        .get("type")
+        .filter(|value| !value.is_null())
+        .or_else(|| context.and_then(|context| context.get("type")));
+    if let Some(kind) = kind {
+        routing.insert("type".to_string(), kind.clone());
+    }
+    for key in ["ticketId", "dialogId", "approvalRequestId"] {
+        let value = attributes
+            .and_then(|attributes| attributes.get(key))
+            .or_else(|| context.and_then(|context| context.get(key)));
+        if let Some(value) = value {
+            routing.insert(key.to_string(), value.clone());
+        }
+    }
     (!routing.is_empty()).then(|| serde_json::json!({ "context": routing }))
 }
 
@@ -574,6 +598,60 @@ mod tests {
         assert_eq!(
             parse_click_uri(&click_uri(Some(&payload))).unwrap(),
             payload
+        );
+    }
+
+    /// The spec contract: top-level `type` + flat `attributes`, no `context` at
+    /// all — the shape the wire settles on once the backend stops dual-writing.
+    #[test]
+    fn spec_shaped_envelope_routes_without_context() {
+        let envelope = serde_json::json!({
+            "title": "Approval required",
+            "type": "TICKET_APPROVAL_REQUEST",
+            "attributes": {
+                "ticketId": "abc",
+                "approvalRequestId": "0a2a0b3c-9d1e-4f5a-8b7c-6d5e4f3a2b1c",
+                "toolCalls": "[]",
+            }
+        });
+        let payload = click_payload(&envelope).unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({ "context": {
+                "type": "TICKET_APPROVAL_REQUEST",
+                "ticketId": "abc",
+                "approvalRequestId": "0a2a0b3c-9d1e-4f5a-8b7c-6d5e4f3a2b1c",
+            } })
+        );
+    }
+
+    /// Dual-write window: both shapes on the wire, the spec half wins. A null
+    /// top-level `type` (a legacy-path document) falls back to the context's.
+    #[test]
+    fn attributes_win_over_context_and_null_type_falls_back() {
+        let envelope = serde_json::json!({
+            "type": "TICKET_APPROVAL_REQUEST",
+            "attributes": { "ticketId": "new" },
+            "context": { "type": "ADMIN_APPROVAL_REQUEST", "ticketId": "old", "dialogId": "d-1" }
+        });
+        let payload = click_payload(&envelope).unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({ "context": {
+                "type": "TICKET_APPROVAL_REQUEST",
+                "ticketId": "new",
+                "dialogId": "d-1",
+            } })
+        );
+
+        let legacy_only = serde_json::json!({
+            "type": serde_json::Value::Null,
+            "context": { "type": "CLIENT_AI_MESSAGE", "dialogId": "d-2" }
+        });
+        let payload = click_payload(&legacy_only).unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({ "context": { "type": "CLIENT_AI_MESSAGE", "dialogId": "d-2" } })
         );
     }
 

@@ -109,9 +109,11 @@ const SETTLED_RESOLUTIONS: [&str; 3] = ["APPROVED", "REJECTED", "CANCELLED"];
 /// a decision made anywhere (the web UI, another device, another admin) reach
 /// the banner sitting in this machine's Action Center.
 ///
-/// Takes the envelope's `context` object, not the projected click payload the
-/// rest of this module reads: `resolution` is not one of the fields that
-/// survives the projection.
+/// Takes a source object carrying the resolution fields — the envelope's
+/// `attributes` map (the spec contract) or its legacy `context` object — not
+/// the projected click payload the rest of this module reads: `resolution` is
+/// not one of the fields that survives the projection. The caller reads both
+/// sources; recording is idempotent.
 pub(crate) fn note_resolution(context: Option<&serde_json::Value>) {
     let Some(context) = context else { return };
     let settled = string_field(context, "resolution").is_some_and(|resolution| {

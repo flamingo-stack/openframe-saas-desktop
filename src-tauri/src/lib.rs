@@ -47,9 +47,40 @@ const WINDOW_BG: Color = Color(22, 22, 22, 255);
 use tauri::ActivationPolicy;
 
 pub(crate) const MAIN_LABEL: &str = "main";
-/// Dedicated window for the BFF OAuth flow — the desktop counterpart of the
-/// mobile shell's WKWebView login sheet (openframe-mobile NativeAuthPlugin).
-const LOGIN_LABEL: &str = "native-auth";
+
+/// The one URI scheme this app claims with the OS. Two hosts ride on it, and the
+/// host is what tells them apart:
+///
+/// - `openframe-console://auth?devTicket=…` — the OAuth callback. The login runs
+///   in the user's **default browser**, where their SSO session already is, so
+///   the ticket cannot be read out of a webview we control; it has to be handed
+///   back by the OS.
+/// - `openframe-console://notify?context=…` — what a Windows toast activates
+///   (`notifications::CLICK_URI_PREFIX`).
+///
+/// Registered on macOS by `Info.plist` (`CFBundleURLTypes`) and on Windows by
+/// [`register_url_scheme`] (HKCU) — one scheme, one registration, both uses.
+///
+/// It is also the value pushed to the frontend as
+/// `NEXT_PUBLIC_MOBILE_APP_SCHEME` (see [`env_init_script`]), which is what makes
+/// it build `<scheme>://auth` as the gateway `redirectTo`. Those two uses must
+/// stay the same string: the frontend names the callback, the OS delivers it.
+///
+/// The SaaS gateway only honours a redirect that appears verbatim in
+/// `openframe.gateway.redirect.allowed-uris`, so that exact URI has to be in
+/// that list or the callback is rewritten to the tenant root and the browser
+/// keeps the ticket. The OSS gateway honours any requested redirect.
+pub(crate) const URI_SCHEME: &str = "openframe-console";
+
+/// Host that marks a URL on [`URI_SCHEME`] as the OAuth callback.
+const AUTH_CALLBACK_HOST: &str = "auth";
+
+/// How long a browser login may take before the parked `native_auth_start`
+/// gives up. Generous on purpose: the person is in an SSO flow with a password
+/// manager and possibly MFA, and unlike the old login window there is no close
+/// event to cancel on — this timeout is the only thing that ends a login the
+/// user walked away from.
+const LOGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Baked-in shared auth host, set at compile time
 /// (`OPENFRAME_SHARED_HOST_URL=https://… cargo build`). Overridable per install
@@ -377,10 +408,14 @@ fn normalize_host(input: &str) -> Result<String, String> {
 /// JS injected into every window that hosts the bundled frontend, before any
 /// page script runs. It supplies what the SSR server provides on the web:
 /// (1) `window.__ENV` — the runtime env next-runtime-env reads (the export
-///     build omits `<PublicEnvScript />`). Only the shared auth host is
-///     supplied; `NEXT_PUBLIC_TENANT_HOST_URL` is deliberately absent so
-///     `runtimeEnv.tenantHostUrl()` falls through to the host login learned
-///     (`getStoredTenantHost`), which is what lets one binary serve any tenant.
+///     build omits `<PublicEnvScript />`). `NEXT_PUBLIC_TENANT_HOST_URL` is
+///     deliberately absent so `runtimeEnv.tenantHostUrl()` falls through to the
+///     host login learned (`getStoredTenantHost`), which is what lets one binary
+///     serve any tenant. `NEXT_PUBLIC_MOBILE_APP_SCHEME` is the override
+///     `runtimeEnv.appScheme()` reads for the OAuth callback: without it the
+///     frontend defaults to mobile's `com.openframe.app`, which this app does
+///     not claim with the OS — so the browser would hand the ticket to whatever
+///     did (or to nothing), and the login would hang until it timed out.
 /// (2) `window.__OPENFRAME_SHELL__.nativeAuth` — the login + token-custody
 ///     bridge, backed here by the native_auth_* Tauri commands. Load-bearing:
 ///     drop it and the frontend's `nativeAuthPlugin()` is null, which kills
@@ -400,6 +435,7 @@ fn env_init_script(app: &AppHandle) -> String {
         "NEXT_PUBLIC_SHARED_HOST_URL": shared_host(&load_config(app)).unwrap_or_default(),
         "NEXT_PUBLIC_APP_MODE": "saas-tenant",
         "NEXT_PUBLIC_ENABLE_DEV_TICKET_OBSERVER": "true",
+        "NEXT_PUBLIC_MOBILE_APP_SCHEME": URI_SCHEME,
     });
     format!(
         r#"window.__ENV = {env};
@@ -631,6 +667,14 @@ fn handle_new_window(
 
 /// Open a URL in the user's default browser without going through a shell
 /// (each arg is passed literally, so URL contents can't be interpreted as flags/commands).
+///
+/// The launcher is reaped on a thread of its own. On Unix it exits as soon as it
+/// has handed the URL over, but `Child` does not reap on drop and this process
+/// lives in the tray for days — so without this every link opened and every
+/// sign-in would leave a zombie behind for the rest of the session. The exit
+/// status is worth a line because sign-in hangs on it: a launcher that starts
+/// and then fails to hand the URL over otherwise looks exactly like a gateway
+/// that never redirected, five minutes later.
 fn open_external(url: &str) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     let mut cmd = std::process::Command::new("open");
@@ -643,7 +687,13 @@ fn open_external(url: &str) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     let mut cmd = std::process::Command::new("xdg-open");
 
-    cmd.arg(url).spawn().map(|_| ())
+    let mut child = cmd.arg(url).spawn()?;
+    std::thread::spawn(move || match child.wait() {
+        Ok(status) if !status.success() => log::warn!("url launcher exited with {status}"),
+        Err(e) => log::warn!("url launcher could not be waited on: {e}"),
+        Ok(_) => {}
+    });
+    Ok(())
 }
 
 /// Raise the main window. Deliberately a no-op when there is none — except in a
@@ -715,12 +765,27 @@ fn sign_out(app: &AppHandle) -> Result<(), String> {
 
 // ---------------------------------------------------------------------------
 // NativeAuth bridge — backs window.__OPENFRAME_SHELL__.nativeAuth (see
-// env_init_script). Mirrors openframe-mobile's NativeAuthPlugin.swift: login
-// window -> ?devTicket= capture -> native token exchange -> local token store.
+// env_init_script). Default browser -> openframe-console://auth?devTicket=
+// capture -> native token exchange -> local token store. Mirrors
+// openframe-mobile's NativeAuthPlugin.swift, with the browser in place of
+// mobile's ASWebAuthenticationSession.
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]
 struct AuthState {
+    /// The login `native_auth_start` is waiting on. May hold a sender whose
+    /// receiver is already gone — a start that timed out leaves its own behind
+    /// rather than clearing the slot, because a clear would drop the sender of
+    /// whichever login had replaced it and cancel that one instead.
+    /// [`finish_login`] handles the dead sender it may find.
+    ///
+    /// What nothing here can do is tie a callback to the attempt that asked for
+    /// it: the callback carries nothing to match on, since the gateway
+    /// allow-lists the redirect URI by exact string equality and no nonce of
+    /// ours can ride on it (the same gap that leaves the flow without CSRF
+    /// protection — see docs/auth-and-notifications.md). So a first browser tab
+    /// finished after the user has already started a second attempt resolves
+    /// that second attempt, with a ticket old enough that the exchange fails.
     pending_login: Mutex<Option<tokio::sync::oneshot::Sender<Result<String, String>>>>,
 }
 
@@ -730,41 +795,67 @@ struct NativeAuthStartResult {
     callback_url: String,
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 fn url_carries_ticket(url: &url::Url) -> bool {
     url.query_pairs().any(|(k, _)| k == "devTicket")
 }
 
-/// What a navigation inside the login window means.
-enum LoginNav {
-    /// A callback carrying `?devTicket=`, on whatever scheme and host it
-    /// arrived. The gateway sends it to the app scheme when it honours the
-    /// requested redirect, and to the tenant landing when it does not — both
-    /// end the login here.
-    Ticket,
-    /// The app scheme without a ticket: the flow ended and failed. Allowing it
-    /// would ask the OS to open a scheme this app never registered.
-    SchemeWithoutTicket,
-    /// The login pages themselves.
-    Continue,
+/// Whether a URL the OS handed us is the OAuth callback — our scheme, our
+/// `auth` host. Anything else on the scheme (a stray link, a future route) is
+/// not a login result and must not resolve one.
+///
+/// The host is compared case-insensitively because `Url::parse` does not
+/// normalise it: for a non-special scheme like ours the host is opaque and kept
+/// verbatim, so `//AUTH` would otherwise read as "not a callback" and leave the
+/// login to run out its whole timeout.
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+fn is_auth_callback(url: &url::Url) -> bool {
+    url.scheme() == URI_SCHEME
+        && url
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case(AUTH_CALLBACK_HOST))
 }
 
-fn classify_login_nav(url: &url::Url, callback_scheme: Option<&str>) -> LoginNav {
-    if url_carries_ticket(url) {
-        return LoginNav::Ticket;
+/// Route a URL the OS delivered on our registered scheme. Returns `true` only
+/// when it was the OAuth callback **and** a login was waiting for it — an
+/// unsolicited or long-stale callback is consumed silently, because acting on
+/// one would let any page that can reach the scheme drive this app's window.
+///
+/// A callback that *cold-starts* the app therefore does nothing: the login it
+/// belonged to died with the process that asked for it, and its ticket has a
+/// two-minute life. Stashing it for the page about to load would mean completing
+/// a sign-in nobody in this process asked for, which is the property this
+/// nonce-less callback is least able to justify.
+///
+/// A callback **without** a ticket fails the login rather than being ignored:
+/// the gateway appends one to every `authMobile` callback, so its absence means
+/// the flow never reached the BFF callback, and waiting out the full timeout
+/// would tell the user nothing.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn handle_scheme_url(app: &AppHandle, url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    if !is_auth_callback(&parsed) {
+        return false;
     }
-    match callback_scheme {
-        Some(scheme) if url.scheme().eq_ignore_ascii_case(scheme) => LoginNav::SchemeWithoutTicket,
-        _ => LoginNav::Continue,
-    }
+    let result = if url_carries_ticket(&parsed) {
+        Ok(url.to_string())
+    } else {
+        Err("callback carried no ticket".into())
+    };
+    finish_login(app, result)
 }
 
-/// Resolve the pending native_auth_start() and tear down the login window.
-/// Only the first resolution wins; later calls (e.g. the Destroyed event after
-/// we destroy the window ourselves) are no-ops.
-fn finish_login(app: &AppHandle, result: Result<String, String>) {
+/// Resolve the pending native_auth_start(), reporting whether there was one.
+/// Only the first resolution wins; a callback arriving with nothing parked — a
+/// stale link, or a login that already timed out — is a no-op beyond the log.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn finish_login(app: &AppHandle, result: Result<String, String>) -> bool {
     let state: State<'_, AuthState> = app.state();
-    let Some(tx) = state.pending_login.lock().unwrap().take() else {
-        return;
+    let Some(tx) = notifications::lock(&state.pending_login).take() else {
+        log::info!("[auth] scheme callback arrived with no login waiting — ignored");
+        return false;
     };
     match &result {
         // Scheme and host only — the devTicket rides in the query string.
@@ -776,83 +867,95 @@ fn finish_login(app: &AppHandle, result: Result<String, String>) {
         ),
         Err(e) => log::info!("[auth] login ended without a ticket: {e}"),
     }
-    let _ = tx.send(result);
-    // Destroy off the event-callback stack; destroy() so the close can't be
-    // intercepted or re-enter the webview callbacks.
-    let app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        if let Some(win) = app.get_webview_window(LOGIN_LABEL) {
-            let _ = win.destroy();
-        }
-    });
+    // A send that fails means the waiter gave up between the take above and here
+    // — say so rather than let the capture line stand as the last word.
+    if tx.send(result).is_err() {
+        log::info!("[auth] the login it belonged to had already ended — callback dropped");
+        return false;
+    }
+    true
 }
 
-/// NativeAuth.start: run the gateway BFF OAuth flow in a dedicated window and
-/// resolve with the redirect URL carrying `?devTicket=`.
+/// NativeAuth.start: run the gateway BFF OAuth flow in the user's **default
+/// browser** and resolve with the callback URL carrying `?devTicket=`.
 ///
-/// The login ends on `callback_scheme` — the app scheme mobile registers with
-/// the OS (`com.openframe.app`), which the shell reuses because it is the one
-/// redirect target the gateway honours verbatim in every environment. Here it
-/// is never handed to the OS and nothing is registered: the navigation to it is
-/// cancelled and read in-process, which is this window's equivalent of the
-/// mobile ASWebAuthenticationSession matching on it.
+/// The browser is the point. A login window of our own is a fresh cookie jar, so
+/// an identity provider the user is already signed into on this machine cannot
+/// see that session and asks for credentials again; the default browser holds
+/// it. It also keeps us out of the embedded-webview user agents Google rejects
+/// with `disallowed_useragent`.
 ///
-/// ANY url carrying the ticket is still accepted, because an environment that
-/// drops the requested redirect delivers it on the tenant landing instead, and
-/// the check runs in both on_navigation and on_page_load because server 302 hops
-/// don't always surface as navigation-policy callbacks. The window is not listed
-/// in any capability, so the remote login page cannot reach Tauri commands.
+/// The price is that nothing about the flow is observable from here any more —
+/// no navigation callbacks, no window to close. The ticket comes back only if
+/// the gateway redirects to [`URI_SCHEME`] and the OS hands us that URL
+/// ([`handle_scheme_url`]), which is why `callback_scheme` is checked against
+/// what we actually registered instead of being taken on faith. The shell hands
+/// the frontend this very value as `NEXT_PUBLIC_MOBILE_APP_SCHEME`, so any
+/// mismatch is a misconfiguration, and against a gateway that allow-lists the
+/// redirect by exact string equality it ends in the timeout below — better to
+/// fail immediately, naming the env var, than to hang for five minutes.
+///
+/// The old "accept ANY url carrying a ticket" fallback is gone with the window.
+/// A gateway that rewrites the redirect to the tenant root now leaves the ticket
+/// in the browser where this process cannot reach it, so on the SaaS side this
+/// flow *requires* the callback in `openframe.gateway.redirect.allowed-uris`.
 #[tauri::command]
 async fn native_auth_start(
-    app: AppHandle,
     state: State<'_, AuthState>,
     url: String,
     callback_scheme: Option<String>,
 ) -> Result<NativeAuthStartResult, String> {
     let login_url = url::Url::parse(&url).map_err(|e| format!("Invalid login URL: {e}"))?;
+    // This URL is about to be handed to the OS launcher, which will open
+    // whatever it names — a `file:` or shell-handled scheme would be an
+    // application launch, not a login. Same gate `handle_new_window` puts in
+    // front of the same launcher for the same reason.
+    if !matches!(login_url.scheme(), "http" | "https") {
+        log::error!("[auth] refusing to open a {} login URL", login_url.scheme());
+        return Err("Login URL must be http(s)".into());
+    }
+    let scheme = callback_scheme.as_deref().unwrap_or("<none>");
+    if scheme != URI_SCHEME {
+        log::error!(
+            "[auth] frontend asked to complete on {scheme}://, which this app does not claim \
+             — check NEXT_PUBLIC_MOBILE_APP_SCHEME"
+        );
+        return Err(match callback_scheme {
+            Some(_) => format!("Login callback scheme {scheme} is not the registered {URI_SCHEME}"),
+            None => "Login started without a callback scheme".into(),
+        });
+    }
     log::info!(
-        "[auth] opening login window at {}",
+        "[auth] opening login in the default browser at {}",
         login_url.origin().ascii_serialization()
     );
 
-    if let Some(stale) = app.get_webview_window(LOGIN_LABEL) {
-        let _ = stale.destroy();
-    }
     let (tx, rx) = tokio::sync::oneshot::channel();
-    if let Some(stale) = state.pending_login.lock().unwrap().replace(tx) {
+    if let Some(stale) = notifications::lock(&state.pending_login).replace(tx) {
         let _ = stale.send(Err("USER_CANCELED".into()));
     }
 
-    let nav_app = app.clone();
-    let load_app = app.clone();
-    WebviewWindowBuilder::new(&app, LOGIN_LABEL, WebviewUrl::External(login_url))
-        .title("Sign in to OpenFrame")
-        .inner_size(520.0, 720.0)
-        .background_color(WINDOW_BG)
-        .on_navigation(
-            move |u| match classify_login_nav(u, callback_scheme.as_deref()) {
-                LoginNav::Ticket => {
-                    finish_login(&nav_app, Ok(u.to_string()));
-                    false
-                }
-                LoginNav::SchemeWithoutTicket => {
-                    finish_login(&nav_app, Err("callback carried no ticket".into()));
-                    false
-                }
-                LoginNav::Continue => true,
-            },
-        )
-        .on_page_load(move |_win, payload| {
-            if url_carries_ticket(payload.url()) {
-                finish_login(&load_app, Ok(payload.url().to_string()));
-            }
-        })
-        .build()
-        .map_err(|e| e.to_string())?;
+    // `spawn`, so nothing here waits on the browser, and no shell, so the URL's
+    // own characters can't be read as flags or commands.
+    if let Err(e) = open_external(login_url.as_str()) {
+        log::error!("[auth] could not open the default browser: {e}");
+        return Err(format!("Could not open the browser: {e}"));
+    }
 
-    match rx.await {
-        Ok(result) => result.map(|callback_url| NativeAuthStartResult { callback_url }),
-        Err(_) => Err("USER_CANCELED".into()),
+    match tokio::time::timeout(LOGIN_TIMEOUT, rx).await {
+        Ok(Ok(result)) => result.map(|callback_url| NativeAuthStartResult { callback_url }),
+        // Sender dropped without sending. A replacement sends USER_CANCELED
+        // rather than dropping, so in practice this is process teardown.
+        Ok(Err(_)) => Err("USER_CANCELED".into()),
+        Err(_) => {
+            log::warn!(
+                "[auth] no callback on {URI_SCHEME}://{AUTH_CALLBACK_HOST} within {}s — the \
+                 browser flow never came back (is the callback in the gateway's \
+                 redirect.allowed-uris?)",
+                LOGIN_TIMEOUT.as_secs()
+            );
+            Err("LOGIN_TIMEOUT".into())
+        }
     }
 }
 
@@ -998,54 +1101,91 @@ fn take_pending_notification_click(window: WebviewWindow) -> Option<serde_json::
     notifications::take_startup_click(window.app_handle())
 }
 
-/// Deliver a notification-activation URI carried in a process's arguments — the
-/// Windows toast click path, either our own argv (cold start) or a second launch
-/// forwarded by the single-instance plugin (warm click). Delivery raises the
-/// window only when there already is one, so callers still have to decide
-/// whether this process should have one at all.
+/// Deliver a scheme URI carried in a process's arguments — how Windows delivers
+/// both an OAuth callback and a toast click, either as our own argv (cold start)
+/// or forwarded by the single-instance plugin (warm). macOS delivers neither
+/// this way: URL activation there is an Apple Event, which reaches us as
+/// `RunEvent::Opened`.
+///
+/// Notification delivery raises the window only when there already is one, so
+/// callers still have to decide whether this process should have one at all.
 #[cfg(target_os = "windows")]
-fn handle_notification_argv(app: &AppHandle, args: &[String]) {
+fn handle_scheme_argv(app: &AppHandle, args: &[String]) {
     for arg in args {
-        if notifications::handle_notification_uri(app, arg) {
+        if handle_scheme_url(app, arg) || notifications::handle_notification_uri(app, arg) {
             return;
         }
     }
 }
 
-/// Register the `openframe-desktop://` URI scheme (HKCU, no elevation).
-/// Windows toast clicks activate through it — see windows_toast.rs. Re-written
+/// Register [`URI_SCHEME`] for this executable (HKCU, no elevation). Re-written
 /// on every launch so the command always points at the current exe path.
+///
+/// Windows has no equivalent of the macOS bundle's `CFBundleURLTypes`, so the
+/// one scheme both uses ride on — the OAuth callback and toast clicks — is
+/// written here.
 #[cfg(target_os = "windows")]
 fn register_url_scheme() {
     use winreg::{enums::*, RegKey};
 
     let Ok(exe) = std::env::current_exe() else {
-        log::warn!(
-            "url scheme: current_exe unavailable — notification clicks will not open the app"
-        );
+        log::warn!("[scheme] current_exe unavailable — sign-in and toast clicks will not work");
         return;
     };
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let path = format!(r"Software\Classes\{}", notifications::URI_SCHEME);
+    let path = format!(r"Software\Classes\{URI_SCHEME}");
     // `URL Protocol` is what marks the key as a protocol handler and the command
-    // under it is what the shell dispatches to; with either missing, a toast
-    // activates a scheme that resolves to nothing and the click is lost in the
-    // shell, not here. So they are written as one fallible sequence rather than
-    // four discarded results — same reason `windows_activator::register` is.
-    // The display name is cosmetic and stays out of it.
+    // under it is what the shell dispatches to; with either missing, an
+    // activation resolves to nothing and is lost in the shell, not here. So they
+    // are written as one fallible sequence rather than four discarded results —
+    // same reason `windows_activator::register` is. The default value is only the
+    // friendly name the shell shows the user (in "How do you want to open this?",
+    // say), so it is a product name and its failure is not worth reporting.
     let written = hkcu
         .create_subkey(&path)
         .and_then(|(key, _)| {
-            let _ = key.set_value("", &"URL:OpenFrame Desktop");
+            let _ = key.set_value("", &"URL:OpenFrame Console");
             key.set_value("URL Protocol", &"")?;
             key.create_subkey(r"shell\open\command")
         })
         .and_then(|(command, _)| command.set_value("", &format!("\"{}\" \"%1\"", exe.display())));
     match written {
-        Ok(()) => log::info!("url scheme {} registered", notifications::URI_SCHEME),
+        Ok(()) => log::info!("[scheme] {URI_SCHEME} registered"),
         Err(err) => log::warn!(
-            "url scheme not registered ({err}) — notification clicks will not open the app"
+            "[scheme] {URI_SCHEME} not registered ({err}) — sign-in and toast clicks will not \
+             work"
         ),
+    }
+}
+
+/// Delete the HKCU keys a pre-rename build wrote under its own identity: the
+/// `openframe-desktop` scheme, whose `shell\open\command` still names the old
+/// exe, and the AppUserModelId key registering that build's toast activator.
+///
+/// The scheme one is not inert. A toast left in the Action Center from before the
+/// rename activates `openframe-desktop://notify`, which the shell resolves to the
+/// old binary — so an update lands, and a stale notification still starts the
+/// build it replaced. Nothing writes these keys any more, and the old build
+/// rewrites them if it does get launched, so this only converges over launches of
+/// the renamed build; it is still the difference between a stale toast opening
+/// the wrong app once and doing it forever.
+///
+/// Deletable once no machine still has a pre-rename build on it, alongside
+/// `autostart::remove_legacy_registration`.
+#[cfg(target_os = "windows")]
+fn remove_legacy_url_scheme() {
+    use winreg::{enums::*, RegKey};
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    for path in [
+        r"Software\Classes\openframe-desktop",
+        r"Software\Classes\AppUserModelId\com.openframe.desktop",
+    ] {
+        match hkcu.delete_subkey_all(path) {
+            Ok(()) => log::info!("[scheme] removed the legacy key {path}"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::warn!("[scheme] could not remove the legacy key {path}: {e}"),
+        }
     }
 }
 
@@ -1117,19 +1257,22 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
-            // A Windows toast click activates the openframe-desktop:// URI,
-            // which reaches the running instance as a second launch carrying it
-            // in argv. Anything else is the user re-launching the app — except a
-            // COM server launch, which only happens if this instance failed to
-            // register the activator, and must not put a window on screen for a
-            // press meant to run in the background.
+            // A browser handing back the OAuth callback, or a toast click,
+            // reaches the running instance on Windows as a second launch
+            // carrying the URI in argv. Anything else is the user re-launching
+            // the app — except a COM server launch, which only happens if this
+            // instance failed to register the activator, and must not put a
+            // window on screen for a press meant to run in the background.
             #[cfg(target_os = "windows")]
             let handled = {
                 // Deliver first, decide about the window after: a click only
                 // stashes its payload when there is no window to emit at, and
                 // this process may well have none — a COM server launch opens
-                // none, and it is the one case that must stay windowless.
-                handle_notification_argv(app, &argv);
+                // none, and it is the one case that must stay windowless. An
+                // OAuth callback deliberately does not count as handled: the
+                // browser has the focus at that moment, and the app the user is
+                // being returned to should come forward.
+                handle_scheme_argv(app, &argv);
                 windows_activator::is_activation_launch(&argv)
             };
             #[cfg(not(target_os = "windows"))]
@@ -1146,7 +1289,7 @@ pub fn run() {
                 .targets([
                     tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
                     tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
-                        file_name: Some("openframe-desktop".into()),
+                        file_name: Some("openframe-console".into()),
                     }),
                     tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Webview),
                 ])
@@ -1179,7 +1322,10 @@ pub fn run() {
         .setup(|app| {
             build_tray(app)?;
             #[cfg(target_os = "windows")]
-            register_url_scheme();
+            {
+                register_url_scheme();
+                remove_legacy_url_scheme();
+            }
             tokens::spawn_wake_watch(app.handle().clone());
             tokens::spawn_refresh_loop(app.handle().clone());
             #[cfg(target_os = "macos")]
@@ -1204,8 +1350,9 @@ pub fn run() {
             // nothing on that path, which opens no window either way.
             let asked_for_a_window = autostart::take_show_window_request(&handle);
 
-            // Cold start from a Windows toast click: the protocol launch put
-            // the URI in our own argv. Runs before the window exists so the
+            // Cold start from a Windows protocol activation — a toast click, or
+            // an OAuth callback that arrived after the app was quit — put the
+            // URI in our own argv. Runs before the window exists so a click
             // payload is stashed (the webview pulls it via
             // take_pending_notification_click) instead of being shown early —
             // handle_page_load still owns the reveal, so no unpainted flash.
@@ -1215,7 +1362,7 @@ pub fn run() {
                 let argv: Vec<String> = std::env::args_os()
                     .filter_map(|arg| arg.into_string().ok())
                     .collect();
-                handle_notification_argv(&handle, &argv);
+                handle_scheme_argv(&handle, &argv);
                 // COM started this process only to serve a button press, and a
                 // press that completes in the background must not put a window
                 // on screen for it. Which press it is arrives after setup, so
@@ -1289,10 +1436,6 @@ pub fn run() {
                     !window.is_minimized().unwrap_or(false) && window.is_visible().unwrap_or(true);
                 set_main_presence(window.app_handle(), present);
             }
-            // Login window closed by the user before the ticket arrived → cancel.
-            WindowEvent::Destroyed if window.label() == LOGIN_LABEL => {
-                finish_login(window.app_handle(), Err("USER_CANCELED".into()));
-            }
             // Sign-out destroys and recreates the main window; park clicks from
             // here until the replacement's listener mounts, rather than emitting
             // them at a label that currently has no window.
@@ -1311,64 +1454,107 @@ pub fn run() {
             }
             _ => {}
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app, event);
+            // macOS delivers a URL activation as an Apple Event, not in argv —
+            // this is the only path an OAuth callback can take to reach a
+            // running app there. Raise the window when a login was actually
+            // resolved, success or failure: the browser has the focus and the
+            // user is being handed back to the app to see the result. A callback
+            // nobody was waiting on raises nothing here — Windows is necessarily
+            // laxer, since there the same URL arrives as a second process launch
+            // and the single-instance handler raises for any relaunch.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Opened { urls } = &event {
+                for url in urls {
+                    if handle_scheme_url(app, url.as_str()) {
+                        raise_or_open_main_window(app);
+                    }
+                }
+            }
+        });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn nav(url: &str, scheme: Option<&str>) -> LoginNav {
-        classify_login_nav(&url::Url::parse(url).unwrap(), scheme)
+    fn parse(url: &str) -> url::Url {
+        url::Url::parse(url).unwrap()
     }
 
     // The callback the gateway sends when it honours the requested redirect
-    // (`openframe.gateway.redirect.allowed-uris`), which is the whole point of
-    // reusing the mobile scheme: a non-special URL still parses, and the ticket
-    // is still in its query.
+    // (`openframe.gateway.redirect.allowed-uris`): a non-special URL still
+    // parses, the host is `auth`, and the ticket is in its query.
     #[test]
-    fn app_scheme_callback_carries_the_ticket() {
-        assert!(matches!(
-            nav(
-                "com.openframe.app://auth?devTicket=abc123",
-                Some("com.openframe.app")
-            ),
-            LoginNav::Ticket
-        ));
+    fn scheme_callback_is_recognised_and_carries_the_ticket() {
+        let url = parse("openframe-console://auth?devTicket=abc123");
+        assert!(is_auth_callback(&url));
+        assert!(url_carries_ticket(&url));
     }
 
-    // What every environment with dev-ticket issuance on does with a redirect it
-    // does not allow-list: the ticket rides on the tenant landing instead.
+    // The gateway appends the ticket with `&` when the redirect already has a
+    // query (OAuthBffController), so the parse must survive both separators.
     #[test]
-    fn https_landing_carries_the_ticket_too() {
-        assert!(matches!(
-            nav(
-                "https://acme.openframe.example/?devTicket=abc123",
-                Some("com.openframe.app")
-            ),
-            LoginNav::Ticket
-        ));
+    fn ticket_is_found_after_an_existing_query() {
+        assert!(url_carries_ticket(&parse(
+            "openframe-console://auth?state=x&devTicket=abc123"
+        )));
     }
 
-    // Never allowed through: this app registers no scheme, so the OS has nothing
-    // to open it with.
+    // Ends the login as a failure rather than hanging: the gateway appends a
+    // ticket to every authMobile callback, so one without means the flow never
+    // reached the BFF callback.
     #[test]
-    fn app_scheme_without_a_ticket_ends_the_login() {
-        assert!(matches!(
-            nav("com.openframe.app://auth", Some("com.openframe.app")),
-            LoginNav::SchemeWithoutTicket
-        ));
+    fn scheme_callback_without_a_ticket_is_still_a_callback() {
+        let url = parse("openframe-console://auth");
+        assert!(is_auth_callback(&url));
+        assert!(!url_carries_ticket(&url));
     }
 
+    // What a gateway that does not allow-list our redirect does with it: the
+    // ticket lands on the tenant root, in the user's browser, where this process
+    // cannot see it. Not a callback — the old login window could read this, the
+    // browser flow cannot, and pretending otherwise would be a lie.
     #[test]
-    fn login_pages_navigate_normally() {
-        assert!(matches!(
-            nav(
-                "https://auth.openframe.example/oauth/login?tenantId=t1",
-                Some("com.openframe.app")
-            ),
-            LoginNav::Continue
-        ));
+    fn https_tenant_landing_is_not_a_callback() {
+        assert!(!is_auth_callback(&parse(
+            "https://acme.openframe.example/?devTicket=abc123"
+        )));
+    }
+
+    // Our scheme, but not the login route — a toast URI shape, or anything else
+    // we may answer on later.
+    #[test]
+    fn other_hosts_on_our_scheme_are_not_callbacks() {
+        assert!(!is_auth_callback(&parse(
+            "openframe-console://notify?context=%7B%7D"
+        )));
+    }
+
+    // `Url::parse` normalises the scheme but not an opaque host, so the host
+    // needs its own case-insensitive compare to survive a callback that comes
+    // back shouting.
+    #[test]
+    fn the_callback_host_is_matched_regardless_of_case() {
+        assert!(is_auth_callback(&parse(
+            "openframe-console://AUTH?devTicket=abc123"
+        )));
+    }
+
+    // The macOS half of the scheme registration lives in a plist the compiler
+    // never reads, so nothing but this test would notice it drifting away from
+    // URI_SCHEME — and the way it fails is silent: the OS simply hands the
+    // callback to nobody and sign-in hangs until it times out.
+    #[test]
+    fn the_bundle_plist_registers_the_scheme_we_answer_on() {
+        let plist = include_str!("../Info.plist");
+        assert!(
+            plist.contains(&format!("<string>{URI_SCHEME}</string>")),
+            "Info.plist does not register {URI_SCHEME} in CFBundleURLSchemes"
+        );
     }
 }

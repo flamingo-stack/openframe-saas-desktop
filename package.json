@@ -1,8 +1,8 @@
 {
-  "name": "openframe-desktop",
+  "name": "openframe-console",
   "version": "0.1.0",
   "private": true,
-  "description": "OpenFrame Desktop",
+  "description": "OpenFrame Console",
   "scripts": {
     "web:placeholder": "node scripts/make-placeholder-web.mjs",
     "build:web": "bash scripts/build-web.sh",

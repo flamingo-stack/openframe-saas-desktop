@@ -8,7 +8,7 @@
 //     every click — live banner, Notification Center hours later, or a click
 //     that launches the app cold — with the payload in the notification's
 //     userInfo.
-//   - Windows: toasts activate an `openframe-desktop://notify` URI, which
+//   - Windows: toasts activate an `openframe-console://notify` URI, which
 //     reaches a running instance through single-instance argv forwarding or
 //     launches the app cold (`handle_notification_uri`). Their action buttons
 //     take the other route, through the COM activator (`windows_activator`).
@@ -60,13 +60,13 @@ pub(crate) enum Delivery {
     Update,
 }
 
-/// Custom URI scheme Windows toasts activate through, registered under HKCU at
-/// startup by `crate::register_url_scheme`. Windows-only: every other platform
-/// delivers clicks in-process (macOS) or not at all.
+/// The URI a Windows toast activates through. It rides on the app's single
+/// registered scheme (`crate::URI_SCHEME`, written to HKCU at startup) and is
+/// told apart from the OAuth callback by its host — see the tie-down test below.
+/// Windows-only: every other platform delivers clicks in-process (macOS) or not
+/// at all.
 #[cfg(any(target_os = "windows", test))]
-pub(crate) const URI_SCHEME: &str = "openframe-desktop";
-#[cfg(any(target_os = "windows", test))]
-const CLICK_URI_PREFIX: &str = "openframe-desktop://notify";
+const CLICK_URI_PREFIX: &str = "openframe-console://notify";
 
 pub(crate) struct NotificationsPlane {
     subscription: tokio::sync::Mutex<Option<SubscriptionSlot>>,
@@ -317,7 +317,7 @@ fn click_payload(envelope: &serde_json::Value) -> Option<serde_json::Value> {
     (!routing.is_empty()).then(|| serde_json::json!({ "context": routing }))
 }
 
-/// `openframe-desktop://notify?context=<percent-encoded JSON>`.
+/// `openframe-console://notify?context=<percent-encoded JSON>`.
 #[cfg(any(target_os = "windows", test))]
 pub(crate) fn click_uri(click: Option<&serde_json::Value>) -> String {
     use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
@@ -357,7 +357,7 @@ pub(crate) fn payload_from_context_json(json: &str) -> Option<serde_json::Value>
         .then(|| serde_json::json!({ "context": context }))
 }
 
-/// Handles an `openframe-desktop://notify` URI from a Windows toast click,
+/// Handles an `openframe-console://notify` URI from a Windows toast click,
 /// arriving either as our own argv (cold start) or forwarded by the
 /// single-instance plugin (warm click). Returns `false` for foreign URIs.
 #[cfg(target_os = "windows")]
@@ -537,8 +537,11 @@ pub(crate) fn truncate_for_notification(text: &str, max: usize) -> String {
 }
 
 /// A poisoned lock is not a reason to take the process down: every mutex behind
-/// this guards display state, and a panic that poisoned one has already been
-/// reported. Shared with `notification_actions`, which guards its own.
+/// this guards state whose invariants survive a panicking holder — each critical
+/// section is a single read or replace — and a panic that poisoned one has
+/// already been reported. Callers are display state here, the pending login
+/// sender in `lib.rs`, the registration in `autostart.rs`, and
+/// `notification_actions`, which guards its own.
 pub(crate) fn lock<T>(mutex: &StdMutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
@@ -611,7 +614,10 @@ mod tests {
     /// writes to HKCU; if they drift, toasts activate a scheme nothing claims.
     #[test]
     fn click_uri_prefix_uses_the_registered_scheme() {
-        assert_eq!(CLICK_URI_PREFIX.split_once("://").unwrap().0, URI_SCHEME);
+        assert_eq!(
+            CLICK_URI_PREFIX.split_once("://").unwrap().0,
+            crate::URI_SCHEME
+        );
     }
 
     /// `UPDATED` is the gateway saying "you already know about this one" —
@@ -634,9 +640,9 @@ mod tests {
     #[test]
     fn malformed_uris_have_no_payload() {
         assert!(parse_click_uri(CLICK_URI_PREFIX).is_none());
-        assert!(parse_click_uri("openframe-desktop://notify?context=%7B%7D").is_some());
-        assert!(parse_click_uri("openframe-desktop://notify?context=not-json").is_none());
-        assert!(parse_click_uri("openframe-desktop://notify?id=x").is_none());
+        assert!(parse_click_uri("openframe-console://notify?context=%7B%7D").is_some());
+        assert!(parse_click_uri("openframe-console://notify?context=not-json").is_none());
+        assert!(parse_click_uri("openframe-console://notify?id=x").is_none());
         assert!(parse_click_uri("openframe-chat://notify?context=%7B%7D").is_none());
     }
 }

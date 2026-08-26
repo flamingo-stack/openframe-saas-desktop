@@ -1,4 +1,4 @@
-# OpenFrame Desktop
+# OpenFrame Console
 
 Native desktop shell for OpenFrame — a [Tauri 2](https://tauri.app) application
 that embeds the [openframe-oss-frontend](https://github.com/flamingo-stack/openframe-oss-frontend)
@@ -10,7 +10,9 @@ a system-browser OAuth flow.
 staged into `www/` at build time and embedded in the binary. What is here is the
 Rust shell around it.
 
-Supported: macOS, Windows. Linux builds, but has no OS-notification backend.
+Supported: macOS, Windows. Linux builds, but has neither an OS-notification
+backend nor any URL-scheme registration — so notifications never arrive and the
+OAuth callback has no way back into the app, leaving sign-in unable to complete.
 
 ## Requirements
 
@@ -34,7 +36,10 @@ enough to use the app.
 
 Run the app through `npm run dev` or a built `.app`/`.exe`. The bare
 `target/debug` binary is not registered with the OS, so tray icons, notifications
-and URL-scheme activation behave differently or not at all.
+and URL-scheme activation behave differently or not at all. **Sign-in is one of
+them**: the OAuth callback comes back through the OS on `openframe-console://`,
+which macOS routes only to a bundled `.app` it has seen (launch it once from
+`/Applications`) and Windows only to an install that has written its HKCU key.
 
 ## Building
 
@@ -74,9 +79,38 @@ The shared host is baked in at build time and can be overridden per install by
 
 | OS | Path |
 |---|---|
-| macOS | `~/Library/Application Support/com.openframe.desktop/config.json` |
-| Windows | `%APPDATA%\com.openframe.desktop\config.json` |
-| Linux | `~/.config/com.openframe.desktop/config.json` |
+| macOS | `~/Library/Application Support/com.openframe.console/config.json` |
+| Windows | `%APPDATA%\com.openframe.console\config.json` |
+| Linux | `~/.config/com.openframe.console/config.json` |
+
+> **Renamed from OpenFrame Desktop (2026-08-26)**, identifier included:
+> `com.openframe.desktop` → `com.openframe.console`. The identifier keys the
+> paths above, the log directory, the macOS notification authorization, the
+> launchd label and the Windows AUMID, so a pre-rename install comes back **signed
+> out** (its `tokens.json` stays behind at the old path) and re-prompts for
+> notification permission. That was acceptable because the app had only ever been
+> distributed to test users.
+>
+> Two leftovers are *not* inert, and a renamed build deletes both on first run.
+> The **login registration** is named after the identifier, so an abandoned one
+> keeps launching the old build every login — `autostart::remove_legacy_registration`
+> clears the macOS/Linux file and the Windows `Run` value written under
+> `OpenFrame Desktop`. On Windows the **old `openframe-desktop://` scheme key**
+> still points at the old exe, so a toast left in the Action Center from before
+> the rename would start the build it replaced — `remove_legacy_url_scheme`
+> clears that and the stale `AppUserModelId` key. Both can be removed once no
+> machine still has a pre-rename build on it. Nothing else is migrated: the old config directory is left where it
+> is, and `installed-agent` rows written before the rename stay filed under the
+> old `AGENT_TYPE`.
+>
+> **Start at Login is reset by the rename, not carried over.** `autostart_configured`
+> lived in the old config directory, so the reconcile sees a renamed install as a
+> first launch and applies the default — which re-enables start-at-login for anyone
+> who had turned it off on a pre-rename build. It cannot be inferred from what the
+> new identity can see: an opted-out pre-rename install and a fresh install both
+> present as "no registration and no record". The old `config.json` *would* separate
+> them, but reading it is the migration this rename deliberately does not do. The
+> user's own toggle is authoritative from that point on.
 
 ```json
 {
@@ -106,9 +140,11 @@ Without it the UI renders and every data call fails.
 
 ## What the shell owns
 
-- **Login** — the OAuth flow runs in a dedicated window; tokens are exchanged
-  natively because the response headers carrying them are invisible to a
-  cross-origin webview fetch.
+- **Login** — the OAuth flow runs in the user's default browser, so an SSO
+  session they already have there is reused instead of asking for credentials
+  again, and comes back on the `openframe-console://auth` scheme this app
+  registers with the OS. Tokens are then exchanged natively, because the response
+  headers carrying them are invisible to a cross-origin webview fetch.
 - **Tokens** — refresh is scheduled from the JWT expiry and runs on a background
   poll, so a session survives the webview being idle in the tray. The shell is
   the *only* refresher: refresh tokens rotate, so two would invalidate each other.

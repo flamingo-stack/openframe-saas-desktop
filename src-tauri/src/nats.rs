@@ -22,7 +22,7 @@ use tokio::sync::RwLock;
 use crate::{load_config, notifications, tenant_host, tokens, UNRESERVED};
 
 /// NATS client name, as it shows up server-side.
-const CLIENT_NAME: &str = "openframe-desktop";
+const CLIENT_NAME: &str = "openframe-console";
 const WS_PATH: &str = "/ws/nats-api";
 /// NATS-protocol-level credentials — the real auth is the URL bearer, which
 /// the gateway validates at upgrade time.

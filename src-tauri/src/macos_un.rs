@@ -44,11 +44,15 @@ use crate::{
     notifications::deliver_click,
 };
 
-/// Keeps its original id: notifications already sitting in Notification Center
-/// resolve their category by identifier, and a rename would strip their button.
-const CATEGORY_DEFAULT: &str = "openframe-desktop-notification";
-const CATEGORY_APPROVAL: &str = "openframe-desktop-approval";
-const CATEGORY_MESSAGE: &str = "openframe-desktop-message";
+/// Renamed with the app, which is safe only because the bundle identifier was
+/// renamed in the same change: notifications already in the Notification Center
+/// belong to `com.openframe.desktop` and are another app's as far as the OS is
+/// concerned, so there is nothing left whose category id these could fail to
+/// match. Renaming these alone would strip the buttons off every delivered
+/// notification.
+const CATEGORY_DEFAULT: &str = "openframe-console-notification";
+const CATEGORY_APPROVAL: &str = "openframe-console-approval";
+const CATEGORY_MESSAGE: &str = "openframe-console-message";
 
 const OPEN_ACTION_ID: &str = "open";
 const APPROVE_ACTION_ID: &str = "approve";

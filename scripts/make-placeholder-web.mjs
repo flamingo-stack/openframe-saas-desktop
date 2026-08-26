@@ -25,7 +25,7 @@ const html = `<!doctype html>
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>OpenFrame Desktop — dev shell</title>
+    <title>OpenFrame Console — dev shell</title>
     <style>
       :root { color-scheme: dark; }
       body { margin: 0; min-height: 100vh; display: grid; place-items: center;
@@ -40,7 +40,7 @@ const html = `<!doctype html>
   </head>
   <body>
     <div class="card">
-      <h1>OpenFrame Desktop</h1>
+      <h1>OpenFrame Console</h1>
       <p class="ok">✓ Tauri shell is running.</p>
       <p>This is the placeholder bundle. Run <code>npm run build:web</code> to stage the
          real openframe-frontend export instead.</p>

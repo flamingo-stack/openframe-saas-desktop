@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "OpenFrame Desktop",
+  "productName": "OpenFrame Console",
   "version": "0.1.0",
-  "identifier": "com.openframe.desktop",
+  "identifier": "com.openframe.console",
   "build": {
     "frontendDist": "../www"
   },

@@ -205,8 +205,7 @@ fn maybe_notify(app: &AppHandle, envelope: &serde_json::Value, user_id: &str) {
     // that is true whether or not this envelope is one the user gets to see.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
-        // Attributes are the spec contract; context rides only while the backend
-        // still dual-writes it. Recording is idempotent, so both sources are read.
+        // Both contracts, since either may carry the verdict; recording is idempotent.
         crate::notification_actions::note_resolution(envelope.get("attributes"));
         crate::notification_actions::note_resolution(envelope.get("context"));
     }
@@ -314,11 +313,10 @@ fn delivery_of(envelope: &serde_json::Value) -> Delivery {
 /// id kept here is a UUID. `None` when the envelope points at nothing openable;
 /// the click then only raises the window.
 ///
-/// Sources are read field by field: top-level `type` and the `attributes` map
-/// are the spec contract, the nested `context` object is the legacy fallback
-/// that disappears from the wire once the backend stops dual-writing it. The
-/// payload keeps its `context` wrapper — that name is this app's internal
-/// protocol with the webview and the Windows activation URI, not the backend's.
+/// Read field by field from both contracts: `type` + `attributes` is the spec
+/// one, `context` the legacy fallback that leaves the wire once the backend
+/// stops dual-writing. The payload keeps its own `context` wrapper — that name
+/// is this app's protocol with the webview, not the backend's.
 fn click_payload(envelope: &serde_json::Value) -> Option<serde_json::Value> {
     let attributes = envelope.get("attributes");
     let context = envelope.get("context");
@@ -661,6 +659,63 @@ mod tests {
         assert!(click_payload(&serde_json::json!({ "context": "not-an-object" })).is_none());
         assert!(click_payload(&serde_json::json!({ "context": { "ticketId": "" } })).is_some());
         assert_eq!(click_uri(None), CLICK_URI_PREFIX);
+    }
+
+    /// Each contract fills what the other leaves out, rather than the payload
+    /// being taken wholesale from whichever was found first.
+    #[test]
+    fn the_two_contracts_are_read_field_by_field() {
+        let envelope = serde_json::json!({
+            "type": "TICKET_ESCALATED_BY_USER",
+            "attributes": { "ticketId": "t-3" },
+            "context": { "type": "TICKET_ESCALATED_BY_USER", "ticketId": "t-3", "dialogId": "dlg-3" },
+        });
+        assert_eq!(
+            click_payload(&envelope).unwrap(),
+            serde_json::json!({ "context": {
+                "type": "TICKET_ESCALATED_BY_USER",
+                "ticketId": "t-3",
+                "dialogId": "dlg-3",
+            } })
+        );
+    }
+
+    /// New catalog types are expected to arrive without a shell release, and the
+    /// webview routes by id.
+    #[test]
+    fn an_unknown_type_still_carries_its_ids() {
+        let envelope = serde_json::json!({
+            "type": "SOMETHING_SHIPPED_LATER",
+            "attributes": { "ticketId": "t-4" },
+        });
+        assert_eq!(
+            click_payload(&envelope).unwrap(),
+            serde_json::json!({ "context": { "type": "SOMETHING_SHIPPED_LATER", "ticketId": "t-4" } })
+        );
+    }
+
+    /// The projection is a whitelist: the catalog adds attributes without asking
+    /// the shell, and they must not reach the activation URI.
+    #[test]
+    fn unknown_attributes_stay_out_of_the_payload() {
+        let envelope = serde_json::json!({
+            "type": "MINGO_APPROVAL_REQUEST",
+            "attributes": {
+                "approvalRequestId": "req-1",
+                "dialogId": "dlg-1",
+                "somethingShippedLater": "y".repeat(4096),
+            },
+        });
+        let payload = click_payload(&envelope).unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({ "context": {
+                "type": "MINGO_APPROVAL_REQUEST",
+                "dialogId": "dlg-1",
+                "approvalRequestId": "req-1",
+            } })
+        );
+        assert!(click_uri(Some(&payload)).len() < 2048);
     }
 
     /// The bulk a context can carry (an approval request's toolCalls) must not

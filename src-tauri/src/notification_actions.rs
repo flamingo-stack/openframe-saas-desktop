@@ -27,9 +27,19 @@ use crate::MAIN_LABEL;
 /// Consumed by `onNativeChatDialogChanged` in the frontend's native-shell.ts.
 const DIALOG_CHANGED_EVENT: &str = "chat:dialog-changed";
 
-/// Envelope `context.type` values that earn action buttons. The rest of the set
-/// (tickets, client chats) has no action the shell can complete on its own.
-const APPROVAL_CONTEXT_TYPE: &str = "ADMIN_APPROVAL_REQUEST";
+/// Notification types that earn action buttons. The rest of the set (tickets,
+/// client chats) has no action the shell can complete on its own.
+///
+/// Three spellings for one decision: the spec catalog split the approval type by
+/// ticket linkage, the legacy context calls both `ADMIN_APPROVAL_REQUEST`, and
+/// which arrives depends on the contract that wrote the envelope. The buttons
+/// are the same either way — a press resolves the request by id.
+const APPROVAL_TYPES: [&str; 3] = [
+    "ADMIN_APPROVAL_REQUEST",
+    "TICKET_APPROVAL_REQUEST",
+    "MINGO_APPROVAL_REQUEST",
+];
+/// Unsplit, and spelled the same in both contracts.
 const MESSAGE_CONTEXT_TYPE: &str = "ADMIN_AI_MESSAGE";
 
 /// Which button set a notification gets. Derived from the click payload rather
@@ -70,7 +80,8 @@ fn kind_for(click: Option<&serde_json::Value>) -> ActionKind {
 /// toast this replaces, and which request a press resolves are all the same
 /// question.
 pub(crate) fn approval_request_id(click: Option<&serde_json::Value>) -> Option<String> {
-    (context_str(click, "type").as_deref() == Some(APPROVAL_CONTEXT_TYPE))
+    context_str(click, "type")
+        .is_some_and(|kind| APPROVAL_TYPES.contains(&kind.as_str()))
         .then(|| context_str(click, "approvalRequestId"))
         .flatten()
 }
@@ -480,6 +491,32 @@ mod tests {
         ));
         assert!(!is_resolved("wire-bare"));
         note_resolution(None);
+    }
+
+    /// Both catalog spellings earn the same buttons as the legacy one — without
+    /// this, approvals lose their buttons the day the spec type is what arrives.
+    #[test]
+    fn every_approval_spelling_earns_the_same_buttons() {
+        for kind in APPROVAL_TYPES {
+            assert_eq!(
+                kind_for(Some(&click(serde_json::json!({
+                    "type": kind,
+                    "approvalRequestId": "req-1",
+                })))),
+                ActionKind::Approval,
+                "{kind}"
+            );
+        }
+    }
+
+    /// The verdict as the spec contract carries it.
+    #[test]
+    fn a_verdict_in_attributes_settles_a_request() {
+        note_resolution(Some(&serde_json::json!({
+            "approvalRequestId": "attr-settled",
+            "resolution": "APPROVED",
+        })));
+        assert!(is_resolved("attr-settled"));
     }
 
     /// The bug this exists for: the gateway republishes a decided approval

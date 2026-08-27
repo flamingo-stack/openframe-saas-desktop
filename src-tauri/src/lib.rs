@@ -43,8 +43,8 @@ use tokens::NativeAuthTokens;
 /// page paints (matches the dark OpenFrame UI).
 const WINDOW_BG: Color = Color(22, 22, 22, 255);
 
-/// Title every window opens with, before its page has one. `set_window_title`
-/// replaces it with the page's `document.title` as soon as the bundle boots.
+/// Title every window opens with, before its page has one.
+/// [`mirror_document_title`] replaces it as soon as the page reports one.
 /// A window must not fall back to its URL here: a child window's is a
 /// `tauri://localhost/...` bundle URL, which is an internal detail and reads as
 /// a broken window.
@@ -172,6 +172,26 @@ static MAIN_PRESENCE: Mutex<MainPresence> = Mutex::new(MainPresence {
 /// acquired FIRST, with `MAIN_PRESENCE` only in short spans inside it — one
 /// ordering, so the two cannot deadlock.
 static MIRROR: Mutex<()> = Mutex::new(());
+
+/// macOS only: the dock icon tracks whether the APP has a window on screen, not
+/// whether the main one does. Close-to-tray used to drop straight to Accessory,
+/// which with a child window still open read as "the app quit" while its windows
+/// sat there — and an Accessory app has no dock icon left to click to get back.
+/// Call this whenever a window goes away, naming the one that is leaving:
+/// `is_visible` is not reliably false yet for the window currently being closed.
+#[cfg(target_os = "macos")]
+fn sync_activation_policy(app: &AppHandle, leaving: &str) {
+    let still_on_screen = app
+        .webview_windows()
+        .iter()
+        .any(|(label, w)| label != leaving && w.is_visible().unwrap_or(false));
+    let policy = if still_on_screen {
+        ActivationPolicy::Regular
+    } else {
+        ActivationPolicy::Accessory
+    };
+    let _ = app.set_activation_policy(policy);
+}
 
 /// Record whether the main window is in front of the user, mirror that onto the
 /// webview, and — on the way back — say how long it was away so the UI can
@@ -509,32 +529,6 @@ window.__OPENFRAME_SHELL__ = {{
     origError.apply(null, arguments);
   }};
   forward('info', 'bundle booting; origin=' + location.origin + ' __ENV=' + JSON.stringify(window.__ENV));
-}})();
-(function () {{
-  var last = '';
-  var sync = function () {{
-    var title = (document.title || '').trim();
-    if (!title || title === last) return;
-    last = title;
-    try {{
-      window.__TAURI_INTERNALS__.invoke('set_window_title', {{ title: title }});
-    }} catch (e) {{}}
-  }};
-  var start = function () {{
-    sync();
-    // The router swaps the <title> text on every client-side navigation, and
-    // there is no event for it — watching <head> covers both that and a direct
-    // `document.title =`. The `last` guard keeps the other head traffic
-    // (injected <style>/<link>) from turning into IPC.
-    new MutationObserver(sync).observe(document.head, {{
-      subtree: true, childList: true, characterData: true
-    }});
-  }};
-  if (document.readyState === 'loading') {{
-    document.addEventListener('DOMContentLoaded', start);
-  }} else {{
-    start();
-  }}
 }})();"#
     )
 }
@@ -552,16 +546,22 @@ fn webview_log(window: WebviewWindow, level: String, message: String) {
     }
 }
 
-/// Mirror the page's `document.title` onto the native window title, the way a
-/// browser titles a tab. Without it every window carries [`WINDOW_TITLE`], and
-/// windows detached from the main one are indistinguishable in the window list.
-/// Wired by env_init_script.
-#[tauri::command]
-fn set_window_title(window: WebviewWindow, title: String) {
-    // Bounded here rather than in the script that normally calls this: the IPC
-    // boundary is where the guarantee has to hold. Truncated by chars, not
-    // bytes — a title is arbitrary page text and slicing it mid-codepoint panics.
+/// Mirror the page's title onto the native window title, the way a browser
+/// titles a tab. Wired with `on_document_title_changed`, so the *webview*
+/// reports its own title (KVO on WKWebView, equivalents on WebView2/WebKitGTK)
+/// and it lands on the window that actually changed.
+///
+/// Deliberately NOT injected script calling a command: a child window has to be
+/// built with the opener's webview configuration — macOS requires that for
+/// `window.open` to work at all (`NewWindowResponse::Create`) — and that
+/// configuration carries the user-content controller that hosts Tauri's IPC
+/// handler. A child's `invoke` therefore arrives under the OPENER's identity, so
+/// a script-driven sync left every child stuck on its opening title and retitled
+/// the MAIN window whenever a child navigated.
+fn mirror_document_title(window: WebviewWindow, title: String) {
     let title: String = title.trim().chars().take(MAX_WINDOW_TITLE_CHARS).collect();
+    // A document with no title of its own must not blank the window's; it keeps
+    // whatever it opened with.
     if title.is_empty() {
         return;
     }
@@ -587,6 +587,7 @@ fn open_main_window(app: &AppHandle) -> Result<(), String> {
     let window = WebviewWindowBuilder::new(app, MAIN_LABEL, WebviewUrl::App("index.html".into()))
         .initialization_script(env_init_script(app))
         .title(WINDOW_TITLE)
+        .on_document_title_changed(mirror_document_title)
         .inner_size(1280.0, 860.0)
         .min_inner_size(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
         .resizable(true)
@@ -700,6 +701,7 @@ fn handle_new_window(
         )
         .initialization_script(env_init_script(app))
         .title(WINDOW_TITLE)
+        .on_document_title_changed(mirror_document_title)
         .inner_size(1100.0, 800.0)
         .min_inner_size(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
         .resizable(true)
@@ -1381,7 +1383,6 @@ pub fn run() {
             native_auth_set_tenant_host,
             take_pending_notification_click,
             webview_log,
-            set_window_title,
             updater::update_check,
             updater::update_apply_now,
             autostart::autostart_status,
@@ -1489,9 +1490,7 @@ pub fn run() {
                     let _ = window.hide();
                     set_main_presence(window.app_handle(), false);
                     #[cfg(target_os = "macos")]
-                    let _ = window
-                        .app_handle()
-                        .set_activation_policy(ActivationPolicy::Accessory);
+                    sync_activation_policy(window.app_handle(), MAIN_LABEL);
                 }
             }
             // Minimize and restore reach the shell as a resize and nothing else
@@ -1516,6 +1515,12 @@ pub fn run() {
                 // an already-hidden window this is no transition at all.
                 clear_main_presence();
             }
+            // The main window is already hidden by the time a child is closed,
+            // so nothing else would ever take the app back out of the dock.
+            #[cfg(target_os = "macos")]
+            WindowEvent::Destroyed if window.label() != MAIN_LABEL => {
+                sync_activation_policy(window.app_handle(), window.label());
+            }
             // The user is looking at the app — clear the unread badge.
             WindowEvent::Focused(true) if window.label() == MAIN_LABEL => {
                 notifications::on_main_focused(window.app_handle());
@@ -1526,7 +1531,24 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             #[cfg(not(target_os = "macos"))]
-            let _ = (app, event);
+            let _ = app;
+            // A tray app outlives its windows. Tauri asks to exit as soon as the
+            // last one is DESTROYED (not hidden), and tray "Sign Out" destroys
+            // the main window on purpose to rebuild it signed-out — so the
+            // process died there before `reopen_main_window` could put the
+            // window back, and the tray went with it. Close-to-tray never hit
+            // this: it hides the window, which leaves it in the window list.
+            //
+            // `code` is what separates the two: only "every window is gone"
+            // arrives as None. The tray's Quit (`app.exit(0)`) and the updater's
+            // restart both carry one and still go through — and `prevent_exit`
+            // is ignored for a restart regardless.
+            if let tauri::RunEvent::ExitRequested {
+                code: None, api, ..
+            } = &event
+            {
+                api.prevent_exit();
+            }
             // macOS delivers a URL activation as an Apple Event, not in argv —
             // this is the only path an OAuth callback can take to reach a
             // running app there. Raise the window when a login was actually

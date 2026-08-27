@@ -1549,6 +1549,27 @@ pub fn run() {
             {
                 api.prevent_exit();
             }
+            // Re-opening an app that is already running — from Spotlight, from
+            // the Finder, or by clicking its dock icon — reaches a macOS app as
+            // `applicationShouldHandleReopen`, never as a second process, so
+            // the single-instance handler (which does raise, and is what covers
+            // this on Windows) never sees it. Unhandled, all three did nothing
+            // at all: the app sat in the tray with its window hidden and the
+            // only way back in was the tray icon.
+            //
+            // Only when nothing is on screen: with a window already visible
+            // AppKit brings it forward itself, and stealing that to raise the
+            // main window would pull the user off the child window they asked
+            // for. `show_primary_window` puts the app back in the dock, so the
+            // icon that appears is a working one from then on.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen {
+                has_visible_windows: false,
+                ..
+            } = &event
+            {
+                raise_or_open_main_window(app);
+            }
             // macOS delivers a URL activation as an Apple Event, not in argv —
             // this is the only path an OAuth callback can take to reach a
             // running app there. Raise the window when a login was actually

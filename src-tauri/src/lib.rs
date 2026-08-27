@@ -43,6 +43,24 @@ use tokens::NativeAuthTokens;
 /// page paints (matches the dark OpenFrame UI).
 const WINDOW_BG: Color = Color(22, 22, 22, 255);
 
+/// Title every window opens with, before its page has one. `set_window_title`
+/// replaces it with the page's `document.title` as soon as the bundle boots.
+/// A window must not fall back to its URL here: a child window's is a
+/// `tauri://localhost/...` bundle URL, which is an internal detail and reads as
+/// a broken window.
+const WINDOW_TITLE: &str = "OpenFrame";
+
+/// Floor for every window the app opens, main and child alike. The UI's
+/// narrowest layout still assumes this much room, and without it a child window
+/// can be dragged down to a few pixels. There is deliberately no ceiling —
+/// neither window has one.
+const MIN_WINDOW_WIDTH: f64 = 1024.0;
+const MIN_WINDOW_HEIGHT: f64 = 700.0;
+
+/// Cap on a title mirrored in from a page, in characters. Long enough for any
+/// real title; short enough that a window's titlebar entry stays a label.
+const MAX_WINDOW_TITLE_CHARS: usize = 200;
+
 #[cfg(target_os = "macos")]
 use tauri::ActivationPolicy;
 
@@ -491,6 +509,32 @@ window.__OPENFRAME_SHELL__ = {{
     origError.apply(null, arguments);
   }};
   forward('info', 'bundle booting; origin=' + location.origin + ' __ENV=' + JSON.stringify(window.__ENV));
+}})();
+(function () {{
+  var last = '';
+  var sync = function () {{
+    var title = (document.title || '').trim();
+    if (!title || title === last) return;
+    last = title;
+    try {{
+      window.__TAURI_INTERNALS__.invoke('set_window_title', {{ title: title }});
+    }} catch (e) {{}}
+  }};
+  var start = function () {{
+    sync();
+    // The router swaps the <title> text on every client-side navigation, and
+    // there is no event for it — watching <head> covers both that and a direct
+    // `document.title =`. The `last` guard keeps the other head traffic
+    // (injected <style>/<link>) from turning into IPC.
+    new MutationObserver(sync).observe(document.head, {{
+      subtree: true, childList: true, characterData: true
+    }});
+  }};
+  if (document.readyState === 'loading') {{
+    document.addEventListener('DOMContentLoaded', start);
+  }} else {{
+    start();
+  }}
 }})();"#
     )
 }
@@ -508,6 +552,27 @@ fn webview_log(window: WebviewWindow, level: String, message: String) {
     }
 }
 
+/// Mirror the page's `document.title` onto the native window title, the way a
+/// browser titles a tab. Without it every window carries [`WINDOW_TITLE`], and
+/// windows detached from the main one are indistinguishable in the window list.
+/// Wired by env_init_script.
+#[tauri::command]
+fn set_window_title(window: WebviewWindow, title: String) {
+    // Bounded here rather than in the script that normally calls this: the IPC
+    // boundary is where the guarantee has to hold. Truncated by chars, not
+    // bytes — a title is arbitrary page text and slicing it mid-codepoint panics.
+    let title: String = title.trim().chars().take(MAX_WINDOW_TITLE_CHARS).collect();
+    if title.is_empty() {
+        return;
+    }
+    if let Err(e) = window.set_title(&title) {
+        log::warn!(
+            "[webview:{}] could not set window title: {e}",
+            window.label()
+        );
+    }
+}
+
 fn open_main_window(app: &AppHandle) -> Result<(), String> {
     if app.get_webview_window(MAIN_LABEL).is_some() {
         show_primary_window(app);
@@ -521,9 +586,9 @@ fn open_main_window(app: &AppHandle) -> Result<(), String> {
     let handler_app = app.clone();
     let window = WebviewWindowBuilder::new(app, MAIN_LABEL, WebviewUrl::App("index.html".into()))
         .initialization_script(env_init_script(app))
-        .title("OpenFrame")
+        .title(WINDOW_TITLE)
         .inner_size(1280.0, 860.0)
-        .min_inner_size(1024.0, 700.0)
+        .min_inner_size(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
         .resizable(true)
         .background_color(WINDOW_BG)
         .visible(false)
@@ -634,8 +699,10 @@ fn handle_new_window(
             WebviewUrl::External(url.clone()),
         )
         .initialization_script(env_init_script(app))
-        .title(url.as_str())
+        .title(WINDOW_TITLE)
         .inner_size(1100.0, 800.0)
+        .min_inner_size(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
+        .resizable(true)
         .position(140.0 + offset, 120.0 + offset)
         .background_color(WINDOW_BG)
         .visible(false)
@@ -1314,6 +1381,7 @@ pub fn run() {
             native_auth_set_tenant_host,
             take_pending_notification_click,
             webview_log,
+            set_window_title,
             updater::update_check,
             updater::update_apply_now,
             autostart::autostart_status,

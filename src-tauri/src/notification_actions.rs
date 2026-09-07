@@ -254,7 +254,7 @@ fn announce_dialog_change(app: &AppHandle, context: &ActionContext) {
         DIALOG_CHANGED_EVENT,
         serde_json::json!({ "dialogId": dialog_id }),
     ) {
-        log::warn!("emit {DIALOG_CHANGED_EVENT}: {e}");
+        log::warn!("[notifications] emit {DIALOG_CHANGED_EVENT}: {e}");
     }
 }
 

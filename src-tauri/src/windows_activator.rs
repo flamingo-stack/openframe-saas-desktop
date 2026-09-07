@@ -19,6 +19,14 @@
 // what toasts are posted under) but has no property for the activator. The
 // AppUserModelId key supplies it, and doubles as the AUMID registration for dev
 // builds, which have no shortcut at all.
+//
+// This whole file is Windows-only: it is registered from `lib.rs` behind
+// `#[cfg(target_os = "windows")]` on the `mod windows_activator;` declaration,
+// which is what keeps the `windows` crate dependency and every item below out
+// of non-Windows builds. The guard is asserted here too so this file cannot
+// silently compile (and fail) on another platform if that `mod` guard is ever
+// removed or edited.
+#![cfg(target_os = "windows")]
 
 use std::ffi::c_void;
 use std::sync::OnceLock;
@@ -64,6 +72,7 @@ static ROUTER: OnceLock<AppHandle> = OnceLock::new();
 /// nothing, so COM never routes an activation into one that is about to exit.
 pub(crate) fn init(app: &AppHandle) {
     if ROUTER.set(app.clone()).is_err() {
+        log::warn!("[notifications] toast activator router already initialized — skipping re-init");
         return;
     }
     register(app);
@@ -287,3 +296,4 @@ impl IClassFactory_Impl for ActivatorFactory_Impl {
         Ok(())
     }
 }
+

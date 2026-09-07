@@ -16,6 +16,7 @@
 // refreshes the gate then refuses.
 
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use block2::RcBlock;
 use objc2_app_kit::NSWorkspace;
@@ -26,7 +27,16 @@ use tauri::AppHandle;
 /// nothing from AppKit but the one class it calls.
 const DID_WAKE: &str = "NSWorkspaceDidWakeNotification";
 
+/// Guards against registering more than one observer per process: `observe`
+/// intentionally leaks its token (see below), so a second call would leak a
+/// second observer and duplicate wake refreshes.
+static OBSERVED: AtomicBool = AtomicBool::new(false);
+
 pub(crate) fn observe(app: AppHandle) {
+    if OBSERVED.swap(true, Ordering::SeqCst) {
+        log::warn!("[wake] observe() called more than once; ignoring duplicate registration");
+        return;
+    }
     let handler = RcBlock::new(move |_notification: NonNull<NSNotification>| {
         // Before the nudge, not after: the nudge is what would otherwise rotate
         // at resume+0, ahead of the wake watch's next tick.

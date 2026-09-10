@@ -595,6 +595,11 @@ fn open_main_window(app: &AppHandle) -> Result<(), String> {
         .visible(false)
         .on_new_window(move |url, features| handle_new_window(&handler_app, url, features))
         .on_page_load(handle_page_load)
+        // Tauri's file-drop handler swallows every drag session at the
+        // NSDraggingDestination / WebView2 layer, so the page never sees
+        // dragover/drop and HTML5 drag-and-drop (the ticket board) is dead.
+        // Nothing here consumes file drops, so opt out of the handler.
+        .disable_drag_drop_handler()
         .build()
         .map_err(|e| e.to_string())?;
     spawn_show_fallback(&window);
@@ -710,6 +715,7 @@ fn handle_new_window(
         .visible(false)
         .on_new_window(move |u, f| handle_new_window(&child_app, u, f))
         .on_page_load(handle_page_load)
+        .disable_drag_drop_handler()
         .window_features(features)
         .build()
         {

@@ -283,12 +283,6 @@ jobs:
           } > RELEASE_HEADER.md
           cat RELEASE_HEADER.md
 
-      - name: Delete existing latest release
-        if: ${{ github.event_name == 'push' }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release delete latest --yes --cleanup-tag || true
-
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
@@ -300,3 +294,10 @@ jobs:
           body_path: RELEASE_HEADER.md
           files: |
             final-artifacts/*
+
+      - name: Delete previous latest release
+        if: ${{ github.event_name == 'push' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release delete latest --yes --cleanup-tag || true
+

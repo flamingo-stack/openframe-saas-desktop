@@ -286,10 +286,11 @@ dials with a fresh bearer.
 - Notifications fire **only when the main window is hidden or unfocused**. The
   webview's own subscription keeps driving the in-app drawer — duplicate delivery,
   different sinks. A badge accumulates while hidden and clears on focus.
-- The click payload is the envelope's routing `context`, narrowed to the fields
-  the frontend's route mapping reads plus `approvalRequestId`, which the macOS
-  action buttons need. The rest of a context can be arbitrarily large, and it has
-  to fit inside a Windows activation URI.
+- The click payload is the envelope narrowed to its routing fields, in the
+  envelope's own shape: top-level `type` plus `attributes` with `ticketId`,
+  `dialogId` and `approvalRequestId` — what the frontend's route mapping reads,
+  plus the id the action buttons need. The rest of `attributes` can be
+  arbitrarily large, and the payload has to fit inside a Windows activation URI.
 - Every logout path tears the subscription down — including a session death the
   shell detects itself, which the webview may not notice for hours while idle in
   the tray. Otherwise the previous user's notification content would keep
@@ -378,8 +379,8 @@ been decided — under the same notification id, carrying:
 | Field | Meaning |
 |---|---|
 | `eventType` | `CREATED` for the first push, `UPDATED` for one that supersedes it. Absent → `CREATED`. |
-| `context.resolution` | Backend `ApprovalResolution`: `PENDING`, `APPROVED`, `REJECTED`, `CANCELLED`. Absent until decided. |
-| `context.resolvedByName` | Who decided it. |
+| `attributes.resolution` | Backend `ApprovalResolution`: `PENDING`, `APPROVED`, `REJECTED`, `CANCELLED`. |
+| `attributes.resolvedByName` | Who decided it. |
 
 That is a *correction*, not a second notification, and the shell has to read it as
 one — otherwise the republished copy arrives as a fresh banner still offering a

@@ -339,8 +339,8 @@ fn encode_action_args(
     if let Some(user_id) = user_id {
         args.push_str(&format!("&user={}", encode(user_id)));
     }
-    if let Some(context) = click.and_then(|click| click.get("context")) {
-        args.push_str(&format!("&context={}", encode(&context.to_string())));
+    if let Some(click) = click {
+        args.push_str(&format!("&payload={}", encode(&click.to_string())));
     }
     args
 }
@@ -371,9 +371,7 @@ pub(crate) fn parse_action_args(args: &str) -> Option<ToastAction> {
             "action" => parsed.action = value,
             "title" => parsed.context.title = value,
             "user" => parsed.context.user_id = Some(value).filter(|user| !user.is_empty()),
-            "context" => {
-                parsed.context.payload = crate::notifications::payload_from_context_json(&value)
-            }
+            "payload" => parsed.context.payload = crate::notifications::payload_from_json(&value),
             _ => {}
         }
     }
@@ -438,10 +436,10 @@ mod tests {
     use super::*;
 
     fn approval_click() -> serde_json::Value {
-        serde_json::json!({ "context": {
-            "type": "ADMIN_APPROVAL_REQUEST",
-            "approvalRequestId": "0a2a0b3c-9d1e-4f5a-8b7c-6d5e4f3a2b1c",
-        } })
+        serde_json::json!({
+            "type": "MINGO_APPROVAL_REQUEST",
+            "attributes": { "approvalRequestId": "0a2a0b3c-9d1e-4f5a-8b7c-6d5e4f3a2b1c" },
+        })
     }
 
     #[test]
@@ -460,9 +458,10 @@ mod tests {
     /// the right request.
     #[test]
     fn action_args_survive_reserved_chars() {
-        let click = serde_json::json!({ "context": {
-            "type": "ADMIN_AI_MESSAGE", "dialogId": "abc/д ф&x=1",
-        } });
+        let click = serde_json::json!({
+            "type": "ADMIN_AI_MESSAGE",
+            "attributes": { "dialogId": "abc/д ф&x=1" },
+        });
         let args = encode_action_args(REPLY_ACTION, "a&b=c д", Some("u&1"), Some(&click));
         let parsed = parse_action_args(&args).unwrap();
         assert_eq!(parsed.context.title, "a&b=c д");

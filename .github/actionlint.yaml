@@ -1,6 +1,14 @@
 # Generated and re-synced by the Flamingo hub (flamingo[bot]); local edits are
 # overwritten on the next sync, so findings must be fixed in the hub template.
 # YAML syntax is still enforced by the yaml-lint step.
+#
+# NOTE: the blanket '.+' ignores below suppress ALL actionlint diagnostics for
+# these two files, including real issues (undefined context refs, shellcheck
+# findings in embedded run blocks, etc). This was flagged in review: given the
+# extensive inline shell logic in these workflows, a narrower allowlist of
+# specific, reviewed rule codes should replace the blanket ignore. Restoring
+# real coverage requires updating the Flamingo hub template that generates
+# this file, since local edits here are overwritten on the next sync.
 paths:
   .github/workflows/doc-orchestrator.yml:
     ignore:

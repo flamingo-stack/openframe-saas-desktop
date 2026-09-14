@@ -178,6 +178,25 @@ pub(crate) enum Action {
     Reply(String),
 }
 
+/// Ceiling on the reply text echoed back into a failure banner. Matches the
+/// spirit of OPENFRAM-006-13's BODY_CHARS truncation for user-facing
+/// notification text: the platform toast document cap (~5KB, see
+/// windows_toast.rs) can silently drop the whole notification if the body
+/// grows unbounded, and here the body is the user's own untruncated reply.
+const ECHOED_REPLY_CHARS: usize = 500;
+
+/// Truncate `text` to at most `max_chars` `char`s, appending an ellipsis when
+/// something was cut. Operates on `char` boundaries so multi-byte UTF-8 text
+/// is never split mid-codepoint.
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut truncated: String = text.chars().take(max_chars).collect();
+    truncated.push('…');
+    truncated
+}
+
 impl Action {
     /// Success banner title.
     fn done(&self) -> &'static str {
@@ -198,10 +217,14 @@ impl Action {
 
     /// Failure banner body. A failed reply carries the text back: responding to
     /// the notification cleared the inline field, so this is the only copy left.
+    /// The echoed text is truncated so an unbounded reply cannot itself blow the
+    /// notification past the platform's body cap.
     fn failed(&self, reason: &str) -> String {
         let line = format!("Could not {} — {reason}.", self.verb());
         match self {
-            Action::Reply(text) => format!("{line} Your reply: {text}"),
+            Action::Reply(text) => {
+                format!("{line} Your reply: {}", truncate_chars(text, ECHOED_REPLY_CHARS))
+            }
             _ => line,
         }
     }
@@ -592,5 +615,17 @@ mod tests {
         let failed = Action::Reply("ship it".into()).failed("the gateway could not be reached");
         assert!(failed.contains("ship it"));
         assert!(!Action::Approve.failed("nope").contains("Your reply"));
+    }
+
+    /// The finding this exists for: an unbounded reply must not be echoed back
+    /// unbounded into the failure banner body.
+    #[test]
+    fn a_failed_reply_truncates_an_oversized_echo() {
+        let long_text = "x".repeat(ECHOED_REPLY_CHARS + 250);
+        let failed = Action::Reply(long_text.clone()).failed("the gateway could not be reached");
+        assert!(!failed.contains(&long_text));
+        assert!(failed.contains('…'));
+        let echoed = failed.split("Your reply: ").nth(1).unwrap();
+        assert!(echoed.chars().count() <= ECHOED_REPLY_CHARS + 1);
     }
 }

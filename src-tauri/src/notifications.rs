@@ -205,9 +205,7 @@ fn maybe_notify(app: &AppHandle, envelope: &serde_json::Value, user_id: &str) {
     // that is true whether or not this envelope is one the user gets to see.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
-        // Both contracts, since either may carry the verdict; recording is idempotent.
         crate::notification_actions::note_resolution(envelope.get("attributes"));
-        crate::notification_actions::note_resolution(envelope.get("context"));
     }
 
     let Some(title) = string_field(envelope, "title") else {
@@ -303,50 +301,49 @@ fn delivery_of(envelope: &serde_json::Value) -> Delivery {
 // Click payload + delivery
 // ---------------------------------------------------------------------------
 
-/// The webview's `notification:click` payload: the envelope's routing fields
-/// in wire shape, which the frontend's `resolveNatsNotificationAction` maps to a
-/// route. Only the fields that mapping reads — plus `approvalRequestId`, which
-/// the Approve/Reject buttons resolve against the chat API — survive. The rest
-/// of the envelope can be arbitrarily large (an approval request carries the
-/// whole `toolCalls` array), and the payload has to fit both in a Windows
+/// The webview's `notification:click` payload: the envelope narrowed to its
+/// routing fields, in the envelope's own shape — top-level `type` plus a flat
+/// `attributes` map — which the frontend's `resolveNatsNotificationRoute` maps
+/// to a route. Only the fields that mapping reads — plus `approvalRequestId`,
+/// which the Approve/Reject buttons resolve against the chat API — survive. The
+/// rest of the envelope can be arbitrarily large (an approval request carries
+/// the whole `toolCalls` JSON), and the payload has to fit both in a Windows
 /// activation URI and in a toast payload that repeats it once per button; every
 /// id kept here is a UUID. `None` when the envelope points at nothing openable;
 /// the click then only raises the window.
 ///
-/// Read field by field from both contracts: `type` + `attributes` is the spec
-/// one, `context` the legacy fallback that leaves the wire once the backend
-/// stops dual-writing. The payload keeps its own `context` wrapper — that name
-/// is this app's protocol with the webview, not the backend's.
+/// The typed `context` the backend used to nest beside `attributes` is retired
+/// and ignored if it still appears.
 fn click_payload(envelope: &serde_json::Value) -> Option<serde_json::Value> {
-    let attributes = envelope.get("attributes");
-    let context = envelope.get("context");
-    let mut routing = serde_json::Map::new();
-    let kind = envelope
-        .get("type")
-        .filter(|value| !value.is_null())
-        .or_else(|| context.and_then(|context| context.get("type")));
-    if let Some(kind) = kind {
-        routing.insert("type".to_string(), kind.clone());
+    let mut payload = serde_json::Map::new();
+    if let Some(kind) = envelope.get("type").filter(|value| !value.is_null()) {
+        payload.insert("type".to_string(), kind.clone());
     }
-    for key in ["ticketId", "dialogId", "approvalRequestId"] {
-        let value = attributes
-            .and_then(|attributes| attributes.get(key))
-            .or_else(|| context.and_then(|context| context.get(key)));
-        if let Some(value) = value {
-            routing.insert(key.to_string(), value.clone());
+    let mut attributes = serde_json::Map::new();
+    if let Some(source) = envelope.get("attributes") {
+        for key in ["ticketId", "dialogId", "approvalRequestId"] {
+            if let Some(value) = source.get(key) {
+                attributes.insert(key.to_string(), value.clone());
+            }
         }
     }
-    (!routing.is_empty()).then(|| serde_json::json!({ "context": routing }))
+    if !attributes.is_empty() {
+        payload.insert(
+            "attributes".to_string(),
+            serde_json::Value::Object(attributes),
+        );
+    }
+    (!payload.is_empty()).then_some(serde_json::Value::Object(payload))
 }
 
-/// `openframe-console://notify?context=<percent-encoded JSON>`.
+/// `openframe-console://notify?payload=<percent-encoded JSON>`.
 #[cfg(any(target_os = "windows", test))]
 pub(crate) fn click_uri(click: Option<&serde_json::Value>) -> String {
     use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
-    match click.and_then(|c| c.get("context")) {
-        Some(context) => format!(
-            "{CLICK_URI_PREFIX}?context={}",
-            utf8_percent_encode(&context.to_string(), NON_ALPHANUMERIC)
+    match click {
+        Some(click) => format!(
+            "{CLICK_URI_PREFIX}?payload={}",
+            utf8_percent_encode(&click.to_string(), NON_ALPHANUMERIC)
         ),
         None => CLICK_URI_PREFIX.to_string(),
     }
@@ -360,23 +357,21 @@ fn parse_click_uri(uri: &str) -> Option<serde_json::Value> {
     let query = rest.strip_prefix('/').unwrap_or(rest).strip_prefix('?')?;
     let encoded = query
         .split('&')
-        .find_map(|pair| pair.strip_prefix("context="))?;
+        .find_map(|pair| pair.strip_prefix("payload="))?;
     let json = percent_encoding::percent_decode_str(encoded)
         .decode_utf8()
         .ok()?;
-    payload_from_context_json(&json)
+    payload_from_json(&json)
 }
 
-/// Wrap a decoded `context` object back into the shape every click path carries
-/// it in. Both Windows activation transports land here — the URI a toast body
-/// activates and the arguments a toast button carries — so the envelope shape
-/// the webview and `kind_for` depend on is asserted once.
+/// Decode a click payload carried as JSON. Both Windows activation transports
+/// land here — the URI a toast body activates and the arguments a toast button
+/// carries — so the shape the webview and `kind_for` depend on is asserted once:
+/// an object, or nothing.
 #[cfg(any(target_os = "windows", test))]
-pub(crate) fn payload_from_context_json(json: &str) -> Option<serde_json::Value> {
-    let context: serde_json::Value = serde_json::from_str(json).ok()?;
-    context
-        .is_object()
-        .then(|| serde_json::json!({ "context": context }))
+pub(crate) fn payload_from_json(json: &str) -> Option<serde_json::Value> {
+    let payload: serde_json::Value = serde_json::from_str(json).ok()?;
+    payload.is_object().then_some(payload)
 }
 
 /// Handles an `openframe-console://notify` URI from a Windows toast click,
@@ -401,13 +396,11 @@ pub(crate) fn handle_notification_uri(app: &AppHandle, uri: &str) -> bool {
 pub(crate) fn deliver_click(app: &AppHandle, payload: Option<serde_json::Value>) {
     match payload {
         Some(payload) => {
-            // Context can carry user-facing content — identify it at info, dump
-            // it only at debug, same policy as notification_router.
+            // The payload can carry user-facing content — identify it at info,
+            // dump it only at debug, same policy as notification_router.
             log::info!(
-                "[notifications] activated — forwarding context.type={}",
-                payload
-                    .pointer("/context/type")
-                    .unwrap_or(&serde_json::Value::Null)
+                "[notifications] activated — forwarding type={}",
+                payload.get("type").unwrap_or(&serde_json::Value::Null)
             );
             log::debug!("[notifications] click payload: {payload}");
             emit_or_stash(app, payload);
@@ -578,7 +571,8 @@ mod tests {
     fn click_uri_roundtrip() {
         let envelope = serde_json::json!({
             "title": "Ticket updated",
-            "context": { "type": "TICKET_STATUS_CHANGED", "ticketId": "6a4fda9ba8b65c28c4dbf6ba" }
+            "type": "TICKET_STATUS_CHANGED",
+            "attributes": { "ticketId": "6a4fda9ba8b65c28c4dbf6ba" }
         });
         let payload = click_payload(&envelope).unwrap();
         assert_eq!(
@@ -590,7 +584,8 @@ mod tests {
     #[test]
     fn click_uri_roundtrip_survives_reserved_chars() {
         let envelope = serde_json::json!({
-            "context": { "type": "CLIENT_AI_MESSAGE", "dialogId": "abc/д ф&x=1" }
+            "type": "CLIENT_AI_MESSAGE",
+            "attributes": { "dialogId": "abc/д ф&x=1" }
         });
         let payload = click_payload(&envelope).unwrap();
         assert_eq!(
@@ -599,10 +594,10 @@ mod tests {
         );
     }
 
-    /// The spec contract: top-level `type` + flat `attributes`, no `context` at
-    /// all — the shape the wire settles on once the backend stops dual-writing.
+    /// The payload is the envelope in its own shape, narrowed to the routing
+    /// fields: top-level `type`, the ids under `attributes`.
     #[test]
-    fn spec_shaped_envelope_routes_without_context() {
+    fn click_payload_is_the_envelope_narrowed() {
         let envelope = serde_json::json!({
             "title": "Approval required",
             "type": "TICKET_APPROVAL_REQUEST",
@@ -612,72 +607,48 @@ mod tests {
                 "toolCalls": "[]",
             }
         });
-        let payload = click_payload(&envelope).unwrap();
         assert_eq!(
-            payload,
-            serde_json::json!({ "context": {
+            click_payload(&envelope).unwrap(),
+            serde_json::json!({
                 "type": "TICKET_APPROVAL_REQUEST",
-                "ticketId": "abc",
-                "approvalRequestId": "0a2a0b3c-9d1e-4f5a-8b7c-6d5e4f3a2b1c",
-            } })
+                "attributes": {
+                    "ticketId": "abc",
+                    "approvalRequestId": "0a2a0b3c-9d1e-4f5a-8b7c-6d5e4f3a2b1c",
+                }
+            })
         );
     }
 
-    /// Dual-write window: both shapes on the wire, the spec half wins. A null
-    /// top-level `type` (a legacy-path document) falls back to the context's.
+    /// The retired typed `context` is ignored: on its own it yields no payload,
+    /// and beside `attributes` it contributes nothing.
     #[test]
-    fn attributes_win_over_context_and_null_type_falls_back() {
-        let envelope = serde_json::json!({
+    fn a_legacy_context_on_the_envelope_is_ignored() {
+        let legacy_only = serde_json::json!({
+            "title": "Ticket updated",
+            "context": { "type": "CLIENT_AI_MESSAGE", "dialogId": "d-2" }
+        });
+        assert!(click_payload(&legacy_only).is_none());
+
+        let dual = serde_json::json!({
             "type": "TICKET_APPROVAL_REQUEST",
             "attributes": { "ticketId": "new" },
             "context": { "type": "ADMIN_APPROVAL_REQUEST", "ticketId": "old", "dialogId": "d-1" }
         });
-        let payload = click_payload(&envelope).unwrap();
         assert_eq!(
-            payload,
-            serde_json::json!({ "context": {
+            click_payload(&dual).unwrap(),
+            serde_json::json!({
                 "type": "TICKET_APPROVAL_REQUEST",
-                "ticketId": "new",
-                "dialogId": "d-1",
-            } })
-        );
-
-        let legacy_only = serde_json::json!({
-            "type": serde_json::Value::Null,
-            "context": { "type": "CLIENT_AI_MESSAGE", "dialogId": "d-2" }
-        });
-        let payload = click_payload(&legacy_only).unwrap();
-        assert_eq!(
-            payload,
-            serde_json::json!({ "context": { "type": "CLIENT_AI_MESSAGE", "dialogId": "d-2" } })
+                "attributes": { "ticketId": "new" }
+            })
         );
     }
 
     #[test]
-    fn envelopes_without_context_have_no_payload() {
+    fn envelopes_without_routing_fields_have_no_payload() {
         assert!(click_payload(&serde_json::json!({ "title": "Hi" })).is_none());
-        assert!(click_payload(&serde_json::json!({ "context": "not-an-object" })).is_none());
-        assert!(click_payload(&serde_json::json!({ "context": { "ticketId": "" } })).is_some());
+        assert!(click_payload(&serde_json::json!({ "attributes": "not-an-object" })).is_none());
+        assert!(click_payload(&serde_json::json!({ "attributes": { "ticketId": "" } })).is_some());
         assert_eq!(click_uri(None), CLICK_URI_PREFIX);
-    }
-
-    /// Each contract fills what the other leaves out, rather than the payload
-    /// being taken wholesale from whichever was found first.
-    #[test]
-    fn the_two_contracts_are_read_field_by_field() {
-        let envelope = serde_json::json!({
-            "type": "TICKET_ESCALATED_BY_USER",
-            "attributes": { "ticketId": "t-3" },
-            "context": { "type": "TICKET_ESCALATED_BY_USER", "ticketId": "t-3", "dialogId": "dlg-3" },
-        });
-        assert_eq!(
-            click_payload(&envelope).unwrap(),
-            serde_json::json!({ "context": {
-                "type": "TICKET_ESCALATED_BY_USER",
-                "ticketId": "t-3",
-                "dialogId": "dlg-3",
-            } })
-        );
     }
 
     /// New catalog types are expected to arrive without a shell release, and the
@@ -690,12 +661,15 @@ mod tests {
         });
         assert_eq!(
             click_payload(&envelope).unwrap(),
-            serde_json::json!({ "context": { "type": "SOMETHING_SHIPPED_LATER", "ticketId": "t-4" } })
+            serde_json::json!({ "type": "SOMETHING_SHIPPED_LATER", "attributes": { "ticketId": "t-4" } })
         );
     }
 
     /// The projection is a whitelist: the catalog adds attributes without asking
-    /// the shell, and they must not reach the activation URI.
+    /// the shell, and they must not reach the activation URI. The bulk an
+    /// approval carries (its `toolCalls` JSON) is the case that matters —
+    /// Windows truncates the URI at ~2 KB, and the ids the action buttons act on
+    /// must survive it.
     #[test]
     fn unknown_attributes_stay_out_of_the_payload() {
         let envelope = serde_json::json!({
@@ -704,41 +678,16 @@ mod tests {
                 "approvalRequestId": "req-1",
                 "dialogId": "dlg-1",
                 "somethingShippedLater": "y".repeat(4096),
+                "toolCalls": "x".repeat(4096),
             },
         });
         let payload = click_payload(&envelope).unwrap();
         assert_eq!(
             payload,
-            serde_json::json!({ "context": {
+            serde_json::json!({
                 "type": "MINGO_APPROVAL_REQUEST",
-                "dialogId": "dlg-1",
-                "approvalRequestId": "req-1",
-            } })
-        );
-        assert!(click_uri(Some(&payload)).len() < 2048);
-    }
-
-    /// The bulk a context can carry (an approval request's toolCalls) must not
-    /// reach the activation URI — Windows truncates it at ~2 KB. The ids the
-    /// macOS action buttons act on must survive it.
-    #[test]
-    fn click_payload_keeps_only_routing_fields() {
-        let envelope = serde_json::json!({
-            "context": {
-                "type": "ADMIN_APPROVAL_REQUEST",
-                "ticketId": "abc",
-                "approvalRequestId": "0a2a0b3c-9d1e-4f5a-8b7c-6d5e4f3a2b1c",
-                "toolCalls": [{ "toolExplanation": "x".repeat(4096) }],
-            }
-        });
-        let payload = click_payload(&envelope).unwrap();
-        assert_eq!(
-            payload,
-            serde_json::json!({ "context": {
-                "type": "ADMIN_APPROVAL_REQUEST",
-                "ticketId": "abc",
-                "approvalRequestId": "0a2a0b3c-9d1e-4f5a-8b7c-6d5e4f3a2b1c",
-            } })
+                "attributes": { "dialogId": "dlg-1", "approvalRequestId": "req-1" }
+            })
         );
         assert!(click_uri(Some(&payload)).len() < 2048);
     }
@@ -773,9 +722,10 @@ mod tests {
     #[test]
     fn malformed_uris_have_no_payload() {
         assert!(parse_click_uri(CLICK_URI_PREFIX).is_none());
-        assert!(parse_click_uri("openframe-console://notify?context=%7B%7D").is_some());
-        assert!(parse_click_uri("openframe-console://notify?context=not-json").is_none());
+        assert!(parse_click_uri("openframe-console://notify?payload=%7B%7D").is_some());
+        assert!(parse_click_uri("openframe-console://notify?payload=not-json").is_none());
+        assert!(parse_click_uri("openframe-console://notify?payload=%5B%5D").is_none());
         assert!(parse_click_uri("openframe-console://notify?id=x").is_none());
-        assert!(parse_click_uri("openframe-chat://notify?context=%7B%7D").is_none());
+        assert!(parse_click_uri("openframe-chat://notify?payload=%7B%7D").is_none());
     }
 }

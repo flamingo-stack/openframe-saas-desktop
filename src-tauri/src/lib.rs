@@ -73,7 +73,7 @@ pub(crate) const MAIN_LABEL: &str = "main";
 ///   in the user's **default browser**, where their SSO session already is, so
 ///   the ticket cannot be read out of a webview we control; it has to be handed
 ///   back by the OS.
-/// - `openframe-console://notify?context=…` — what a Windows toast activates
+/// - `openframe-console://notify?payload=…` — what a Windows toast activates
 ///   (`notifications::CLICK_URI_PREFIX`).
 ///
 /// Registered on macOS by `Info.plist` (`CFBundleURLTypes`) and on Windows by
@@ -1648,7 +1648,7 @@ mod tests {
     #[test]
     fn other_hosts_on_our_scheme_are_not_callbacks() {
         assert!(!is_auth_callback(&parse(
-            "openframe-console://notify?context=%7B%7D"
+            "openframe-console://notify?payload=%7B%7D"
         )));
     }
 

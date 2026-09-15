@@ -34,8 +34,22 @@ on:
 # =============================================================================
 
 jobs:
+  guard-ref:
+    name: "Guard: main-only release"
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if ref is not refs/heads/main
+        run: |
+          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "::error::This workflow must only run from refs/heads/main (got '${{ github.ref }}'). The self-updater's cosign verification pins the signing identity to release.yml@refs/heads/main, so releasing from another ref would produce artifacts that fail verification."
+            exit 1
+          fi
+
   version:
     name: Resolve Version
+    needs: [guard-ref]
     permissions:
       contents: read
     uses: ./.github/workflows/version.yml
@@ -44,7 +58,7 @@ jobs:
 
   build:
     name: "Build: ${{ matrix.leg }}"
-    needs: [version]
+    needs: [guard-ref, version]
     permissions:
       contents: read
     runs-on: "${{ matrix.runner }}"
@@ -198,7 +212,7 @@ jobs:
 
   release:
     name: "Create Release"
-    needs: [version, build]
+    needs: [guard-ref, version, build]
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -300,3 +314,4 @@ jobs:
           body_path: RELEASE_HEADER.md
           files: |
             final-artifacts/*
+

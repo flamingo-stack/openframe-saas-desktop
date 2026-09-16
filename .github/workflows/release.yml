@@ -18,6 +18,10 @@ on:
       - 'package-lock.json'
   workflow_dispatch:
     inputs:
+      frontend_tag:
+        description: "openframe-oss-frontend image tag to bundle: the one prod runs (openframe-saas.frontend.image.tag in openframe-saas-tenant manifests/tenant/values-prod.yaml), e.g. 1.0.100."
+        required: true
+        type: string
       version:
         description: "Version to Release (x.y.z). Leave empty for auto patch bump."
         required: false
@@ -42,9 +46,32 @@ jobs:
     with:
       version: ${{ inputs.version }}
 
+  # Pins the bundled frontend: a dispatch to the git tag the frontend release
+  # created with the image prod runs, a push to frontend main (the dev 'latest'
+  # image's source). Fails here, before three build legs spend their minutes.
+  frontend:
+    name: Resolve Frontend
+    permissions: {}
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.resolve.outputs.ref }}
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - name: Resolve frontend ref
+        id: resolve
+        env:
+          REF: ${{ inputs.frontend_tag || 'main' }}
+          KIND: ${{ inputs.frontend_tag && 'tags' || 'heads' }}
+        run: |
+          set -euo pipefail
+          sha=$(git ls-remote --exit-code https://github.com/flamingo-stack/openframe-oss-frontend "refs/$KIND/$REF" | cut -f1) \
+            || { echo "::error::openframe-oss-frontend has no refs/$KIND/$REF; a frontend release creates its tag."; exit 1; }
+          echo "frontend: $REF @ $sha"
+          { echo "ref=$REF"; echo "sha=$sha"; } >> "$GITHUB_OUTPUT"
+
   build:
     name: "Build: ${{ matrix.leg }}"
-    needs: [version]
+    needs: [version, frontend]
     permissions:
       contents: read
     runs-on: "${{ matrix.runner }}"
@@ -126,6 +153,7 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
           BUNDLES: ${{ matrix.bundles }}
+          FRONTEND_REF: ${{ needs.frontend.outputs.ref }}
           # Never the 'latest' tag: this Makefile applies it and tauri needs semver.
           OPENFRAME_VERSION: ${{ needs.version.outputs.app_version }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -176,9 +204,10 @@ jobs:
         if: always()
         env:
           LEG: ${{ matrix.leg }}
+          REF: ${{ needs.frontend.outputs.ref }}
         run: |
           sha=$(git -C .frontend rev-parse HEAD 2>/dev/null) || exit 0
-          echo "**$LEG** bundled \`openframe-oss-frontend@$sha\`" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "**$LEG** bundled \`openframe-oss-frontend@$REF\` (\`$sha\`)" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -198,7 +227,7 @@ jobs:
 
   release:
     name: "Create Release"
-    needs: [version, build]
+    needs: [version, frontend, build]
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -263,6 +292,8 @@ jobs:
       - name: Generate release header
         env:
           SHARED_HOST: ${{ inputs.shared_host_url || secrets.OPENFRAME_SHARED_HOST_URL }}
+          FRONTEND_REF: ${{ needs.frontend.outputs.ref }}
+          FRONTEND_SHA: ${{ needs.frontend.outputs.sha }}
         run: |
           set -euo pipefail
           shopt -s nullglob   # unmatched globs vanish, so .sig and updater.json skip themselves
@@ -278,7 +309,7 @@ jobs:
             row "macOS (Universal) — update"       final-artifacts/*.app.tar.gz
             row "Windows x64 — install + update"   final-artifacts/*_x64-setup.exe
             row "Windows arm64 — install + update" final-artifacts/*_arm64-setup.exe
-            printf "\nBuilt against shared auth host \`%s\`. Updater manifest: \`updater.json\`.\n" "$SHARED_HOST"
+            printf "\nBundles openframe-oss-frontend \`%s\` (\`%s\`). Built against shared auth host \`%s\`. Updater manifest: \`updater.json\`.\n" "$FRONTEND_REF" "$FRONTEND_SHA" "$SHARED_HOST"
             printf '\n---\n'
           } > RELEASE_HEADER.md
           cat RELEASE_HEADER.md

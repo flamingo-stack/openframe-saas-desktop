@@ -6,7 +6,12 @@
 #   FRONTEND_DIR=/path/to/checkout   use an existing working copy as-is (no git
 #                                    operations — this is the local dev loop)
 #   otherwise                        clone/refresh FRONTEND_REPO at FRONTEND_REF
-#                                    into .frontend/ (git-ignored)
+#                                    into .frontend/ (git-ignored). FRONTEND_REF
+#                                    is required — no `main` default, so a build
+#                                    never silently ships the frontend's tip. A
+#                                    release passes the frontend image tag prod
+#                                    runs; the frontend release workflow tags
+#                                    that commit with a GitHub release.
 #
 # Mirrors openframe-mobile/scripts/build-web.sh, with one difference: no
 # inject-env.mjs step — the desktop shell injects window.__ENV at RUNTIME (see
@@ -22,7 +27,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FRONTEND_REPO="${FRONTEND_REPO:-https://github.com/flamingo-stack/openframe-oss-frontend}"
-FRONTEND_REF="${FRONTEND_REF:-main}"
+FRONTEND_REF="${FRONTEND_REF:-}"
 CHECKOUT="$HERE/.frontend"
 
 if [ -n "${FRONTEND_DIR:-}" ]; then
@@ -32,6 +37,10 @@ if [ -n "${FRONTEND_DIR:-}" ]; then
   fi
   echo "▸ Using local frontend checkout: $FRONTEND_DIR"
 else
+  if [ -z "$FRONTEND_REF" ]; then
+    echo "✗ FRONTEND_REF is required: the frontend image tag to release against (e.g. 1.0.100), or a branch for a dev build" >&2
+    exit 1
+  fi
   # Shallow, single-ref: this is a build input, not something to develop in.
   if [ -d "$CHECKOUT/.git" ]; then
     echo "▸ Refreshing $CHECKOUT ($FRONTEND_REF)…"
@@ -47,7 +56,7 @@ else
   git -C "$CHECKOUT" checkout --quiet --detach FETCH_HEAD
   git -C "$CHECKOUT" clean -qfd
   FRONTEND_DIR="$CHECKOUT"
-  echo "▸ Frontend at $(git -C "$CHECKOUT" rev-parse --short HEAD)"
+  echo "▸ Frontend $FRONTEND_REF at $(git -C "$CHECKOUT" rev-parse --short HEAD)"
 fi
 
 echo "▸ Installing frontend dependencies…"

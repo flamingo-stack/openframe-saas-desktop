@@ -25,7 +25,7 @@ OAuth callback has no way back into the app, leaving sign-in unable to complete.
 
 ```sh
 npm install
-npm run build:web   # clone + build openframe-oss-frontend, stage into www/
+FRONTEND_REF=main npm run build:web   # clone + build openframe-oss-frontend, stage into www/
 npm run dev         # tauri dev
 ```
 
@@ -50,7 +50,7 @@ bakes no host.
 ```sh
 make lint     # rustfmt --check + clippy -D warnings
 make test     # cargo test
-make build OPENFRAME_SHARED_HOST_URL=https://auth.example.com
+make build OPENFRAME_SHARED_HOST_URL=https://auth.example.com FRONTEND_REF=1.0.100
 ```
 
 | Variable | Purpose |
@@ -60,12 +60,23 @@ make build OPENFRAME_SHARED_HOST_URL=https://auth.example.com
 | `TARGET` | Rust target triple for cross-compilation. |
 | `BUNDLES` | Bundle subset, e.g. `BUNDLES=app` for an unsigned macOS `.app`. |
 | `FRONTEND_DIR` | Use an existing frontend checkout instead of cloning. No git operations are run against it — this is the local dev loop. |
-| `FRONTEND_REF` | Frontend branch or tag to build. Default `main`. |
+| `FRONTEND_REF` | **Required unless `FRONTEND_DIR` is set.** Frontend git tag or branch to build; no default, so a build never silently tracks `main`. A release uses the frontend image tag prod runs (see [Releasing](#releasing)). |
 | `FRONTEND_REPO` | Frontend origin, if not the public repo. |
 
 Code signing and notarization are deliberately **not** in the Makefile — they run
 against the produced artifact, which is why `tauri.conf.json` sets
 `certificateThumbprint: null`.
+
+## Releasing
+
+`release.yml` on `workflow_dispatch` takes a mandatory `frontend_tag`: the
+openframe-oss-frontend image tag prod runs, `openframe-saas.frontend.image.tag`
+in `manifests/tenant/values-prod.yaml` of openframe-saas-tenant. The pipeline
+resolves the frontend git tag of the same name (the frontend release workflow
+creates a GitHub release for every released image) and builds the static export
+from that commit. Pushes to `main` build the rolling
+`latest` prerelease from frontend `main`, the same source as the dev
+environment's `latest` image.
 
 ## Configuration
 

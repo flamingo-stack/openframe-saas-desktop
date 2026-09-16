@@ -10,8 +10,8 @@
 #                                    is required — no `main` default, so a build
 #                                    never silently ships the frontend's tip. A
 #                                    release passes the frontend image tag prod
-#                                    runs; the frontend release workflow pushes
-#                                    a git tag of the same name at that commit.
+#                                    runs; the frontend release workflow tags
+#                                    that commit with a GitHub release.
 #
 # Mirrors openframe-mobile/scripts/build-web.sh, with one difference: no
 # inject-env.mjs step — the desktop shell injects window.__ENV at RUNTIME (see

@@ -46,11 +46,9 @@ jobs:
     with:
       version: ${{ inputs.version }}
 
-  # Pins the bundled frontend to what prod runs. A dispatch must name a published
-  # image tag, resolved to the git tag of the same name (the frontend release
-  # workflow pushes one per released image); a push tracks frontend main, the same
-  # source as the dev environment's 'latest' image. Fails here, before three
-  # build legs spend their minutes.
+  # Pins the bundled frontend: a dispatch to the git tag the frontend release
+  # created with the image prod runs, a push to frontend main (the dev 'latest'
+  # image's source). Fails here, before three build legs spend their minutes.
   frontend:
     name: Resolve Frontend
     permissions: {}
@@ -62,29 +60,14 @@ jobs:
       - name: Resolve frontend ref
         id: resolve
         env:
-          TAG: ${{ inputs.frontend_tag }}
-          REPO: https://github.com/flamingo-stack/openframe-oss-frontend
-          IMAGE: flamingo-stack/openframe-oss-frontend/openframe-oss-frontend
+          REF: ${{ inputs.frontend_tag || 'main' }}
+          KIND: ${{ inputs.frontend_tag && 'tags' || 'heads' }}
         run: |
           set -euo pipefail
-          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
-            [[ "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::frontend_tag must be an x.y.z frontend image tag, got '${TAG:-<empty>}'"; exit 1; }
-            # A git tag alone proves nothing shipped; the image is what the manifests pin.
-            token=$(curl -fsS "https://ghcr.io/token?scope=repository:$IMAGE:pull" | jq -r .token)
-            code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" \
-              -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json" \
-              "https://ghcr.io/v2/$IMAGE/manifests/$TAG")
-            [ "$code" = 200 ] || { echo "::error::ghcr.io/$IMAGE:$TAG does not exist (HTTP $code). Release the frontend first."; exit 1; }
-            # An annotated tag lists twice with the peeled commit last; a lightweight one once.
-            sha=$(git ls-remote --exit-code "$REPO" "refs/tags/$TAG" "refs/tags/$TAG^{}" | tail -1 | cut -f1) \
-              || { echo "::error::openframe-oss-frontend has no git tag $TAG. Its release workflow tags each released commit; an image from before that needs the tag pushed by hand."; exit 1; }
-            ref=$TAG
-          else
-            ref=main
-            sha=$(git ls-remote --exit-code "$REPO" "refs/heads/$ref" | cut -f1)
-          fi
-          echo "frontend: $ref @ $sha"
-          { echo "ref=$ref"; echo "sha=$sha"; } >> "$GITHUB_OUTPUT"
+          sha=$(git ls-remote --exit-code https://github.com/flamingo-stack/openframe-oss-frontend "refs/$KIND/$REF" | cut -f1) \
+            || { echo "::error::openframe-oss-frontend has no refs/$KIND/$REF; a frontend release creates its tag."; exit 1; }
+          echo "frontend: $REF @ $sha"
+          { echo "ref=$REF"; echo "sha=$sha"; } >> "$GITHUB_OUTPUT"
 
   build:
     name: "Build: ${{ matrix.leg }}"

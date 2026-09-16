@@ -36,10 +36,10 @@ The ref is `FRONTEND_REF`, and it is required: there is no `main` default, so a
 build never silently ships whatever the frontend's tip happens to be. A release
 passes the frontend image tag prod runs (`openframe-saas.frontend.image.tag` in
 openframe-saas-tenant's `manifests/tenant/values-prod.yaml`); the frontend's
-release workflow pushes a git tag of the same name at the built commit, and
-`release.yml` verifies both the image and the tag exist before any build leg
-starts. Only the rolling `latest` build from a push to `main` tracks frontend
-`main`, matching the dev environment's `latest` image.
+release workflow creates a GitHub release of the same name at the built commit,
+and `release.yml` verifies the tag exists before any build leg starts. Only the
+rolling `latest` build from a push to `main` tracks frontend `main`, matching the
+dev environment's `latest` image.
 
 `www/` is a generated artifact. `tauri.conf.json` sets `frontendDist: "../www"`,
 and `generate_context!` embeds the directory **at compile time** — so `www/` must

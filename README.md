@@ -72,9 +72,9 @@ against the produced artifact, which is why `tauri.conf.json` sets
 `release.yml` on `workflow_dispatch` takes a mandatory `frontend_tag`: the
 openframe-oss-frontend image tag prod runs, `openframe-saas.frontend.image.tag`
 in `manifests/tenant/values-prod.yaml` of openframe-saas-tenant. The pipeline
-checks that image exists on ghcr.io, resolves the frontend git tag of the same
-name (the frontend release workflow pushes one for every released image), and
-builds the static export from that commit. Pushes to `main` build the rolling
+resolves the frontend git tag of the same name (the frontend release workflow
+creates a GitHub release for every released image) and builds the static export
+from that commit. Pushes to `main` build the rolling
 `latest` prerelease from frontend `main`, the same source as the dev
 environment's `latest` image.
 

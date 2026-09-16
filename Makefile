@@ -3,7 +3,7 @@
 # Mirrors clients/openframe-chat/Makefile in openframe-oss-tenant so the same CI
 # shape drives both:
 #   make lint
-#   make build TARGET=<rust-target> OPENFRAME_VERSION=<v> [BUNDLES=app]
+#   make build TARGET=<rust-target> OPENFRAME_VERSION=<v> FRONTEND_REF=<tag> [BUNDLES=app]
 #
 # Two differences, both forced by this shell bundling the openframe-frontend
 # static export rather than building its own UI:
@@ -57,8 +57,9 @@ deps:
 	$(NPM) ci
 
 # Stage the openframe-oss-frontend static export into www/. Clones/refreshes
-# .frontend/ by default; FRONTEND_DIR=<path> uses an existing checkout instead,
-# FRONTEND_REF=<branch|tag> pins the ref.
+# .frontend/ at FRONTEND_REF=<tag|branch> — required; a release passes the
+# frontend image tag prod runs. FRONTEND_DIR=<path> uses an existing checkout
+# instead and needs no ref.
 web:
 	$(NPM) run build:web
 

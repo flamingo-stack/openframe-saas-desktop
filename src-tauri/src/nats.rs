@@ -6,6 +6,15 @@
 // token refresh plugs in. Ported from openframe-chat's
 // nats_bridge/connection.rs.
 //
+// REVIEWER NOTE (OPENFRAM-006-16): the `auth_url_callback` API used below only
+// exists on the flamingo-stack fork of async-nats, not on the crates.io
+// release. Confirm src-tauri/Cargo.toml still pins this dependency to the git
+// source `https://github.com/flamingo-stack/nats.rs.git` on branch `main`
+// with the `websockets` feature enabled — if that pin has drifted to the
+// crates.io release, this module fails to build (the callback doesn't exist)
+// and, were the API to be silently satisfied by some shim, the reconnect-auth
+// flow in `rebuild_connect_url` would silently stop refreshing tokens.
+//
 // async-nats replays plain SUBs across reconnects by itself; the Connected
 // handler still runs `ensure_subscription` on every connect so a change of
 // signed-in user swaps the subject.
@@ -57,6 +66,12 @@ struct Connector {
     /// Connected would then see a matching subject and skip subscribing —
     /// silence until restart.
     session: tokio::sync::Mutex<()>,
+    /// Bumped by [`reconnect`] every time it clears the connection slot, and
+    /// checked by [`resubscribe`] after it (re-)acquires `session`. A
+    /// resubscribe that lands in the teardown-to-re-dial window sees a stale
+    /// generation and retries instead of silently no-oping against a `None`
+    /// client, so a resubscribe request is never simply lost.
+    generation: AtomicU32,
 }
 
 /// Tenant gateway to dial — the notification subject is per-user on the
@@ -98,6 +113,7 @@ pub(crate) fn spawn(app: AppHandle) {
         auth_failures: AtomicU32::new(0),
         dialing: AtomicBool::new(false),
         session: tokio::sync::Mutex::new(()),
+        generation: AtomicU32::new(0),
     });
     app.manage(connector.clone());
     tauri::async_runtime::spawn(async move { run(connector).await });
@@ -109,17 +125,39 @@ pub(crate) fn spawn(app: AppHandle) {
 /// other thing that subscribes — without this the plane would wait for a
 /// reconnect that may never come. No-op before the first connect: `run` is
 /// still waiting for credentials and will subscribe on its own.
+///
+/// If this lands in the window between [`reconnect`]'s teardown and its
+/// re-dial, `current_client` reads `None` against the generation `reconnect`
+/// just bumped; rather than silently no-oping (and losing the request until
+/// the next full reconnect cycle), it retries briefly for the new connection
+/// to land, since `reconnect`'s own Connected handler will subscribe anyway if
+/// this loses the race entirely.
 pub(crate) fn resubscribe(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let Some(connector) = app.try_state::<Arc<Connector>>().map(|s| s.inner().clone()) else {
             return;
         };
-        let _session = connector.session.lock().await;
-        let client = current_client(&connector).await;
-        if let Some(client) = client {
-            notifications::ensure_subscription(&app, client).await;
+        for attempt in 0..10 {
+            let generation_before = connector.generation.load(Ordering::Acquire);
+            let _session = connector.session.lock().await;
+            let client = current_client(&connector).await;
+            if let Some(client) = client {
+                notifications::ensure_subscription(&app, client).await;
+                return;
+            }
+            drop(_session);
+            // No client stored. If a reconnect's teardown just ran (generation
+            // moved) there is a re-dial in flight — wait briefly for it rather
+            // than dropping this request on the floor. If no teardown ever ran
+            // (generation unchanged, e.g. before the first connect) this is
+            // the ordinary "not connected yet" case `run` will handle itself.
+            if attempt == 0 && connector.generation.load(Ordering::Acquire) == generation_before {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        log::warn!("[nats] resubscribe: gave up waiting for a connection to re-dial");
     });
 }
 
@@ -142,9 +180,15 @@ pub(crate) fn reconnect(app: &AppHandle) {
             notifications::drop_subscription(&app, "tenant changed").await;
             *connector.connection.write().await = None;
             connector.auth_failures.store(0, Ordering::Relaxed);
+            // Signal a teardown happened, so a resubscribe that reads `None`
+            // in the window after this lock is released knows to retry
+            // instead of silently no-oping.
+            connector.generation.fetch_add(1, Ordering::AcqRel);
         }
         // Released first: run() parks until the new tenant's credentials land,
         // and holding the session lock through that would stall resubscribe.
+        // A resubscribe landing in this window now sees the bumped generation
+        // and retries rather than losing the request; see `resubscribe`.
         run(connector).await;
     });
 }

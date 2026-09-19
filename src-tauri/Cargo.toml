@@ -51,7 +51,7 @@ uuid = { version = "1", features = ["v4"] }
 # for the class object that serves it). winreg registers both that activator's
 # CLSID and the openframe-console:// scheme the toast body still activates.
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.61", features = [
+windows = { version = "=0.61.0", features = [
     "Data_Xml_Dom",
     "UI_Notifications",
     "Win32_Foundation",
@@ -64,7 +64,10 @@ windows = { version = "0.61", features = [
 # Bump it in lockstep with `windows`: if the two resolve to different major
 # versions the macro's `::windows_core::IUnknownImpl` stops satisfying the
 # `_Impl` supertrait, and the error points nowhere near this file.
-windows-core = "0.61"
+# Both are pinned to exact versions (=) rather than caret ranges so that
+# bumping one without the other fails the build immediately at `cargo update`
+# / `cargo build` instead of silently resolving to mismatched majors.
+windows-core = "=0.61.0"
 winreg = "0.52"
 
 # UNUserNotificationCenter backend (clicks survive the process, unlike the
@@ -94,3 +97,4 @@ objc2-user-notifications = { version = "0.3.2", features = [
     "UNNotificationTrigger",
     "UNUserNotificationCenter",
 ] }
+

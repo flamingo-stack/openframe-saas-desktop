@@ -5,6 +5,9 @@ paths:
   .github/workflows/doc-orchestrator.yml:
     ignore:
       - '.+'
+  .github/workflows/code-documentation.yml:
+    ignore:
+      - '.+'
   .github/workflows/flamingo-code-review.yml:
     ignore:
       - '.+'

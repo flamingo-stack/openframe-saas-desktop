@@ -33,7 +33,7 @@ jobs:
 
       - uses: ./.github/steps/yaml-lint
 
-      - uses: docker://rhysd/actionlint:1.7.7
+      - uses: docker://rhysd/actionlint:1.7.12
         with:
           args: -color
 

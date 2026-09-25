@@ -1,6 +1,7 @@
 # CODEOWNERS
 # Last-match-wins: put broader patterns above more specific ones.
 # Docs: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
-*                          @flamingo-stack/client-engineers @flamingo-stack/tech-leads @flamingo-stack/tech-heads-of
+*                          @flamingo-stack/frontend-engineers
+/src-tauri/                @flamingo-stack/frontend-engineers @flamingo-stack/client-engineers
 
 /.github/CODEOWNERS        @flamingo-stack/devops-engineers

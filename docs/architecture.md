@@ -27,8 +27,8 @@ viability and cold-start time.
 ## Bundle pipeline
 
 `scripts/build-web.sh` (wrapped by `make web`, aliased `npm run build:web`)
-clones or refreshes the frontend into git-ignored `.frontend/` — shallow, single
-ref — installs, runs `OPENFRAME_BUILD_TARGET=export npm run build`, and copies
+clones the frontend into git-ignored `.frontend/` — shallow, single ref, fresh on
+every build so a tag checkout keeps its tag for the bundle's version stamp — installs, runs `OPENFRAME_BUILD_TARGET=export npm run build`, and copies
 `dist/` to `www/`. `FRONTEND_DIR` points it at an existing checkout instead and
 runs no git operations against it.
 

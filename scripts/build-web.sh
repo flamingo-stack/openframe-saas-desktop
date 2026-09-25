@@ -5,8 +5,9 @@
 # Source of the frontend, in order:
 #   FRONTEND_DIR=/path/to/checkout   use an existing working copy as-is (no git
 #                                    operations — this is the local dev loop)
-#   otherwise                        clone/refresh FRONTEND_REPO at FRONTEND_REF
-#                                    into .frontend/ (git-ignored). FRONTEND_REF
+#   otherwise                        fresh shallow clone of FRONTEND_REPO at
+#                                    FRONTEND_REF into .frontend/ (git-ignored),
+#                                    re-cloned on every build. FRONTEND_REF
 #                                    is required — no `main` default, so a build
 #                                    never silently ships the frontend's tip. A
 #                                    release passes the frontend image tag prod
@@ -42,19 +43,13 @@ else
     exit 1
   fi
   # Shallow, single-ref: this is a build input, not something to develop in.
-  if [ -d "$CHECKOUT/.git" ]; then
-    echo "▸ Refreshing $CHECKOUT ($FRONTEND_REF)…"
-    git -C "$CHECKOUT" remote set-url origin "$FRONTEND_REPO"
-    git -C "$CHECKOUT" fetch --depth 1 origin "$FRONTEND_REF"
-  else
-    echo "▸ Cloning $FRONTEND_REPO ($FRONTEND_REF) → .frontend/…"
-    rm -rf "$CHECKOUT"
-    git clone --depth 1 --branch "$FRONTEND_REF" "$FRONTEND_REPO" "$CHECKOUT"
-    git -C "$CHECKOUT" fetch --depth 1 origin "$FRONTEND_REF"
-  fi
-  # Hard reset, not merge: local edits here are never intentional.
-  git -C "$CHECKOUT" checkout --quiet --detach FETCH_HEAD
-  git -C "$CHECKOUT" clean -qfd
+  # Re-cloned every time rather than refreshed in place: fetching a tag into an
+  # existing shallow checkout leaves no local tag ref, so the bundle's
+  # `git describe` (its X-OpenFrame-Client version) would report a bare sha
+  # instead of the release. `npm ci` below reinstalls from scratch either way.
+  echo "▸ Cloning $FRONTEND_REPO ($FRONTEND_REF) → .frontend/…"
+  rm -rf "$CHECKOUT"
+  git -c advice.detachedHead=false clone --quiet --depth 1 --branch "$FRONTEND_REF" "$FRONTEND_REPO" "$CHECKOUT"
   FRONTEND_DIR="$CHECKOUT"
   echo "▸ Frontend $FRONTEND_REF at $(git -C "$CHECKOUT" rev-parse --short HEAD)"
 fi

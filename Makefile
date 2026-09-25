@@ -11,6 +11,12 @@
 #     bundle is embedded by generate_context! at compile time, so every Rust
 #     target needs www/ to exist — hence the placeholder dependency on lint/test.
 #   - the shared auth host is baked in at compile time (see below).
+#
+# `make build` is the CI path: tauri.conf.json asks for updater artifacts, which
+# fail without TAURI_SIGNING_PRIVATE_KEY. A local unsigned .app skips them:
+#   make web FRONTEND_DIR=<frontend checkout>
+#   OPENFRAME_SHARED_HOST_URL=<host> npx tauri build --bundles app \
+#     --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
 CARGO ?= cargo
 NPM ?= npm

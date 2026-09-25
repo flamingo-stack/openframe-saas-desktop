@@ -2,7 +2,7 @@
 # overwritten on the next sync, so findings must be fixed in the hub template.
 # YAML syntax is still enforced by the yaml-lint step.
 paths:
-  .github/workflows/doc-orchestrator.yml:
+  .github/workflows/code-documentation.yml:
     ignore:
       - '.+'
   .github/workflows/flamingo-code-review.yml:

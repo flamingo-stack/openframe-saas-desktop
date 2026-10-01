@@ -259,9 +259,17 @@ fn toast_xml(
 ) -> String {
     use crate::notifications::truncate_for_notification;
 
-    // Escaped once: the body click's target and the "Open" button's target are
-    // the same URI and must stay identical.
-    let uri = escape_xml(&crate::notifications::click_uri(click));
+    // Percent-encoded against the canonical UNRESERVED set before being XML-
+    // escaped: the raw URI can carry a click payload's own path/query
+    // characters, and `escape_xml` alone only guarantees the document parses —
+    // it does nothing to keep those characters from being interpreted as part
+    // of the `openframe-console://` URI itself. Escaped once: the body click's
+    // target and the "Open" button's target are the same URI and must stay
+    // identical.
+    let uri = escape_xml(&utf8_percent_encode(
+        &crate::notifications::click_uri(click),
+        UNRESERVED,
+    ).to_string());
     // Clamped before anything copies it: the title goes into the visual text and
     // into every button's arguments.
     let title = truncate_for_notification(title, TITLE_LIMIT);

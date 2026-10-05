@@ -183,7 +183,12 @@ async fn post_json(
     log::warn!("[chat-api] POST {path} rejected: HTTP {status}");
     Err(PostError::new(
         Some(status),
-        reason.unwrap_or_else(|| format!("HTTP {status}")),
+        // Per OPENFRAM-006-13: notification banners must show human-readable
+        // prose, never a raw status line. When the gateway sent no usable
+        // message, fall back to generic actionable text instead of `HTTP {status}`.
+        reason.unwrap_or_else(|| {
+            "the gateway rejected this request — please try again, or open OpenFrame".to_string()
+        }),
     ))
 }
 

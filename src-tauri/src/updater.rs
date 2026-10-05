@@ -379,6 +379,19 @@ pub async fn update_apply_now(app: AppHandle, window: WebviewWindow) -> Result<(
     }
 }
 
+/// NATS subjects are dot-delimited, with `*` and `>` reserved as wildcards, so a
+/// `user_id` containing any of those could smuggle the message into a different
+/// subject hierarchy than the literal `user.<id>.installed-agent` we intend.
+/// The claim is expected to be an opaque server-issued identifier and should
+/// never contain these characters; reject it outright rather than attempt to
+/// escape it, since NATS subjects have no escaping mechanism.
+fn is_valid_nats_subject_token(user_id: &str) -> bool {
+    !user_id.is_empty()
+        && !user_id
+            .chars()
+            .any(|c| c == '.' || c == '*' || c == '>' || c.is_whitespace())
+}
+
 pub(crate) async fn publish_version_report(app: &AppHandle, client: &async_nats::Client) {
     let Some(user_id) = tokens::load_tokens(app)
         .access_token
@@ -388,6 +401,10 @@ pub(crate) async fn publish_version_report(app: &AppHandle, client: &async_nats:
         log::debug!("[updater] no userId in token — skipping version report");
         return;
     };
+    if !is_valid_nats_subject_token(&user_id) {
+        log::warn!("[updater] userId claim is not a valid NATS subject token — skipping version report");
+        return;
+    }
     let version = app.package_info().version.to_string();
     let subject = format!("user.{user_id}.installed-agent");
     let payload = match serde_json::to_vec(&InstalledAgentReport {

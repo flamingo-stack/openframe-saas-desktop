@@ -39,20 +39,33 @@ jobs:
           echo "last published release: ${latest:-<none>}"
           echo "latest=${latest}" >> "$GITHUB_OUTPUT"
 
-      - name: Resolve version (push)
-        id: version_push
-        if: github.event_name != 'workflow_dispatch'
+      - name: Compute next patch version
+        id: next_patch
         env:
           LATEST: ${{ steps.published.outputs.latest }}
-          RUN_NUMBER: ${{ github.run_number }}
         run: |
           set -euo pipefail
           if [[ -n "$LATEST" ]]; then
             IFS='.' read -r cur_major cur_minor cur_patch <<< "$LATEST"
-            app_version="${cur_major}.${cur_minor}.$((cur_patch + 1))-dev.${RUN_NUMBER}"
+            if ! [[ "$cur_major" =~ ^[0-9]+$ && "$cur_minor" =~ ^[0-9]+$ && "$cur_patch" =~ ^[0-9]+$ ]]; then
+              echo "::error::Invalid published version format: ${LATEST} (expected x.y.z)"
+              exit 1
+            fi
+            next_patch="${cur_major}.${cur_minor}.$((cur_patch + 1))"
           else
-            app_version="0.0.0-dev.${RUN_NUMBER}"
+            next_patch="0.0.0"
           fi
+          echo "next_patch=${next_patch}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve version (push)
+        id: version_push
+        if: github.event_name != 'workflow_dispatch'
+        env:
+          NEXT_PATCH: ${{ steps.next_patch.outputs.next_patch }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          app_version="${NEXT_PATCH}-dev.${RUN_NUMBER}"
           echo "push event: version resolves to latest, app version ${app_version}"
           echo "version=latest" >> "$GITHUB_OUTPUT"
           echo "app_version=${app_version}" >> "$GITHUB_OUTPUT"
@@ -63,6 +76,7 @@ jobs:
         env:
           INPUT_VERSION: ${{ inputs.version }}
           LATEST: ${{ steps.published.outputs.latest }}
+          NEXT_PATCH: ${{ steps.next_patch.outputs.next_patch }}
         run: |
           set -euo pipefail
 
@@ -85,7 +99,7 @@ jobs:
           IFS='.' read -r cur_major cur_minor cur_patch <<< "$LATEST"
           next_major="$((cur_major + 1)).0.0"
           next_minor="${cur_major}.$((cur_minor + 1)).0"
-          next_patch="${cur_major}.${cur_minor}.$((cur_patch + 1))"
+          next_patch="$NEXT_PATCH"
 
           if [ -z "$INPUT_VERSION" ]; then
             version="$next_patch"
@@ -101,3 +115,4 @@ jobs:
 
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "app_version=${version}" >> "$GITHUB_OUTPUT"
+

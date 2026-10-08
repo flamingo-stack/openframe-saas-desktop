@@ -28,8 +28,9 @@ viability and cold-start time.
 
 `scripts/build-web.sh` (wrapped by `make web`, aliased `npm run build:web`)
 clones the frontend into git-ignored `.frontend/` — shallow, single ref, fresh on
-every build so a tag checkout keeps its tag for the bundle's version stamp — installs, runs `OPENFRAME_BUILD_TARGET=export npm run build`, and copies
-`dist/` to `www/`. `FRONTEND_DIR` points it at an existing checkout instead and
+every build so a tag checkout keeps its tag for the bundle's version stamp — installs, runs `OPENFRAME_BUILD_TARGET=export npm run build` in the web app
+(`apps/web/` since the frontend's 1.0.147 monorepo move, the repo root before),
+and copies its `dist/` to `www/`. `FRONTEND_DIR` points it at an existing checkout instead and
 runs no git operations against it.
 
 The ref is `FRONTEND_REF`, and it is required: there is no `main` default, so a

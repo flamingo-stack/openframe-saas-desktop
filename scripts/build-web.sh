@@ -54,23 +54,37 @@ else
   echo "▸ Frontend $FRONTEND_REF at $(git -C "$CHECKOUT" rev-parse --short HEAD)"
 fi
 
-echo "▸ Installing frontend dependencies…"
-if [ -f "$FRONTEND_DIR/package-lock.json" ]; then
-  ( cd "$FRONTEND_DIR" && npm ci )
+# openframe-oss-frontend became a monorepo at 1.0.147 and the web app moved to
+# apps/web; earlier tags have it at the root. FRONTEND_DIR may name either the
+# repo root or apps/web itself.
+WEB_DIR="$FRONTEND_DIR"
+if [ -f "$FRONTEND_DIR/apps/web/package.json" ]; then
+  WEB_DIR="$FRONTEND_DIR/apps/web"
+fi
+# Without this, npm walks up to the nearest package.json — this repo's — and
+# `npm run build` becomes `tauri build` against a www/ that doesn't exist yet.
+if [ ! -f "$WEB_DIR/package.json" ]; then
+  echo "✗ no web app in $FRONTEND_DIR (expected package.json there or in apps/web/)" >&2
+  exit 1
+fi
+
+echo "▸ Installing frontend dependencies ($WEB_DIR)…"
+if [ -f "$WEB_DIR/package-lock.json" ]; then
+  ( cd "$WEB_DIR" && npm ci )
 else
-  ( cd "$FRONTEND_DIR" && npm install )
+  ( cd "$WEB_DIR" && npm install )
 fi
 
 echo "▸ Building static export…"
-( cd "$FRONTEND_DIR" && OPENFRAME_BUILD_TARGET="export" npm run build )
+( cd "$WEB_DIR" && OPENFRAME_BUILD_TARGET="export" npm run build )
 
-if [ ! -d "$FRONTEND_DIR/dist" ]; then
-  echo "✗ export produced no dist/ in $FRONTEND_DIR" >&2
+if [ ! -d "$WEB_DIR/dist" ]; then
+  echo "✗ export produced no dist/ in $WEB_DIR" >&2
   exit 1
 fi
 
 echo "▸ Staging export bundle → www/"
 rm -rf "$HERE/www"
-cp -R "$FRONTEND_DIR/dist" "$HERE/www"
+cp -R "$WEB_DIR/dist" "$HERE/www"
 
 echo "✓ web bundle staged. Next: npm run dev (or make build)"

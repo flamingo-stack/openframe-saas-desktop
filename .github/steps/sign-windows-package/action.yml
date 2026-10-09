@@ -44,6 +44,13 @@ inputs:
   target:
     description: 'Rust build target (e.g. x86_64-pc-windows-msvc)'
     required: true
+  require_signing:
+    description: >-
+      When "true", fail this step instead of warning if azure_tenant_id is
+      unset. Set to "true" for release builds so an unsigned Windows
+      installer can never be published as a tagged release.
+    required: false
+    default: 'false'
 
 runs:
   using: "composite"
@@ -54,6 +61,7 @@ runs:
         TENANT: ${{ inputs.azure_tenant_id }}
         TARGET_PATH: ${{ inputs.target_path }}
         TARGET: ${{ inputs.target }}
+        REQUIRE_SIGNING: ${{ inputs.require_signing }}
       run: |
         set -euo pipefail
         NSIS_DIR="$TARGET_PATH/$TARGET/release/bundle/nsis"
@@ -66,6 +74,10 @@ runs:
         ls -l "$NSIS_DIR"
 
         if [[ -z "$TENANT" ]]; then
+          if [[ "$REQUIRE_SIGNING" == "true" ]]; then
+            echo "::error::AZURE_TENANT_ID is not set — the Windows installer would NOT be Authenticode-signed. Failing because require_signing is true."
+            exit 1
+          fi
           echo "SIGN_WINDOWS=false" >> "$GITHUB_ENV"
           echo "::warning::AZURE_TENANT_ID is not set — the Windows installer is NOT Authenticode-signed. SmartScreen will warn on download and install."
         else

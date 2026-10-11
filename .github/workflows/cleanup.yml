@@ -30,16 +30,35 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           MAX_AGE_DAYS: "60"
+          # Comma-separated list of glob patterns (matched with bash's [[ == ]])
+          # that must never be auto-deleted, even if unprotected and stale.
+          # This guards branches referenced elsewhere (e.g. tenant YAML
+          # `branch:` pins per OPENFRAM-005-5/006-5) that are not marked
+          # "protected" in GitHub but must not be silently removed.
+          BRANCH_DENYLIST: "release/*,tenants/*,main,master"
         run: |
           set -o pipefail
           CUTOFF=$(date -u -d "$MAX_AGE_DAYS days ago" +%Y-%m-%dT%H:%M:%SZ)
           echo "Deleting branches with no commit since $CUTOFF"
 
+          IFS=',' read -r -a DENY_PATTERNS <<< "$BRANCH_DENYLIST"
+
           gh api --paginate "repos/$REPO/branches?protected=false&per_page=100" \
             --jq '.[].name' |
           while read -r br; do
+            skip=false
+            for pattern in "${DENY_PATTERNS[@]}"; do
+              if [[ "$br" == $pattern ]]; then
+                echo "Skipping $br (matches denylist pattern '$pattern')"
+                skip=true
+                break
+              fi
+            done
+            $skip && continue
+
             last=$(gh api "repos/$REPO/commits/$br" --jq '.commit.committer.date')
             [[ "$last" < "$CUTOFF" ]] || continue
             echo "Deleting $br (last commit $last)"
             gh api --silent -X DELETE "repos/$REPO/git/refs/heads/$br"
           done
+

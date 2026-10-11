@@ -202,27 +202,16 @@ pub(crate) fn ensure_logo(app: &AppHandle) -> Option<&'static std::path::Path> {
     .as_deref()
 }
 
-/// Write the logo through a temporary and rename it into place, so a reader
-/// never sees a partial file — Windows caches whatever it read of the identity
-/// until the notification service restarts, so being caught mid-write is not a
-/// mistake the next toast corrects.
-///
-/// Like `crate::write_atomic`, but the staging path carries the process id: two
-/// instances laying the same file down would otherwise share one temporary, and
-/// the second's write would truncate what the first is about to rename into
-/// place — reintroducing the torn file this exists to prevent.
+/// Write the logo through the shared atomic-write helper, so a reader never
+/// sees a partial file — Windows caches whatever it read of the identity until
+/// the notification service restarts, so being caught mid-write is not a
+/// mistake the next toast corrects. Delegating here keeps this the only place
+/// in the crate that stages a temp file and renames it into place, with the
+/// 0o600 permission hardening `crate::write_atomic` already applies on Unix.
 #[cfg(target_os = "windows")]
 fn write_logo(dir: &std::path::Path, path: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
-    // Cleaned up on either failure: the name carries a fresh process id every
-    // launch, so a staging file left behind is one nothing will ever reclaim.
-    let staged = std::fs::write(&tmp, TOAST_LOGO)
-        // Windows renames over an existing file here (MOVEFILE_REPLACE_EXISTING).
-        .and_then(|()| std::fs::rename(&tmp, path));
-    staged.inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })
+    crate::write_atomic(path, TOAST_LOGO)
 }
 
 /// Windows matches a tag verbatim and rejects `SetTag` for one it does not

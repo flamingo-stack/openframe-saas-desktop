@@ -107,7 +107,8 @@ struct Progress {
 }
 
 /// What went wrong, in the two terms the UI needs: a `kind` it can turn into
-/// copy and an action, and the raw message for the log.
+/// copy and an action, and the raw message — shown verbatim as the UI's detail
+/// line and logged, never matched on.
 ///
 /// The kind is decided here rather than by matching on the message text in
 /// TypeScript. `tauri_plugin_updater::Error`'s Display strings are not an
@@ -200,23 +201,24 @@ const ERROR_VIRUS_DELETED: i32 = 226;
 /// macOS unpacking into `$TMPDIR` and swapping the `.app` bundle (the plugin
 /// asks for an administrator password when the swap is refused, and reports a
 /// cancelled prompt as `PermissionDenied`); on Windows writing the installer
-/// into `%TEMP%`. A full disk is the rarest of these, so only `StorageFull`
-/// may say so.
+/// into `%TEMP%`. A full disk is the rarest of these, so only an actual
+/// out-of-space error may say so.
 fn classify_io(error: &std::io::Error) -> &'static str {
     use std::io::ErrorKind as K;
-    if cfg!(windows)
+    if cfg!(target_os = "windows")
         && matches!(
             error.raw_os_error(),
             Some(ERROR_VIRUS_INFECTED | ERROR_VIRUS_DELETED)
         )
     {
-        return "blocked";
+        return "security";
     }
     match error.kind() {
         K::StorageFull | K::QuotaExceeded => "disk",
-        // A fresh directory under %TEMP% that this process just created only
-        // refuses a write when something outside it intervenes.
-        K::PermissionDenied if cfg!(windows) => "blocked",
+        // Most often security software; an unwritable %TEMP% reads the same.
+        // An installer blocked at launch never gets here: the plugin ignores
+        // ShellExecuteW's result and exits.
+        K::PermissionDenied if cfg!(target_os = "windows") => "security",
         K::PermissionDenied => "permission",
         // The bundle lives where it can't be swapped in place: the mounted DMG,
         // Gatekeeper's read-only App Translocation copy, or another volume.
@@ -227,17 +229,16 @@ fn classify_io(error: &std::io::Error) -> &'static str {
 
 /// Why this install cannot update itself where it runs, decided before anything
 /// is downloaded. The plugin swaps the `.app` by renaming it, which a read-only
-/// mount refuses with `EROFS` — after the whole download, and again at every
-/// launch, since the silent startup pass would retry it each time.
+/// mount refuses (`EROFS` from a translocated copy, `EXDEV` from a disk image)
+/// — after the whole download, and again at every launch, since the silent
+/// startup pass would retry it each time. The paths are resolved the way the
+/// plugin resolves the bundle it will swap.
 fn in_place_blocker() -> Option<UpdateError> {
-    let exe = std::env::current_exe().ok()?;
+    let exe = tauri::utils::platform::current_exe().ok()?;
     if !crate::on_read_only_mount(&exe) {
         return None;
     }
-    let bundle = exe
-        .ancestors()
-        .find(|path| path.extension().is_some_and(|ext| ext == "app"))
-        .unwrap_or(&exe);
+    let bundle = tauri_plugin_updater::extract_path_from_executable(&exe).unwrap_or(exe);
     Some(UpdateError::location(format!(
         "{} is on a read-only volume",
         bundle.display()
@@ -361,20 +362,26 @@ async fn apply(
         // signature is verified after the download-finish callback already
         // recorded one.
         autostart::show_window_after_restart(app, false);
-        log::error!("[updater] {phase} failed ({}): {e}", classify(&e));
+        let io_detail = match &e {
+            tauri_plugin_updater::Error::Io(io) => Some((io.kind(), io.raw_os_error())),
+            _ => None,
+        };
+        let error = UpdateError::from_plugin(e);
+        log::error!(
+            "[updater] {phase} failed ({}): {}",
+            error.kind,
+            error.message
+        );
         // The plugin's text is the OS message alone. The kind and code pin the
         // cause; the executable path shows a launch from the DMG (`/Volumes/…`)
         // or from Gatekeeper's translocated copy (`…/AppTranslocation/…`).
-        if let tauri_plugin_updater::Error::Io(io) = &e {
+        if let Some((kind, os_error)) = io_detail {
             log::error!(
-                "[updater] io error: kind={:?} os_error={:?} exe={:?} temp_dir={:?}",
-                io.kind(),
-                io.raw_os_error(),
-                std::env::current_exe().ok(),
+                "[updater] io error: kind={kind:?} os_error={os_error:?} exe={:?} temp_dir={:?}",
+                tauri::utils::platform::current_exe().ok(),
                 std::env::temp_dir(),
             );
         }
-        let error = UpdateError::from_plugin(e);
         let _ = app.emit_to(MAIN_LABEL, EVENT_ERROR, error.clone());
         return Err(error);
     }
@@ -531,9 +538,13 @@ mod tests {
     }
 
     #[test]
-    fn plugin_io_errors_are_classified_by_their_kind() {
+    fn a_plugin_io_error_is_classified_by_its_kind() {
         let error = tauri_plugin_updater::Error::Io(Error::from(ErrorKind::StorageFull));
         assert_eq!(classify(&error), "disk");
+    }
+
+    #[test]
+    fn a_missing_temp_dir_is_not_reported_as_disk_space() {
         assert_eq!(
             classify(&tauri_plugin_updater::Error::TempDirNotFound),
             "unknown"
@@ -554,25 +565,28 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_bundle_that_cannot_be_swapped_in_place_asks_to_move_the_app() {
-        // EROFS (DMG / translocation), EXDEV (another volume), ENOSPC.
-        assert_eq!(classify_io(&Error::from_raw_os_error(30)), "location");
-        assert_eq!(classify_io(&Error::from_raw_os_error(18)), "location");
-        assert_eq!(classify_io(&Error::from_raw_os_error(28)), "disk");
+        assert_eq!(
+            classify_io(&Error::from_raw_os_error(libc::EROFS)),
+            "location"
+        );
+        assert_eq!(
+            classify_io(&Error::from_raw_os_error(libc::EXDEV)),
+            "location"
+        );
     }
 
-    #[cfg(windows)]
+    #[cfg(target_os = "windows")]
     #[test]
-    fn a_refused_installer_write_is_reported_as_blocked() {
+    fn a_refused_installer_write_names_security_software() {
         assert_eq!(
             classify_io(&Error::from_raw_os_error(ERROR_VIRUS_INFECTED)),
-            "blocked"
+            "security"
         );
         assert_eq!(
             classify_io(&Error::from_raw_os_error(ERROR_VIRUS_DELETED)),
-            "blocked"
+            "security"
         );
-        // ERROR_ACCESS_DENIED, ERROR_DISK_FULL.
-        assert_eq!(classify_io(&Error::from_raw_os_error(5)), "blocked");
-        assert_eq!(classify_io(&Error::from_raw_os_error(112)), "disk");
+        // ERROR_ACCESS_DENIED.
+        assert_eq!(classify_io(&Error::from_raw_os_error(5)), "security");
     }
 }

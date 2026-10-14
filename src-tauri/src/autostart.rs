@@ -687,15 +687,22 @@ fn binary(app: &AppHandle) -> Result<std::path::PathBuf, String> {
     tauri::process::current_binary(&app.env()).map_err(|e| e.to_string())
 }
 
-/// The binary, when it runs from a read-only mount (see
-/// [`crate::on_read_only_mount`]): a macOS App Translocation copy or a disk
-/// image. A login item pointing there is dead after the next reboot — and
-/// translocation picks a new path at every launch, so the reconcile would
-/// rewrite the registration every time without it ever working.
-fn ephemeral_binary(app: &AppHandle) -> Option<std::path::PathBuf> {
-    binary(app)
+/// Refuses to register a binary on a read-only mount (see
+/// [`crate::on_read_only_mount`]), even under a managed policy: a login item
+/// pointing there is dead after the next reboot, and translocation picks a new
+/// path at every launch, so the reconcile would rewrite the registration every
+/// time without it ever working.
+fn ensure_registrable(app: &AppHandle) -> Result<(), String> {
+    match binary(app)
         .ok()
         .filter(|exe| crate::on_read_only_mount(exe))
+    {
+        Some(exe) => Err(format!(
+            "{} is on a read-only volume — move the app to Applications first",
+            exe.display()
+        )),
+        None => Ok(()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -789,17 +796,6 @@ pub(crate) fn reconcile_on_startup(app: &AppHandle) {
         log::info!("[autostart] debug build — leaving the login registration alone");
         return;
     }
-    // Neither registered nor marked configured: the first launch from where the
-    // app stays repairs a stale registration or applies the default, as usual.
-    if let Some(exe) = ephemeral_binary(app) {
-        log::info!(
-            "[autostart] running from a read-only volume ({}) — leaving the login \
-             registration alone until the app is moved",
-            exe.display()
-        );
-        sync_tray(app);
-        return;
-    }
     let app = app.clone();
     std::thread::spawn(move || {
         {
@@ -834,7 +830,12 @@ pub(crate) fn reconcile_on_startup(app: &AppHandle) {
             let decision = decide(facts);
             let outcome = match decision.action {
                 Action::Nothing => Ok("already as it should be"),
-                Action::Register => backend::enable(&app).map(|()| "registered for login"),
+                // Refused through the error arm, which leaves the default
+                // unapplied: the first launch from where the app stays
+                // registers as usual. The legacy cleanup and removals still run.
+                Action::Register => ensure_registrable(&app)
+                    .and_then(|()| backend::enable(&app))
+                    .map(|()| "registered for login"),
                 Action::Unregister => backend::disable(&app).map(|()| "removed from login"),
             };
             match outcome {
@@ -889,12 +890,7 @@ fn set(app: &AppHandle, enabled: bool) -> Result<Status, AutostartError> {
         return Err(AutostartError::enforced());
     }
     if enabled {
-        if let Some(exe) = ephemeral_binary(app) {
-            return Err(AutostartError::unavailable(format!(
-                "{} is on a read-only volume — move the app to Applications first",
-                exe.display()
-            )));
-        }
+        ensure_registrable(app).map_err(AutostartError::unavailable)?;
     }
     {
         let _serialized = lock(&REGISTRATION);
@@ -955,7 +951,7 @@ pub(crate) fn toggle_from_tray(app: &AppHandle) {
 /// though [`FLAG`] would otherwise keep it in the tray.
 ///
 /// A durable marker rather than the relaunch argv, because on Windows the
-/// relaunch is not ours to shape: `download_and_install` hands this process's
+/// relaunch is not ours to shape: the plugin's `install` hands this process's
 /// own argv to the installer — `/ARGS` for NSIS, `LAUNCHAPPARGS` for MSI — and
 /// then calls `std::process::exit(0)`, so nothing after it runs and
 /// `--autostart` is replayed whatever we do. The marker survives that, and works

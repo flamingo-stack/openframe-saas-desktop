@@ -429,9 +429,8 @@ pub(crate) fn write_atomic(path: &std::path::Path, data: &str) -> Result<(), Str
 
 /// Whether `path` sits on a read-only mount: on macOS, Gatekeeper's App
 /// Translocation copy (a quarantined app opened where it was downloaded) or a
-/// mounted disk image. Neither is where the app stays: the updater cannot swap
-/// the bundle there (`EROFS`), and a login item pointing at it is gone after
-/// the next reboot. `false` when it cannot be told.
+/// mounted disk image — places the app runs from but does not stay. `false`
+/// when it cannot be told.
 ///
 /// macOS only: elsewhere a read-only mount is not the app's home either way —
 /// a Linux AppImage always runs from one, and its updater replaces the image
@@ -1705,12 +1704,12 @@ mod tests {
         );
     }
 
+    // `/` is the sealed system snapshot, mounted read-only like a translocated
+    // copy or a disk image; the temp dir is on the writable Data volume, with
+    // /Applications.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_read_only_mount_is_told_apart_from_where_an_app_is_installed() {
-        // `/` is the sealed system snapshot, mounted read-only like a
-        // translocated copy or a disk image; the temp dir is on the writable
-        // Data volume, with /Applications.
         assert!(on_read_only_mount(std::path::Path::new("/")));
         assert!(!on_read_only_mount(&std::env::temp_dir()));
         assert!(!on_read_only_mount(std::path::Path::new("/Applications")));

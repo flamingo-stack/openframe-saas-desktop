@@ -152,15 +152,15 @@ impl UpdateError {
 }
 
 /// Coarse buckets, chosen so each one maps to a DIFFERENT thing to tell the
-/// user: retry, free up disk, or give up and reinstall. Variants that are
-/// platform-gated or that no bucket would change the advice for are left to the
-/// catch-all, which the UI words as a plain retry.
+/// user: retry, free up disk, get approval, move the app, or give up. Variants
+/// that are platform-gated or that no bucket would change the advice for are
+/// left to the catch-all, which the UI words as a plain retry.
 fn classify(error: &tauri_plugin_updater::Error) -> &'static str {
     use tauri_plugin_updater::Error as E;
     match error {
         E::Reqwest(_) | E::Network(_) | E::ReleaseNotFound => "network",
         E::Minisign(_) | E::Base64(_) | E::SignatureUtf8(_) => "signature",
-        E::Io(_) | E::TempDirNotFound | E::FailedToDetermineExtractPath => "io",
+        E::Io(io) => classify_io(io),
         // Nothing the user did and nothing a retry fixes: this build has no
         // artifact for their platform, or the manifest we published is wrong.
         E::UnsupportedArch
@@ -173,6 +173,40 @@ fn classify(error: &tauri_plugin_updater::Error) -> &'static str {
         | E::InvalidUpdaterFormat
         | E::Semver(_)
         | E::Serialization(_) => "unavailable",
+        _ => "unknown",
+    }
+}
+
+/// Windows' codes for "security software took the file". std has no
+/// `ErrorKind` for them, so they arrive as `Uncategorized`.
+const ERROR_VIRUS_INFECTED: i32 = 225;
+const ERROR_VIRUS_DELETED: i32 = 226;
+
+/// The download is held in memory, so an IO error comes from the install: on
+/// macOS unpacking into `$TMPDIR` and swapping the `.app` bundle (the plugin
+/// asks for an administrator password when the swap is refused, and reports a
+/// cancelled prompt as `PermissionDenied`); on Windows writing the installer
+/// into `%TEMP%`. A full disk is the rarest of these, so only `StorageFull`
+/// may say so.
+fn classify_io(error: &std::io::Error) -> &'static str {
+    use std::io::ErrorKind as K;
+    if cfg!(windows)
+        && matches!(
+            error.raw_os_error(),
+            Some(ERROR_VIRUS_INFECTED | ERROR_VIRUS_DELETED)
+        )
+    {
+        return "blocked";
+    }
+    match error.kind() {
+        K::StorageFull | K::QuotaExceeded => "disk",
+        // A fresh directory under %TEMP% that this process just created only
+        // refuses a write when something outside it intervenes.
+        K::PermissionDenied if cfg!(windows) => "blocked",
+        K::PermissionDenied => "permission",
+        // The bundle lives where it can't be swapped in place: the mounted DMG,
+        // Gatekeeper's read-only App Translocation copy, or another volume.
+        K::ReadOnlyFilesystem | K::CrossesDevices if cfg!(target_os = "macos") => "location",
         _ => "unknown",
     }
 }
@@ -232,8 +266,10 @@ async fn apply(
     let mut last_emit: Option<std::time::Instant> = None;
 
     let installing_app = app.clone();
-    let result = update
-        .download_and_install(
+    // Two calls rather than `download_and_install`, which is exactly these two:
+    // the log has to say which one failed.
+    let result = match update
+        .download(
             move |chunk_len, total| {
                 downloaded += chunk_len;
                 // Throttled on the way OUT, not on the way in: every chunk is
@@ -270,20 +306,33 @@ async fn apply(
                 let _ = installing_app.emit_to(MAIN_LABEL, EVENT_INSTALLING, ());
             },
         )
-        .await;
+        .await
+    {
+        Ok(bytes) => update.install(bytes).map_err(|e| ("install", e)),
+        Err(e) => Err(("download", e)),
+    };
 
-    if let Err(e) = result {
-        // Reached only when the install failed and this process is still alive,
+    if let Err((phase, e)) = result {
+        // Reached only when the attempt failed and this process is still alive,
         // so no restart is coming and the request must not outlive the attempt.
-        // A signature failure lands here too, after the download-finish
-        // callback already recorded one.
+        // A signature failure lands here too, as a download failure: the
+        // signature is verified after the download-finish callback already
+        // recorded one.
         autostart::show_window_after_restart(app, false);
+        log::error!("[updater] {phase} failed ({}): {e}", classify(&e));
+        // The plugin's text is the OS message alone. The kind and code pin the
+        // cause; the executable path shows a launch from the DMG (`/Volumes/…`)
+        // or from Gatekeeper's translocated copy (`…/AppTranslocation/…`).
+        if let tauri_plugin_updater::Error::Io(io) = &e {
+            log::error!(
+                "[updater] io error: kind={:?} os_error={:?} exe={:?} temp_dir={:?}",
+                io.kind(),
+                io.raw_os_error(),
+                std::env::current_exe().ok(),
+                std::env::temp_dir(),
+            );
+        }
         let error = UpdateError::from_plugin(e);
-        log::error!(
-            "[updater] install failed ({}): {}",
-            error.kind,
-            error.message
-        );
         let _ = app.emit_to(MAIN_LABEL, EVENT_ERROR, error.clone());
         return Err(error);
     }
@@ -425,4 +474,63 @@ pub(crate) async fn publish_version_report(app: &AppHandle, client: &async_nats:
         }
     }
     log::warn!("[updater] version report gave up after {REPORT_RETRIES} attempts");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn only_a_full_disk_is_reported_as_disk_space() {
+        assert_eq!(classify_io(&Error::from(ErrorKind::StorageFull)), "disk");
+        assert_eq!(classify_io(&Error::from(ErrorKind::QuotaExceeded)), "disk");
+        assert_eq!(classify_io(&Error::from(ErrorKind::NotFound)), "unknown");
+    }
+
+    #[test]
+    fn plugin_io_errors_are_classified_by_their_kind() {
+        let error = tauri_plugin_updater::Error::Io(Error::from(ErrorKind::StorageFull));
+        assert_eq!(classify(&error), "disk");
+        assert_eq!(
+            classify(&tauri_plugin_updater::Error::TempDirNotFound),
+            "unknown"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_refused_admin_prompt_asks_for_approval() {
+        // What the plugin returns when the administrator prompt is cancelled.
+        let error = Error::new(
+            ErrorKind::PermissionDenied,
+            "Failed to move the new app into place",
+        );
+        assert_eq!(classify_io(&error), "permission");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_bundle_that_cannot_be_swapped_in_place_asks_to_move_the_app() {
+        // EROFS (DMG / translocation), EXDEV (another volume), ENOSPC.
+        assert_eq!(classify_io(&Error::from_raw_os_error(30)), "location");
+        assert_eq!(classify_io(&Error::from_raw_os_error(18)), "location");
+        assert_eq!(classify_io(&Error::from_raw_os_error(28)), "disk");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_refused_installer_write_is_reported_as_blocked() {
+        assert_eq!(
+            classify_io(&Error::from_raw_os_error(ERROR_VIRUS_INFECTED)),
+            "blocked"
+        );
+        assert_eq!(
+            classify_io(&Error::from_raw_os_error(ERROR_VIRUS_DELETED)),
+            "blocked"
+        );
+        // ERROR_ACCESS_DENIED, ERROR_DISK_FULL.
+        assert_eq!(classify_io(&Error::from_raw_os_error(5)), "blocked");
+        assert_eq!(classify_io(&Error::from_raw_os_error(112)), "disk");
+    }
 }

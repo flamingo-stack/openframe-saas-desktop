@@ -185,7 +185,7 @@ src-tauri/
   src/nats.rs         NATS-over-WebSocket connection lifecycle
   src/notifications.rs  subscription, dispatch, click delivery
   src/notification_actions.rs  what a notification button does, and its session gate
-  src/chat_api.rs     the REST calls a button completes without a window
+  src/chat_api.rs     the GraphQL mutations a button completes without a window
   src/macos_un.rs     UNUserNotificationCenter backend
   src/windows_toast.rs  toast XML + the button-argument codec
   src/windows_activator.rs  COM activator the toast buttons activate

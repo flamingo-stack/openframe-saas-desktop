@@ -1,24 +1,31 @@
 // Authenticated chat-service calls the shell makes on its own, with no webview
 // involved: the notification action buttons (approve/reject an AI tool request,
 // reply to a Mingo message) complete here, so the decision never has to open a
-// window. Same endpoints and payloads as the frontend's mingo-api-service, in
-// bearer mode.
+// window. Same GraphQL mutations as the frontend's ticketService, in bearer mode.
 //
 // Base is the **tenant** host learned at login (`learned_host`), not the shared
 // auth host: /chat lives on the tenant gateway.
 
 use std::time::Duration;
 
-use percent_encoding::utf8_percent_encode;
 use tauri::AppHandle;
 
 use crate::{
     load_config,
     notifications::{truncate_for_notification, BODY_CHARS},
-    tenant_host, tokens, UNRESERVED,
+    tenant_host, tokens,
 };
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
+
+const GRAPHQL_PATH: &str = "/chat/graphql";
+
+const RESOLVE_APPROVAL_REQUEST_MUTATION: &str =
+    "mutation ResolveApprovalRequest($input: ResolveApprovalRequestInput!) \
+    { resolveApprovalRequest(input: $input) { userErrors { message code } } }";
+
+const SEND_MESSAGE_MUTATION: &str = "mutation SendMessage($input: SendMessageInput!) \
+    { sendMessage(input: $input) { userErrors { message code } } }";
 
 /// A live signed-in session: a usable bearer and the user it belongs to.
 /// Obtained through [`active_session`] — constructing one is the shell's proof
@@ -55,35 +62,37 @@ pub(crate) enum ApprovalOutcome {
     AlreadyResolved,
 }
 
-/// Resolve a Mingo tool-approval request. One endpoint for both outcomes, same
-/// as the frontend's approve/reject mutations.
+/// Resolve a Mingo tool-approval request. One mutation for both outcomes, same
+/// as the frontend's `ticketService.resolveApprovalRequest`.
 pub(crate) async fn resolve_approval(
     app: &AppHandle,
     session: &Session,
     request_id: &str,
     approve: bool,
 ) -> Result<ApprovalOutcome, String> {
-    let path = format!(
-        "/chat/api/v1/approval-requests/{}/approve",
-        utf8_percent_encode(request_id, UNRESERVED)
-    );
-    match post_json(
+    match mutate(
         app,
         session,
-        &path,
-        serde_json::json!({ "approve": approve }),
+        "resolveApprovalRequest",
+        RESOLVE_APPROVAL_REQUEST_MUTATION,
+        serde_json::json!({ "id": request_id, "approve": approve }),
     )
     .await
     {
         Ok(()) => Ok(ApprovalOutcome::Resolved),
-        // The endpoint's one conflict is a request that is no longer pending —
+        // `ILLEGAL_STATE` is mostly a request that is no longer pending —
         // decided from the web UI, from another device, by another admin, or
-        // from a banner this shell had not yet caught up with. None of those is
-        // a failed press: the tool call already carries the verdict the user was
+        // from a banner this shell had not yet caught up with. That is not a
+        // failed press: the tool call already carries the verdict the user was
         // asked for, so reporting it as an error would put a red banner on a
-        // decision that stands.
-        Err(err) if err.status == Some(reqwest::StatusCode::CONFLICT) => {
-            log::info!("[chat-api] POST {path}: already resolved");
+        // decision that stands. The code also covers a dialog that no longer
+        // takes approvals and, on approve, a request that is no longer
+        // executable (the server asks for a Reject instead); those land here
+        // too until the backend gives them a code of their own.
+        // `DIALOG_LOCKED` (Mingo mid-turn) is not among them: it fails, and the
+        // re-posted banner keeps the buttons to try again.
+        Err(err) if err.code.as_deref() == Some("ILLEGAL_STATE") => {
+            log::info!("[chat-api] resolveApprovalRequest: already resolved");
             Ok(ApprovalOutcome::AlreadyResolved)
         }
         Err(err) => Err(err.reason),
@@ -97,10 +106,11 @@ pub(crate) async fn send_message(
     dialog_id: &str,
     content: &str,
 ) -> Result<(), String> {
-    post_json(
+    mutate(
         app,
         session,
-        "/chat/api/v1/messages",
+        "sendMessage",
+        SEND_MESSAGE_MUTATION,
         serde_json::json!({
             "dialogId": dialog_id,
             "content": content,
@@ -112,40 +122,44 @@ pub(crate) async fn send_message(
 }
 
 /// A rejected call. The `reason` is user-facing — it ends up in a follow-up
-/// notification — while the `status` is for callers that read a particular one
-/// as something other than a failure; it is `None` when the request never got a
-/// response.
-struct PostError {
-    status: Option<reqwest::StatusCode>,
+/// notification — while the `code` is the mutation's `userErrors[].code` (the
+/// same value the REST `ErrorResponse.code` carried), for callers that read a
+/// particular one as something other than a failure; it is `None` when the
+/// answer carried no `userErrors` code.
+struct CommandError {
+    code: Option<String>,
     reason: String,
 }
 
-impl PostError {
-    fn new(status: Option<reqwest::StatusCode>, reason: impl Into<String>) -> Self {
+impl CommandError {
+    fn new(code: Option<String>, reason: impl Into<String>) -> Self {
         Self {
-            status,
+            code,
             reason: reason.into(),
         }
     }
 }
 
+/// Runs one ai-agent mutation whose payload is `{ userErrors { message code } }`.
 /// Errors are user-facing (they end up in a follow-up notification), so they
 /// carry the gateway's own message where there is one.
-async fn post_json(
+async fn mutate(
     app: &AppHandle,
     session: &Session,
-    path: &str,
-    body: serde_json::Value,
-) -> Result<(), PostError> {
+    field: &str,
+    query: &str,
+    input: serde_json::Value,
+) -> Result<(), CommandError> {
     let base = tenant_host(&load_config(app))
-        .ok_or_else(|| PostError::new(None, "this install has not learned a tenant host yet"))?;
+        .ok_or_else(|| CommandError::new(None, "this install has not learned a tenant host yet"))?;
 
     let client = reqwest::Client::builder()
         .timeout(HTTP_TIMEOUT)
         .build()
-        .map_err(|e| PostError::new(None, e.to_string()))?;
+        .map_err(|e| CommandError::new(None, e.to_string()))?;
+    let body = serde_json::json!({ "query": query, "variables": { "input": input } });
     let response = client
-        .post(format!("{base}{path}"))
+        .post(format!("{base}{GRAPHQL_PATH}"))
         .bearer_auth(&session.access_token)
         .header("Accept", "application/json")
         .header("Content-Type", "application/json")
@@ -154,46 +168,95 @@ async fn post_json(
         .send()
         .await
         .map_err(|e| {
-            log::warn!("[chat-api] POST {path} to {base} failed: {e}");
-            PostError::new(None, "the gateway could not be reached")
+            log::warn!("[chat-api] {field} to {base} failed: {e}");
+            CommandError::new(None, "the gateway could not be reached")
         })?;
 
     let status = response.status();
-    if status.is_success() {
-        log::info!("[chat-api] POST {path}: HTTP {status}");
-        return Ok(());
-    }
     // 401 means the gateway rejected a token `active_session` considered live —
     // revoked, or its signing key rotated, neither of which `exp` predicts. Say
     // that, rather than quoting a status line: the user's move is to open the
     // app. A 403 is a different verdict (wrong tenant, subscription state) and
     // carries its own message, so it falls through to the body below.
     if status == reqwest::StatusCode::UNAUTHORIZED {
-        log::warn!("[chat-api] POST {path} rejected: HTTP {status} — session no longer accepted");
-        return Err(PostError::new(
-            Some(status),
+        log::warn!("[chat-api] {field} rejected: HTTP {status} — session no longer accepted");
+        return Err(CommandError::new(
+            None,
             "this session is no longer valid — open OpenFrame and sign in again",
         ));
     }
-    // Body only at debug: an error message can quote user content.
-    let reason = response.text().await.ok().and_then(|raw| {
+    let raw = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        // Body only at debug: an error message can quote user content.
         log::debug!("[chat-api] error body: {raw}");
-        error_message(&raw)
-    });
-    log::warn!("[chat-api] POST {path} rejected: HTTP {status}");
-    Err(PostError::new(
-        Some(status),
-        reason.unwrap_or_else(|| format!("HTTP {status}")),
-    ))
+        log::warn!("[chat-api] {field} rejected: HTTP {status}");
+        return Err(CommandError::new(
+            None,
+            error_message(&raw).unwrap_or_else(|| format!("HTTP {status}")),
+        ));
+    }
+    let outcome = command_outcome(&raw, field);
+    match &outcome {
+        Ok(()) => log::info!("[chat-api] {field}: done"),
+        Err(err) => {
+            log::debug!("[chat-api] {field} answer: {raw}");
+            log::warn!(
+                "[chat-api] {field} refused: {}",
+                err.code.as_deref().unwrap_or("no code")
+            );
+        }
+    }
+    outcome
 }
 
-/// The gateway's error text: `message`, else `error` — the same two fields the
-/// frontend's api-client reads. Truncated; a stack trace in a banner helps
-/// nobody.
+/// GraphQL answers a refused command with HTTP 200, so the verdict is in the
+/// body: a top-level `errors` entry (validation, authorization, anything the
+/// service did not classify), else the payload's first `userErrors` entry. A
+/// body that is neither is not a success either — nothing says the command ran.
+fn command_outcome(body: &str, field: &str) -> Result<(), CommandError> {
+    let unreadable =
+        || CommandError::new(None, "the gateway sent an answer the app could not read");
+    let refused = |error: &serde_json::Value| {
+        message_of(error).unwrap_or_else(|| "the request was refused".into())
+    };
+    let parsed: serde_json::Value = serde_json::from_str(body).map_err(|_| unreadable())?;
+    if let Some(error) = parsed
+        .get("errors")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|errors| errors.first())
+    {
+        return Err(CommandError::new(None, refused(error)));
+    }
+    let user_errors = parsed
+        .get("data")
+        .and_then(|data| data.get(field))
+        .and_then(|payload| payload.get("userErrors"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(unreadable)?;
+    match user_errors.first() {
+        None => Ok(()),
+        Some(user_error) => Err(CommandError::new(
+            user_error
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            refused(user_error),
+        )),
+    }
+}
+
+/// The gateway's error text of a non-2xx answer.
 fn error_message(body: &str) -> Option<String> {
     let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
+    message_of(&parsed)
+}
+
+/// `message`, else `error` — the same two fields the frontend's api-client
+/// reads, and `message` is also what a GraphQL error and a `userErrors` entry
+/// carry. Truncated; a stack trace in a banner helps nobody.
+fn message_of(value: &serde_json::Value) -> Option<String> {
     let text = ["message", "error"].into_iter().find_map(|key| {
-        let text = parsed.get(key)?.as_str()?.trim();
+        let text = value.get(key)?.as_str()?.trim();
         (!text.is_empty()).then_some(text)
     })?;
     Some(truncate_for_notification(text, BODY_CHARS))
@@ -215,6 +278,64 @@ mod tests {
         );
         assert_eq!(error_message(r#"{"message":"  "}"#), None);
         assert_eq!(error_message("<html>502</html>"), None);
+    }
+
+    fn outcome(body: &str) -> Result<(), (Option<String>, String)> {
+        command_outcome(body, "resolveApprovalRequest").map_err(|err| (err.code, err.reason))
+    }
+
+    #[test]
+    fn command_outcome_without_user_errors_is_done() {
+        assert!(outcome(r#"{"data":{"resolveApprovalRequest":{"userErrors":[]}}}"#).is_ok());
+    }
+
+    #[test]
+    fn command_outcome_carries_the_user_error_code_and_message() {
+        assert_eq!(
+            outcome(
+                r#"{"data":{"resolveApprovalRequest":{"userErrors":[
+                    {"message":"Approval request already processed. Current status: APPROVED","code":"ILLEGAL_STATE"},
+                    {"message":"second","code":"BAD_REQUEST"}]}}}"#
+            ),
+            Err((
+                Some("ILLEGAL_STATE".into()),
+                "Approval request already processed. Current status: APPROVED".into()
+            ))
+        );
+        assert_eq!(
+            outcome(
+                r#"{"data":{"resolveApprovalRequest":{"userErrors":[{"message":"","code":null}]}}}"#
+            ),
+            Err((None, "the request was refused".into()))
+        );
+    }
+
+    #[test]
+    fn command_outcome_reports_a_graphql_error_without_a_code() {
+        assert_eq!(
+            outcome(
+                r#"{"errors":[{"message":"Access denied","extensions":{"errorType":"PERMISSION_DENIED"}}],"data":{"resolveApprovalRequest":null}}"#
+            ),
+            Err((None, "Access denied".into()))
+        );
+    }
+
+    #[test]
+    fn command_outcome_is_not_done_when_nothing_says_the_command_ran() {
+        let unreadable = Err((
+            None,
+            "the gateway sent an answer the app could not read".to_string(),
+        ));
+        assert_eq!(outcome("<html>captive portal</html>"), unreadable);
+        assert_eq!(outcome(""), unreadable);
+        assert_eq!(
+            outcome(r#"{"data":{"sendMessage":{"userErrors":[]}}}"#),
+            unreadable
+        );
+        assert_eq!(
+            outcome(r#"{"data":{"resolveApprovalRequest":null}}"#),
+            unreadable
+        );
     }
 
     #[test]

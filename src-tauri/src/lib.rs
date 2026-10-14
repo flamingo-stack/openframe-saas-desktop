@@ -427,6 +427,36 @@ pub(crate) fn write_atomic(path: &std::path::Path, data: &str) -> Result<(), Str
     std::fs::rename(&tmp, path).map_err(|e| e.to_string())
 }
 
+/// Whether `path` sits on a read-only mount: on macOS, Gatekeeper's App
+/// Translocation copy (a quarantined app opened where it was downloaded) or a
+/// mounted disk image. Neither is where the app stays: the updater cannot swap
+/// the bundle there (`EROFS`), and a login item pointing at it is gone after
+/// the next reboot. `false` when it cannot be told.
+///
+/// macOS only: elsewhere a read-only mount is not the app's home either way —
+/// a Linux AppImage always runs from one, and its updater replaces the image
+/// file instead.
+#[cfg(target_os = "macos")]
+pub(crate) fn on_read_only_mount(path: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut fs = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `path` is NUL-terminated, and `fs` is read only after statfs
+    // reported filling it.
+    if unsafe { libc::statfs(path.as_ptr(), fs.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    let flags = unsafe { fs.assume_init() }.f_flags;
+    flags & libc::MNT_RDONLY as u32 != 0
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn on_read_only_mount(_path: &std::path::Path) -> bool {
+    false
+}
+
 /// Accept "acme.openframe.ai", "https://acme.openframe.ai", or "…/" and
 /// normalize to a scheme-qualified origin with no trailing slash.
 fn normalize_host(input: &str) -> Result<String, String> {
@@ -1673,5 +1703,17 @@ mod tests {
             plist.contains(&format!("<string>{URI_SCHEME}</string>")),
             "Info.plist does not register {URI_SCHEME} in CFBundleURLSchemes"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_read_only_mount_is_told_apart_from_where_an_app_is_installed() {
+        // `/` is the sealed system snapshot, mounted read-only like a
+        // translocated copy or a disk image; the temp dir is on the writable
+        // Data volume, with /Applications.
+        assert!(on_read_only_mount(std::path::Path::new("/")));
+        assert!(!on_read_only_mount(&std::env::temp_dir()));
+        assert!(!on_read_only_mount(std::path::Path::new("/Applications")));
+        assert!(!on_read_only_mount(std::path::Path::new("/no/such/path")));
     }
 }

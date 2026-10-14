@@ -687,6 +687,17 @@ fn binary(app: &AppHandle) -> Result<std::path::PathBuf, String> {
     tauri::process::current_binary(&app.env()).map_err(|e| e.to_string())
 }
 
+/// The binary, when it runs from a read-only mount (see
+/// [`crate::on_read_only_mount`]): a macOS App Translocation copy or a disk
+/// image. A login item pointing there is dead after the next reboot — and
+/// translocation picks a new path at every launch, so the reconcile would
+/// rewrite the registration every time without it ever working.
+fn ephemeral_binary(app: &AppHandle) -> Option<std::path::PathBuf> {
+    binary(app)
+        .ok()
+        .filter(|exe| crate::on_read_only_mount(exe))
+}
+
 // ---------------------------------------------------------------------------
 // The startup reconcile
 // ---------------------------------------------------------------------------
@@ -778,6 +789,17 @@ pub(crate) fn reconcile_on_startup(app: &AppHandle) {
         log::info!("[autostart] debug build — leaving the login registration alone");
         return;
     }
+    // Neither registered nor marked configured: the first launch from where the
+    // app stays repairs a stale registration or applies the default, as usual.
+    if let Some(exe) = ephemeral_binary(app) {
+        log::info!(
+            "[autostart] running from a read-only volume ({}) — leaving the login \
+             registration alone until the app is moved",
+            exe.display()
+        );
+        sync_tray(app);
+        return;
+    }
     let app = app.clone();
     std::thread::spawn(move || {
         {
@@ -865,6 +887,14 @@ fn status(app: &AppHandle) -> Status {
 fn set(app: &AppHandle, enabled: bool) -> Result<Status, AutostartError> {
     if enforced(app) {
         return Err(AutostartError::enforced());
+    }
+    if enabled {
+        if let Some(exe) = ephemeral_binary(app) {
+            return Err(AutostartError::unavailable(format!(
+                "{} is on a read-only volume — move the app to Applications first",
+                exe.display()
+            )));
+        }
     }
     {
         let _serialized = lock(&REGISTRATION);

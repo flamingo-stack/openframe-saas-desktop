@@ -4,7 +4,8 @@ version = "0.1.0"
 description = "OpenFrame Console"
 authors = ["OpenFrame"]
 edition = "2021"
-rust-version = "1.77.2"
+# 1.85: the updater classifies io::ErrorKind::{QuotaExceeded, CrossesDevices}.
+rust-version = "1.85"
 
 [lib]
 name = "app_lib"
@@ -72,6 +73,8 @@ winreg = "0.52"
 # notification the token refresh hangs off.
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
+# statfs(2), to tell a read-only mount (App Translocation, a disk image) apart.
+libc = "0.2"
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", features = ["NSWorkspace"] }
 objc2-foundation = { version = "0.3.2", features = [

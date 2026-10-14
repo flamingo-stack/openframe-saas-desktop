@@ -62,6 +62,9 @@ pub struct UpdateAvailability {
     version: Option<String>,
     notes: Option<String>,
     release_notes_url: Option<String>,
+    /// Set when this install cannot apply the update where it is, so the UI can
+    /// say what to do instead of offering a button that is bound to fail.
+    blocked: Option<UpdateError>,
 }
 
 impl UpdateAvailability {
@@ -71,6 +74,7 @@ impl UpdateAvailability {
             version: None,
             notes: None,
             release_notes_url: None,
+            blocked: None,
         }
     }
 
@@ -85,6 +89,7 @@ impl UpdateAvailability {
                 .and_then(serde_json::Value::as_str)
                 .filter(|url| !url.is_empty())
                 .map(str::to_string),
+            blocked: in_place_blocker(),
         }
     }
 }
@@ -139,6 +144,15 @@ impl UpdateError {
     fn unavailable(message: impl Into<String>) -> Self {
         Self {
             kind: "unavailable",
+            message: message.into(),
+        }
+    }
+
+    /// The running bundle cannot be replaced where it is — see
+    /// [`in_place_blocker`]. Moving the app is the fix, not a retry.
+    fn location(message: impl Into<String>) -> Self {
+        Self {
+            kind: "location",
             message: message.into(),
         }
     }
@@ -211,6 +225,25 @@ fn classify_io(error: &std::io::Error) -> &'static str {
     }
 }
 
+/// Why this install cannot update itself where it runs, decided before anything
+/// is downloaded. The plugin swaps the `.app` by renaming it, which a read-only
+/// mount refuses with `EROFS` — after the whole download, and again at every
+/// launch, since the silent startup pass would retry it each time.
+fn in_place_blocker() -> Option<UpdateError> {
+    let exe = std::env::current_exe().ok()?;
+    if !crate::on_read_only_mount(&exe) {
+        return None;
+    }
+    let bundle = exe
+        .ancestors()
+        .find(|path| path.extension().is_some_and(|ext| ext == "app"))
+        .unwrap_or(&exe);
+    Some(UpdateError::location(format!(
+        "{} is on a read-only volume",
+        bundle.display()
+    )))
+}
+
 fn resolve_manifest_url(app: &AppHandle) -> String {
     if let Some(url) = load_config(app)
         .update_manifest_url
@@ -257,6 +290,15 @@ async fn apply(
             return Err(UpdateError::busy());
         }
     };
+
+    if let Some(error) = in_place_blocker() {
+        log::warn!(
+            "[updater] not applying {}: {}",
+            update.version,
+            error.message
+        );
+        return Err(error);
+    }
 
     update.timeout = Some(DOWNLOAD_TIMEOUT);
     log::info!("[updater] applying update to {}", update.version);

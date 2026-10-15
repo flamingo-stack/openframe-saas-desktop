@@ -77,6 +77,17 @@ fn register(app: &AppHandle) {
         log::warn!("[notifications] toast activator: current_exe unavailable — no action buttons");
         return;
     };
+    // The path is interpolated into a registry LocalServer32 command string
+    // inside a quoted segment; a path containing a `"` would break out of the
+    // quoting and corrupt (or hijack) the registered command. `current_exe()`
+    // is expected to be well-formed, but this is refused defensively rather
+    // than trusted.
+    if exe.to_string_lossy().contains('"') {
+        log::warn!(
+            "[notifications] toast activator: exe path contains '\"' — refusing to register"
+        );
+        return;
+    }
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let clsid = clsid_string();
     // Lays the file down on first call, so it happens here rather than inside
@@ -238,6 +249,8 @@ impl INotificationActivationCallback_Impl for Activator_Impl {
         log::info!("[notifications] toast activation ({} inputs)", inputs.len());
         if let Some(app) = ROUTER.get() {
             handle_activation(app, &args, &inputs);
+        } else {
+            log::warn!("[notifications] toast activation arrived before router was set — dropped");
         }
         Ok(())
     }

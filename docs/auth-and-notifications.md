@@ -147,8 +147,15 @@ The bridge is shell-agnostic; the frontend feature-detects each method.
 
 ### Where the login ends
 
-The login runs in the user's **default browser** and comes back on this app's own
-scheme, `openframe-console://auth`.
+The login runs in the user's **default browser**, finishes on a hand-off page of
+the web app on the shared host (`/auth/desktop-return/`), and comes back on this
+app's own scheme, `openframe-console://auth`.
+
+The page exists because a redirect straight to the scheme commits no document: the
+tab kept the last page it had, for OpenFrame SSO the credential form, which read as
+a failed login. The page shows the outcome ("You're signed in. You can close this
+tab.") and launches the scheme with it. The gateway's outcome rides in the page's
+fragment, so it is never sent to a server (`apps/web/src/lib/desktop-auth-return.ts`).
 
 The browser is the whole point. A window of ours is a fresh cookie jar, so an
 identity provider the user is already signed into on this machine cannot see that
@@ -164,15 +171,18 @@ Three gateway behaviours have to line up, and a native login needs all three:
   shell used to log in with `authMobile=false`, so against prod the callback
   carried no ticket and the app sat on the sign-in screen. Non-prod hid it: dev
   tickets are on there, so any callback carried one.
-- **The callback must be allow-listed verbatim.** The SaaS gateway's
+- **The redirect must be allow-listed verbatim.** The SaaS gateway's
   `TenantDomainRedirectResolver` replaces a requested `redirectTo` with the
   tenant's own domain unless it matches an entry of
-  `openframe.gateway.redirect.allowed-uris` by exact string equality. So
-  `openframe-console://auth` has to be in that list —
+  `openframe.gateway.redirect.allowed-uris` by exact string equality. So the
+  hand-off page's exact URL, `https://<shared host>/auth/desktop-return/#`, has
+  to be in that list —
   `openframe-saas-shared/configs/base/openframe-saas-gateway.yml`, inherited by
-  every environment — alongside mobile's `com.openframe.app://auth`. The OSS
-  gateway binds `DefaultRedirectTargetResolver` instead, which honours any
-  requested redirect, so it needs no configuration.
+  every environment — alongside mobile's `com.openframe.app://auth`.
+  `openframe-console://auth` stays listed for installed builds whose bundled
+  frontend still redirects straight to it. The OSS gateway binds
+  `DefaultRedirectTargetResolver` instead, which honours any requested redirect,
+  so it needs no configuration.
 - **`mobile-auth-enabled` gates the exchange.** `/oauth/dev-exchange` is refused
   when both it and `dev-ticket-enabled` are off.
 
@@ -199,16 +209,20 @@ Registration is per-platform, and both halves are ours to keep in sync with
   forwarded by the single-instance plugin when the app is running, in our own
   argv when the callback cold-starts it.
 
-The scheme string reaches the frontend as `NEXT_PUBLIC_MOBILE_APP_SCHEME` in the
-injected `window.__ENV`, which is what makes `runtimeEnv.appScheme()` build
-`openframe-console://auth` as the `redirectTo`. The frontend needs no
-desktop-specific code for this; the two uses must not drift, so `start` rejects a
-`callbackScheme` that is not the registered one rather than opening a browser
-whose callback could only ever time out.
+The frontend names the scheme as `DESKTOP_APP_SCHEME`
+(`apps/web/src/lib/desktop-auth-return.ts`): the hand-off page launches it, and
+`nativeLogin` passes it to `start` as the `callbackScheme`. A web test reads
+`URI_SCHEME` and `AUTH_CALLBACK_HOST` out of `src/lib.rs` so the two cannot drift,
+and `start` still rejects a `callbackScheme` that is not the registered one rather
+than opening a browser whose callback could only ever time out.
 
-A callback **without** a ticket ends the login as a failure: the gateway appends
-one to every `authMobile` callback, so its absence means the flow never reached
-the BFF callback.
+A callback carries one of `devTicket` (the session), `signupTicket` (an identity
+with no account yet; the app finishes the signup on its own screen) or `error`
+(`USER_CANCELED`, `SESSION_EXPIRED` from a page left mid-flow), and the shell
+hands any of them to the frontend. A callback with **none** ends the login as a
+failure: the gateway puts one on every `authMobile` callback, so its absence means
+the flow never reached the BFF callback. The hand-off page sends exactly that bare
+callback when it is landed on with nothing, so the app stops waiting at once.
 
 > **What the browser flow gave up.** The old login window also accepted *any*
 > URL carrying a ticket, which covered a gateway that dropped the requested
@@ -219,9 +233,11 @@ the BFF callback.
 > minutes) and logs which URI never arrived.
 >
 > **Cancellation is weaker too.** Closing the window used to reject the pending
-> login immediately. A browser tab the user abandons signals nothing, so the
-> timeout is the only end. A stale callback arriving after it resolves nothing
-> and says so in the log.
+> login immediately. A browser tab the user abandons signals nothing, so the end
+> has to come from the app: its waiting screen's Cancel calls `native_auth_cancel`,
+> which resolves the pending login with `USER_CANCELED`, and otherwise the timeout
+> ends it. A stale callback arriving after either resolves nothing and says so in
+> the log.
 
 > **Two things the callback does not do, and mobile does not either.** It carries
 > no CSRF nonce — the allow-list matches the redirect by exact string equality,

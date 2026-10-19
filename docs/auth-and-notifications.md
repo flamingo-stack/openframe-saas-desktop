@@ -156,6 +156,8 @@ tab kept the last page it had, for OpenFrame SSO the credential form, which read
 a failed login. The page shows the outcome ("You're signed in. You can close this
 tab.") and launches the scheme with it. The gateway's outcome rides in the page's
 fragment, so it is never sent to a server (`apps/web/src/lib/desktop-auth-return.ts`).
+It does reach the browser's history, as the URL the tab landed on before the page
+strips it; the ticket's single use and short life (below) are what bound that.
 
 The browser is the whole point. A window of ours is a fresh cookie jar, so an
 identity provider the user is already signed into on this machine cannot see that
@@ -176,9 +178,9 @@ Three gateway behaviours have to line up, and a native login needs all three:
   tenant's own domain unless it matches an entry of
   `openframe.gateway.redirect.allowed-uris` by exact string equality. So the
   hand-off page's exact URL, `https://<shared host>/auth/desktop-return/#`, has
-  to be in that list —
-  `openframe-saas-shared/configs/base/openframe-saas-gateway.yml`, inherited by
-  every environment — alongside mobile's `com.openframe.app://auth`.
+  to be in that list alongside mobile's `com.openframe.app://auth`, in every
+  environment that serves a build with the hand-off page (`allowed-uris` in
+  `openframe-saas-shared/configs`).
   `openframe-console://auth` stays listed for installed builds whose bundled
   frontend still redirects straight to it. The OSS gateway binds
   `DefaultRedirectTargetResolver` instead, which honours any requested redirect,
@@ -211,14 +213,17 @@ Registration is per-platform, and both halves are ours to keep in sync with
 
 The frontend names the scheme as `DESKTOP_APP_SCHEME`
 (`apps/web/src/lib/desktop-auth-return.ts`): the hand-off page launches it, and
-`nativeLogin` passes it to `start` as the `callbackScheme`. A web test reads
-`URI_SCHEME` and `AUTH_CALLBACK_HOST` out of `src/lib.rs` so the two cannot drift,
-and `start` still rejects a `callbackScheme` that is not the registered one rather
+`nativeLogin` passes it to `start` as the `callbackScheme`. Web tests read
+`URI_SCHEME`, `AUTH_CALLBACK_HOST`, `LOGIN_TIMEOUT` and the `*_ERROR` rejection
+codes out of `src/lib.rs` and fail when one side changes without the other. They
+run with the web unit tests, which CI does not start for a desktop-only change.
+`start` still rejects a `callbackScheme` that is not the registered one rather
 than opening a browser whose callback could only ever time out.
 
 A callback carries one of `devTicket` (the session), `signupTicket` (an identity
 with no account yet; the app finishes the signup on its own screen) or `error`
-(`USER_CANCELED`, `SESSION_EXPIRED` from a page left mid-flow), and the shell
+(`USER_CANCELED` or `SESSION_EXPIRED` from a page left mid-flow; the frontend
+reads any other code as an auth-server reference), and the shell
 hands any of them to the frontend. A callback with **none** ends the login as a
 failure: the gateway puts one on every `authMobile` callback, so its absence means
 the flow never reached the BFF callback. The hand-off page sends exactly that bare
@@ -245,6 +250,10 @@ callback when it is landed on with nothing, so the app stops waiting at once.
 > scheme claim is not exclusive on any desktop OS. A dev ticket is a one-time
 > UUID with a 120s TTL, which bounds but does not close either gap. Both are
 > worth revisiting if the allow-list ever learns to match ignoring the query.
+> The hand-off page widens the first gap: it launches whatever ticket its fragment
+> holds, so a crafted `…/auth/desktop-return/#?devTicket=…` link gets the launch
+> from OpenFrame's own origin, which a browser told to always allow it opens
+> without asking — a login CSRF against a sign-in that is waiting.
 
 > **The gateway also sets auth cookies on the callback response**
 > (`buildFoundWithCookiesAndClearState`), so the user's real browser keeps the

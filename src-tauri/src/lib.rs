@@ -103,6 +103,19 @@ const AUTH_CALLBACK_HOST: &str = "auth";
 /// user walked away from.
 const LOGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+// What a parked `native_auth_start` rejects with when it ends without an
+// outcome. The frontend matches these by value (`MOBILE_AUTH_ERROR` and
+// `DESKTOP_LOGIN_ERROR` in apps/web), and a web test reads them here.
+
+/// The user's cancel, or a newer start replacing this one: the code the
+/// frontend keeps quiet.
+const USER_CANCELED_ERROR: &str = "USER_CANCELED";
+/// No callback within [`LOGIN_TIMEOUT`].
+const LOGIN_TIMEOUT_ERROR: &str = "LOGIN_TIMEOUT";
+/// A callback that carried no outcome.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+const LOGIN_INCOMPLETE_ERROR: &str = "LOGIN_INCOMPLETE";
+
 /// Baked-in shared auth host, set at compile time
 /// (`OPENFRAME_SHARED_HOST_URL=https://… cargo build`). Overridable per install
 /// by `shared_host` in config.json, which is how a dev build points at a stage
@@ -877,8 +890,9 @@ fn sign_out(app: &AppHandle) -> Result<(), String> {
 
 // ---------------------------------------------------------------------------
 // NativeAuth bridge — backs window.__OPENFRAME_SHELL__.nativeAuth (see
-// env_init_script). Default browser -> openframe-console://auth?devTicket=
-// capture -> native token exchange -> local token store. Mirrors
+// env_init_script). Default browser -> gateway -> the frontend's hand-off page
+// (/auth/desktop-return/) -> openframe-console://auth?<outcome> capture ->
+// native token exchange -> local token store. Mirrors
 // openframe-mobile's NativeAuthPlugin.swift, with the browser in place of
 // mobile's ASWebAuthenticationSession.
 // ---------------------------------------------------------------------------
@@ -897,7 +911,9 @@ struct AuthState {
     /// ours can ride on it (the same gap that leaves the flow without CSRF
     /// protection — see docs/auth-and-notifications.md). So a first browser tab
     /// finished after the user has already started a second attempt resolves
-    /// that second attempt, with a ticket old enough that the exchange fails.
+    /// that second attempt with its own result. Since Cancel lets a retry start
+    /// within the first ticket's lifetime, that ticket can still be good: the app
+    /// then signs in to whichever account the first tab finished with.
     pending_login: Mutex<Option<tokio::sync::oneshot::Sender<Result<String, String>>>>,
 }
 
@@ -910,7 +926,8 @@ struct NativeAuthStartResult {
 /// What a login can end with, each read by the frontend's `completeTicketFlow`:
 /// a ticket for the session, a ticket for an identity that still needs an
 /// account (the app finishes the signup on its own screen), or an outcome code
-/// (`USER_CANCELED`, `SESSION_EXPIRED`) from a page that was left mid-flow.
+/// instead of either: one the app words itself (`MOBILE_AUTH_ERROR` in
+/// apps/web), or an auth-server reference.
 #[cfg(any(target_os = "macos", target_os = "windows", test))]
 const CALLBACK_OUTCOME_PARAMS: [&str; 3] = ["devTicket", "signupTicket", "error"];
 
@@ -963,7 +980,7 @@ fn handle_scheme_url(app: &AppHandle, url: &str) -> bool {
     let result = if url_carries_outcome(&parsed) {
         Ok(url.to_string())
     } else {
-        Err("LOGIN_INCOMPLETE".into())
+        Err(LOGIN_INCOMPLETE_ERROR.into())
     };
     finish_login(app, result)
 }
@@ -1055,7 +1072,7 @@ async fn native_auth_start(
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     if let Some(stale) = notifications::lock(&state.pending_login).replace(tx) {
-        let _ = stale.send(Err("USER_CANCELED".into()));
+        let _ = stale.send(Err(USER_CANCELED_ERROR.into()));
     }
 
     // `spawn`, so nothing here waits on the browser, and no shell, so the URL's
@@ -1069,15 +1086,16 @@ async fn native_auth_start(
         Ok(Ok(result)) => result.map(|callback_url| NativeAuthStartResult { callback_url }),
         // Sender dropped without sending. A replacement sends USER_CANCELED
         // rather than dropping, so in practice this is process teardown.
-        Ok(Err(_)) => Err("USER_CANCELED".into()),
+        Ok(Err(_)) => Err(USER_CANCELED_ERROR.into()),
         Err(_) => {
             log::warn!(
                 "[auth] no callback on {URI_SCHEME}://{AUTH_CALLBACK_HOST} within {}s — the \
-                 browser flow never came back (is the callback in the gateway's \
+                 browser flow never came back (is the hand-off page \
+                 https://<shared host>/auth/desktop-return/# in the gateway's \
                  redirect.allowed-uris?)",
                 LOGIN_TIMEOUT.as_secs()
             );
-            Err("LOGIN_TIMEOUT".into())
+            Err(LOGIN_TIMEOUT_ERROR.into())
         }
     }
 }
@@ -1086,7 +1104,7 @@ async fn native_auth_start(
 /// waiting. `USER_CANCELED` is the code the frontend keeps quiet.
 fn cancel_pending_login(state: &AuthState) -> bool {
     match notifications::lock(&state.pending_login).take() {
-        Some(tx) => tx.send(Err("USER_CANCELED".into())).is_ok(),
+        Some(tx) => tx.send(Err(USER_CANCELED_ERROR.into())).is_ok(),
         None => false,
     }
 }
@@ -1094,12 +1112,15 @@ fn cancel_pending_login(state: &AuthState) -> bool {
 /// NativeAuth.cancel: the app's Cancel while the browser sign-in is open. The
 /// browser tab is ours to abandon but not to close, so this is the only end
 /// besides the timeout that the user can choose. Nothing waiting is not an
-/// error: the browser may have finished in the same instant.
+/// error: the browser may have finished in the same instant. It is reported,
+/// though, so the app does not confirm a cancel that the callback beat.
 #[tauri::command]
-fn native_auth_cancel(state: State<'_, AuthState>) {
-    if cancel_pending_login(&state) {
+fn native_auth_cancel(state: State<'_, AuthState>) -> bool {
+    let canceled = cancel_pending_login(&state);
+    if canceled {
         log::info!("[auth] login canceled from the app");
     }
+    canceled
 }
 
 /// NativeAuth.exchangeTicket: native (CORS-free) GET; the tokens ride on the
@@ -1733,7 +1754,7 @@ mod tests {
         *notifications::lock(&state.pending_login) = Some(tx);
 
         assert!(cancel_pending_login(&state));
-        assert_eq!(rx.try_recv().unwrap(), Err("USER_CANCELED".to_string()));
+        assert_eq!(rx.try_recv().unwrap(), Err(USER_CANCELED_ERROR.to_string()));
         assert!(!cancel_pending_login(&state));
     }
 

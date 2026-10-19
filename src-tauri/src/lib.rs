@@ -354,6 +354,11 @@ pub(crate) struct AppConfig {
     /// and cleared on the next launch.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) autostart_show_window_next_start: Option<bool>,
+    /// Tray "Always Start Hidden": every cold start stays in the tray, not only
+    /// the ones the login registration makes. Shell-written by the tray toggle;
+    /// absent (or anything but `true`) leaves only a login start in the tray.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) start_hidden: Option<bool>,
 }
 
 /// The shared auth host in effect: config.json override, else the compile-time
@@ -1212,14 +1217,12 @@ fn take_pending_notification_click(window: WebviewWindow) -> Option<serde_json::
 /// `RunEvent::Opened`.
 ///
 /// Notification delivery raises the window only when there already is one, so
-/// callers still have to decide whether this process should have one at all.
+/// callers still have to decide whether this process should have one at all —
+/// which is why this reports whether it delivered anything.
 #[cfg(target_os = "windows")]
-fn handle_scheme_argv(app: &AppHandle, args: &[String]) {
-    for arg in args {
-        if handle_scheme_url(app, arg) || notifications::handle_notification_uri(app, arg) {
-            return;
-        }
-    }
+fn handle_scheme_argv(app: &AppHandle, args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| handle_scheme_url(app, arg) || notifications::handle_notification_uri(app, arg))
 }
 
 /// Register [`URI_SCHEME`] for this executable (HKCU, no elevation). Re-written
@@ -1319,12 +1322,26 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
         false,
         None::<&str>,
     )?;
+    let start_hidden_i = CheckMenuItem::with_id(
+        app,
+        "start_hidden",
+        "Always Start Hidden",
+        true,
+        false,
+        None::<&str>,
+    )?;
     let signout_i = MenuItem::with_id(app, "signout", "Sign Out", true, None::<&str>)?;
     let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show_i, &autostart_i, &signout_i, &quit_i])?;
+    let menu = Menu::with_items(
+        app,
+        &[&show_i, &autostart_i, &start_hidden_i, &signout_i, &quit_i],
+    )?;
     // Held so the webview's toggle moves the same check mark the tray does.
     app.manage(autostart::TrayCheck(autostart_i));
     autostart::sync_tray(app.handle());
+
+    app.manage(autostart::StartHiddenCheck(start_hidden_i));
+    autostart::sync_start_hidden_tray(app.handle());
 
     TrayIconBuilder::new()
         .icon(tray_icon())
@@ -1345,6 +1362,7 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => raise_or_open_main_window(app),
             "autostart" => autostart::toggle_from_tray(app),
+            "start_hidden" => autostart::toggle_start_hidden_from_tray(app),
             "signout" => {
                 if let Err(e) = sign_out(app) {
                     log::error!("sign_out failed: {e}");
@@ -1366,7 +1384,8 @@ pub fn run() {
             // carrying the URI in argv. Anything else is the user re-launching
             // the app — except a COM server launch, which only happens if this
             // instance failed to register the activator, and must not put a
-            // window on screen for a press meant to run in the background.
+            // window on screen for a press meant to run in the background, and
+            // our own login registration (below).
             #[cfg(target_os = "windows")]
             let handled = {
                 // Deliver first, decide about the window after: a click only
@@ -1380,11 +1399,12 @@ pub fn run() {
                 windows_activator::is_activation_launch(&argv)
             };
             #[cfg(not(target_os = "windows"))]
-            let handled = {
-                let _ = argv;
-                false
-            };
-            if !handled {
+            let handled = false;
+            // Our own login registration starting a second copy is never the
+            // user asking for the app. With Always Start Hidden the copy already
+            // running may have come up hidden from a launch that carried no
+            // flag, and raising here would put the window on screen at login.
+            if !handled && !autostart::has_flag(&argv) {
                 raise_or_open_main_window(app);
             }
         }))
@@ -1462,11 +1482,11 @@ pub fn run() {
             // handle_page_load still owns the reveal, so no unpainted flash.
             // `args_os`, not `args`: the latter panics on non-UTF-8 arguments.
             #[cfg(target_os = "windows")]
-            {
+            let delivered_a_click = {
                 let argv: Vec<String> = std::env::args_os()
                     .filter_map(|arg| arg.into_string().ok())
                     .collect();
-                handle_scheme_argv(&handle, &argv);
+                let delivered = handle_scheme_argv(&handle, &argv);
                 // COM started this process only to serve a button press, and a
                 // press that completes in the background must not put a window
                 // on screen for it. Which press it is arrives after setup, so
@@ -1479,22 +1499,40 @@ pub fn run() {
                     log::info!("started to serve a toast activation — not opening a window");
                     return Ok(());
                 }
-            }
+                delivered
+            };
+            // macOS delivers a click on a cold start after setup, through the
+            // notification center's delegate, and `show_primary_window` builds
+            // the window for it in a headless session.
+            #[cfg(not(target_os = "windows"))]
+            let delivered_a_click = false;
 
             // After the toast-activation return above: a COM server launch is
             // transient and has no business rewriting a login registration.
             autostart::reconcile_on_startup(&handle);
 
-            // Started by the OS at login, not by the user. Everything the app
-            // is useful for while closed — notifications, a live session — is
-            // already running by this point; the window is the one thing a
-            // login start must not put on screen.
-            let headless = autostart::launched_at_login() && !asked_for_a_window;
+            // Started by the OS at login, not by the user — or the user asked
+            // for every start to be like one. Everything the app is useful for
+            // while closed — notifications, a live session — is already running
+            // by this point; the window is the one thing such a start must not
+            // put on screen. A toast click that cold-started the app was stashed
+            // above for a window that only setup will build, so it wins.
+            let at_login = autostart::launched_at_login();
+            let headless = !asked_for_a_window
+                && !delivered_a_click
+                && (at_login || autostart::start_hidden(&handle));
             // Recorded so `show_primary_window` can tell "no window yet" from
             // "no window ever", which argv alone cannot answer.
             autostart::set_headless(headless);
             if headless {
-                log::info!("[autostart] started at login — staying in the tray");
+                log::info!(
+                    "[autostart] {} — staying in the tray",
+                    if at_login {
+                        "started at login"
+                    } else {
+                        "always start hidden is on"
+                    }
+                );
                 #[cfg(target_os = "macos")]
                 let _ = handle.set_activation_policy(ActivationPolicy::Accessory);
             }

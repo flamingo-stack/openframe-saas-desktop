@@ -128,13 +128,12 @@ to discover against, are out of scope for this shell.
 `…\CurrentVersion\Run` value on Windows, a `~/.config/autostart` desktop entry on
 Linux — and carries `--autostart`, which is the shell's only signal that a launch
 came from the OS rather than the user. That flag (or **Always Start Hidden**,
-below) suppresses two things: building
-the main window, and — on macOS — the Regular activation policy, which would
-otherwise leave a dock icon with nothing behind it. Everything a login start
-exists for (tray, token refresh, NATS, notifications) is already wired
-independently of any window; the tray's **Show** builds one on demand, and so
-does a notification click, which would otherwise do nothing for the life of the
-process.
+below) suppresses two things: building the main window, and — on macOS — the
+Regular activation policy, which would otherwise leave a dock icon with nothing
+behind it. Everything a login start exists for (tray, token refresh, NATS,
+notifications) is already wired independently of any window; the tray's
+**Show** builds one on demand, and so does a notification click, which would
+otherwise do nothing for the life of the process.
 
 `tauri`'s `restart()` re-spawns with the process's own argv, so an update taken
 silently at login relaunches still headless. When the user *does* have a window
@@ -189,10 +188,10 @@ and `write_atomic`, which the crate already has.
   notification click or a second launch brings the window up. Two things still
   win over it: an update's `autostart_show_window_next_start`, and on Windows a
   toast click that cold-started the app, whose payload setup has just stashed
-  for a window only setup builds. Not covered: anything that reaches an
-  *already running* instance — if macOS session restore finds the instance
-  launchd started and reopens it, that is a `RunEvent::Reopen`, the same event as
-  the user clicking the app, and raises the window.
+  for a window only setup builds. When the hidden copy started first and our
+  registration starts a second one, the single-instance plugin forwards that
+  launch's `--autostart`, and a forwarded flag raises nothing. The opposite
+  order is not covered — see Known gaps.
 
 ## Security model
 
@@ -252,3 +251,12 @@ logs a boot marker with the injected `window.__ENV` and the page origin.
   plist are written at runtime. On Windows the leftover is a silent no-op; on
   macOS launchd logs a failure each login. Windows could be fixed with an NSIS
   uninstall hook; macOS has no uninstaller to hook.
+- **Always Start Hidden cannot hold back a flagless launch that reaches a
+  running copy.** When our registration's copy starts first and a login item
+  added by hand starts second, the second arrives as a forwarded launch without
+  the flag (Windows) or as a `RunEvent::Reopen` (macOS: a Login Items entry or a
+  session restore reopening the launchd copy). Both are exactly what the user
+  opening the app looks like, so the window comes up. On Windows this is the
+  usual order for a Startup-folder entry, which Explorer generally starts after
+  the Run keys. A hand-added entry should replace **Start at Login**, not sit
+  beside it.

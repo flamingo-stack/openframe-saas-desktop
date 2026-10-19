@@ -356,7 +356,7 @@ pub(crate) struct AppConfig {
     pub(crate) autostart_show_window_next_start: Option<bool>,
     /// Tray "Always Start Hidden": every cold start stays in the tray, not only
     /// the ones the login registration makes. Shell-written by the tray toggle;
-    /// absent (or anything but `true`) is today's behavior.
+    /// absent (or anything but `true`) leaves only a login start in the tray.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) start_hidden: Option<bool>,
 }
@@ -1339,6 +1339,7 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     // Held so the webview's toggle moves the same check mark the tray does.
     app.manage(autostart::TrayCheck(autostart_i));
     autostart::sync_tray(app.handle());
+
     app.manage(autostart::StartHiddenCheck(start_hidden_i));
     autostart::sync_start_hidden_tray(app.handle());
 
@@ -1383,7 +1384,8 @@ pub fn run() {
             // carrying the URI in argv. Anything else is the user re-launching
             // the app — except a COM server launch, which only happens if this
             // instance failed to register the activator, and must not put a
-            // window on screen for a press meant to run in the background.
+            // window on screen for a press meant to run in the background, and
+            // our own login registration (below).
             #[cfg(target_os = "windows")]
             let handled = {
                 // Deliver first, decide about the window after: a click only
@@ -1397,11 +1399,12 @@ pub fn run() {
                 windows_activator::is_activation_launch(&argv)
             };
             #[cfg(not(target_os = "windows"))]
-            let handled = {
-                let _ = argv;
-                false
-            };
-            if !handled {
+            let handled = false;
+            // Our own login registration starting a second copy is never the
+            // user asking for the app. With Always Start Hidden the copy already
+            // running may have come up hidden from a launch that carried no
+            // flag, and raising here would put the window on screen at login.
+            if !handled && !autostart::has_flag(&argv) {
                 raise_or_open_main_window(app);
             }
         }))
@@ -1514,16 +1517,17 @@ pub fn run() {
             // by this point; the window is the one thing such a start must not
             // put on screen. A toast click that cold-started the app was stashed
             // above for a window that only setup will build, so it wins.
+            let at_login = autostart::launched_at_login();
             let headless = !asked_for_a_window
                 && !delivered_a_click
-                && (autostart::launched_at_login() || autostart::start_hidden(&handle));
+                && (at_login || autostart::start_hidden(&handle));
             // Recorded so `show_primary_window` can tell "no window yet" from
             // "no window ever", which argv alone cannot answer.
             autostart::set_headless(headless);
             if headless {
                 log::info!(
                     "[autostart] {} — staying in the tray",
-                    if autostart::launched_at_login() {
+                    if at_login {
                         "started at login"
                     } else {
                         "always start hidden is on"

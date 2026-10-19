@@ -3,9 +3,7 @@
 //! Registration is per-user and carries [`FLAG`], which is the only way this
 //! process learns it was started by the OS rather than by the user — and so how
 //! it knows to stay in the tray instead of opening a window. (The other way is
-//! the user's own "Always Start Hidden", see [`start_hidden`], which covers the
-//! launches the flag cannot: a login item someone added by hand, a startup
-//! script, a session restore.) Everything
+//! the user's own "Always Start Hidden", see [`start_hidden`].) Everything
 //! the app does while it sits there (tray, token refresh, NATS, notifications)
 //! is already wired independently of any window, so a login start needs only two
 //! things from the shell: not building one, and — on macOS — an Accessory
@@ -74,8 +72,14 @@ pub(crate) fn launched_at_login() -> bool {
     has_flag(std::env::args_os())
 }
 
-fn has_flag<I: IntoIterator<Item = std::ffi::OsString>>(args: I) -> bool {
-    args.into_iter().any(|arg| arg == FLAG)
+/// Whether a launch's arguments carry [`FLAG`]: this process's own, or a second
+/// launch's that the single-instance plugin forwarded.
+pub(crate) fn has_flag<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    args.into_iter().any(|arg| arg.as_ref() == FLAG)
 }
 
 /// Whether this process is going to live in the tray without ever building a
@@ -1012,7 +1016,9 @@ pub(crate) fn start_hidden(app: &AppHandle) -> bool {
     load_config(app).start_hidden == Some(true)
 }
 
-/// The tray's "Always Start Hidden" check item. Registered by `build_tray`.
+/// The tray's "Always Start Hidden" check item, kept because the menu handler
+/// is handed only the item's id and has to put the stored value back on it.
+/// Registered by `build_tray`.
 pub(crate) struct StartHiddenCheck(pub(crate) CheckMenuItem<Wry>);
 
 /// Put the stored setting on the tray item.

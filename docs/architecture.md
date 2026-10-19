@@ -127,7 +127,8 @@ to discover against, are out of scope for this shell.
 `~/Library/LaunchAgents/com.openframe.console.plist` on macOS, an `HKCU`
 `…\CurrentVersion\Run` value on Windows, a `~/.config/autostart` desktop entry on
 Linux — and carries `--autostart`, which is the shell's only signal that a launch
-came from the OS rather than the user. That flag suppresses two things: building
+came from the OS rather than the user. That flag (or **Always Start Hidden**,
+below) suppresses two things: building
 the main window, and — on macOS — the Regular activation policy, which would
 otherwise leave a dock icon with nothing behind it. Everything a login start
 exists for (tray, token refresh, NATS, notifications) is already wired
@@ -179,6 +180,19 @@ and `write_atomic`, which the crate already has.
   `autostart_status` / `autostart_set` commands for the frontend. Both go through
   the same state, so either moves the same check mark. As app-defined commands
   they need no capability entry.
+- **Always Start Hidden** (tray check item, `start_hidden` in config.json) makes
+  every cold start headless, not only a flagged one. The flag marks only the
+  launches our own registration makes; a login item the user added by hand, an
+  MDM or startup-folder script, or the OS restoring the session start the app
+  without it, and from inside the process they are indistinguishable from the
+  user opening it. So the setting covers a manual launch too — the tray icon, a
+  notification click or a second launch brings the window up. Two things still
+  win over it: an update's `autostart_show_window_next_start`, and on Windows a
+  toast click that cold-started the app, whose payload setup has just stashed
+  for a window only setup builds. Not covered: anything that reaches an
+  *already running* instance — if macOS session restore finds the instance
+  launchd started and reopens it, that is a `RunEvent::Reopen`, the same event as
+  the user clicking the app, and raises the window.
 
 ## Security model
 

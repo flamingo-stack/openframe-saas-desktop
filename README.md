@@ -143,6 +143,7 @@ Other keys, all optional:
 | `autostart_enforced` | Pins **Start at Login** on (`true`) or off (`false`) for a managed install, and takes the toggle away from the user. Absent leaves the choice to them. |
 | `autostart_configured` | Shell-written. Records that the start-at-login default has been applied, so it is applied once rather than re-asserted over a user who turned it off. |
 | `autostart_show_window_next_start` | Shell-written, cleared on the next launch. Set by an update that restarts while a window is open, so the relaunch shows one even in a login session. |
+| `start_hidden` | Shell-written by the tray's **Always Start Hidden**. `true` keeps every cold start in the tray, not only a login start. |
 
 **Gateway prerequisite:** CORS must allow the shell's origins —
 `tauri://localhost` (macOS/Linux) and `http://tauri.localhost` (Windows) —
@@ -166,7 +167,9 @@ Without it the UI renders and every data call fails.
   Run entry on Windows, an XDG autostart entry on Linux) and on by default. A
   login start carries `--autostart` and stays in the tray; the window is only
   built when the user asks for one, from the tray or a notification — or when an
-  update restarted a session that already had one open.
+  update restarted a session that already had one open. The tray's **Always
+  Start Hidden** extends that to every cold start, for launches that do not carry
+  the flag (a login item added by hand, a startup script, a session restore).
 
 See [docs/auth-and-notifications.md](docs/auth-and-notifications.md) for how
 those work, and [docs/architecture.md](docs/architecture.md) for the shell

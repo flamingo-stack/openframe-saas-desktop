@@ -27,10 +27,20 @@ viability and cold-start time.
 ## Bundle pipeline
 
 `scripts/build-web.sh` (wrapped by `make web`, aliased `npm run build:web`)
-clones or refreshes the frontend into git-ignored `.frontend/` — shallow, single
-ref — installs, runs `OPENFRAME_BUILD_TARGET=export npm run build`, and copies
-`dist/` to `www/`. `FRONTEND_DIR` points it at an existing checkout instead and
+clones the frontend into git-ignored `.frontend/` — shallow, single ref, fresh on
+every build so a tag checkout keeps its tag for the bundle's version stamp — installs, runs `OPENFRAME_BUILD_TARGET=export npm run build` in the web app
+(`apps/web/` since the frontend's 1.0.147 monorepo move, the repo root before),
+and copies its `dist/` to `www/`. `FRONTEND_DIR` points it at an existing checkout instead and
 runs no git operations against it.
+
+The ref is `FRONTEND_REF`, and it is required: there is no `main` default, so a
+build never silently ships whatever the frontend's tip happens to be. A release
+passes the frontend image tag prod runs (`openframe-saas.frontend.image.tag` in
+openframe-saas-tenant's `manifests/tenant/values-prod.yaml`); the frontend's
+release workflow creates a GitHub release of the same name at the built commit,
+and `release.yml` verifies the tag exists before any build leg starts. Only the
+rolling `latest` build from a push to `main` tracks frontend `main`, matching the
+dev environment's `latest` image.
 
 `www/` is a generated artifact. `tauri.conf.json` sets `frontendDist: "../www"`,
 and `generate_context!` embeds the directory **at compile time** — so `www/` must
@@ -117,13 +127,13 @@ to discover against, are out of scope for this shell.
 `~/Library/LaunchAgents/com.openframe.console.plist` on macOS, an `HKCU`
 `…\CurrentVersion\Run` value on Windows, a `~/.config/autostart` desktop entry on
 Linux — and carries `--autostart`, which is the shell's only signal that a launch
-came from the OS rather than the user. That flag suppresses two things: building
-the main window, and — on macOS — the Regular activation policy, which would
-otherwise leave a dock icon with nothing behind it. Everything a login start
-exists for (tray, token refresh, NATS, notifications) is already wired
-independently of any window; the tray's **Show** builds one on demand, and so
-does a notification click, which would otherwise do nothing for the life of the
-process.
+came from the OS rather than the user. That flag (or **Always Start Hidden**,
+below) suppresses two things: building the main window, and — on macOS — the
+Regular activation policy, which would otherwise leave a dock icon with nothing
+behind it. Everything a login start exists for (tray, token refresh, NATS,
+notifications) is already wired independently of any window; the tray's
+**Show** builds one on demand, and so does a notification click, which would
+otherwise do nothing for the life of the process.
 
 `tauri`'s `restart()` re-spawns with the process's own argv, so an update taken
 silently at login relaunches still headless. When the user *does* have a window
@@ -169,6 +179,19 @@ and `write_atomic`, which the crate already has.
   `autostart_status` / `autostart_set` commands for the frontend. Both go through
   the same state, so either moves the same check mark. As app-defined commands
   they need no capability entry.
+- **Always Start Hidden** (tray check item, `start_hidden` in config.json) makes
+  every cold start headless, not only a flagged one. The flag marks only the
+  launches our own registration makes; a login item the user added by hand, an
+  MDM or startup-folder script, or the OS restoring the session start the app
+  without it, and from inside the process they are indistinguishable from the
+  user opening it. So the setting covers a manual launch too — the tray icon, a
+  notification click or a second launch brings the window up. Two things still
+  win over it: an update's `autostart_show_window_next_start`, and on Windows a
+  toast click that cold-started the app, whose payload setup has just stashed
+  for a window only setup builds. When the hidden copy started first and our
+  registration starts a second one, the single-instance plugin forwards that
+  launch's `--autostart`, and a forwarded flag raises nothing. The opposite
+  order is not covered — see Known gaps.
 
 ## Security model
 
@@ -228,3 +251,12 @@ logs a boot marker with the injected `window.__ENV` and the page origin.
   plist are written at runtime. On Windows the leftover is a silent no-op; on
   macOS launchd logs a failure each login. Windows could be fixed with an NSIS
   uninstall hook; macOS has no uninstaller to hook.
+- **Always Start Hidden cannot hold back a flagless launch that reaches a
+  running copy.** When our registration's copy starts first and a login item
+  added by hand starts second, the second arrives as a forwarded launch without
+  the flag (Windows) or as a `RunEvent::Reopen` (macOS: a Login Items entry or a
+  session restore reopening the launchd copy). Both are exactly what the user
+  opening the app looks like, so the window comes up. On Windows this is the
+  usual order for a Startup-folder entry, which Explorer generally starts after
+  the Run keys. A hand-added entry should replace **Start at Login**, not sit
+  beside it.

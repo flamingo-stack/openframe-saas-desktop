@@ -25,7 +25,7 @@ OAuth callback has no way back into the app, leaving sign-in unable to complete.
 
 ```sh
 npm install
-npm run build:web   # clone + build openframe-oss-frontend, stage into www/
+FRONTEND_REF=main npm run build:web   # clone + build openframe-oss-frontend, stage into www/
 npm run dev         # tauri dev
 ```
 
@@ -50,7 +50,7 @@ bakes no host.
 ```sh
 make lint     # rustfmt --check + clippy -D warnings
 make test     # cargo test
-make build OPENFRAME_SHARED_HOST_URL=https://auth.example.com
+make build OPENFRAME_SHARED_HOST_URL=https://auth.example.com FRONTEND_REF=1.0.100
 ```
 
 | Variable | Purpose |
@@ -60,12 +60,23 @@ make build OPENFRAME_SHARED_HOST_URL=https://auth.example.com
 | `TARGET` | Rust target triple for cross-compilation. |
 | `BUNDLES` | Bundle subset, e.g. `BUNDLES=app` for an unsigned macOS `.app`. |
 | `FRONTEND_DIR` | Use an existing frontend checkout instead of cloning. No git operations are run against it — this is the local dev loop. |
-| `FRONTEND_REF` | Frontend branch or tag to build. Default `main`. |
+| `FRONTEND_REF` | **Required unless `FRONTEND_DIR` is set.** Frontend git tag or branch to build; no default, so a build never silently tracks `main`. A release uses the frontend image tag prod runs (see [Releasing](#releasing)). |
 | `FRONTEND_REPO` | Frontend origin, if not the public repo. |
 
 Code signing and notarization are deliberately **not** in the Makefile — they run
 against the produced artifact, which is why `tauri.conf.json` sets
 `certificateThumbprint: null`.
+
+## Releasing
+
+`release.yml` on `workflow_dispatch` takes a mandatory `frontend_tag`: the
+openframe-oss-frontend image tag prod runs, `openframe-saas.frontend.image.tag`
+in `manifests/tenant/values-prod.yaml` of openframe-saas-tenant. The pipeline
+resolves the frontend git tag of the same name (the frontend release workflow
+creates a GitHub release for every released image) and builds the static export
+from that commit. Pushes to `main` build the rolling
+`latest` prerelease from frontend `main`, the same source as the dev
+environment's `latest` image.
 
 ## Configuration
 
@@ -132,6 +143,7 @@ Other keys, all optional:
 | `autostart_enforced` | Pins **Start at Login** on (`true`) or off (`false`) for a managed install, and takes the toggle away from the user. Absent leaves the choice to them. |
 | `autostart_configured` | Shell-written. Records that the start-at-login default has been applied, so it is applied once rather than re-asserted over a user who turned it off. |
 | `autostart_show_window_next_start` | Shell-written, cleared on the next launch. Set by an update that restarts while a window is open, so the relaunch shows one even in a login session. |
+| `start_hidden` | Shell-written by the tray's **Always Start Hidden**. `true` keeps every cold start in the tray, not only a login start. |
 
 **Gateway prerequisite:** CORS must allow the shell's origins —
 `tauri://localhost` (macOS/Linux) and `http://tauri.localhost` (Windows) —
@@ -155,7 +167,9 @@ Without it the UI renders and every data call fails.
   Run entry on Windows, an XDG autostart entry on Linux) and on by default. A
   login start carries `--autostart` and stays in the tray; the window is only
   built when the user asks for one, from the tray or a notification — or when an
-  update restarted a session that already had one open.
+  update restarted a session that already had one open. The tray's **Always
+  Start Hidden** extends that to every cold start, for launches that do not carry
+  the flag (a login item added by hand, a startup script, a session restore).
 
 See [docs/auth-and-notifications.md](docs/auth-and-notifications.md) for how
 those work, and [docs/architecture.md](docs/architecture.md) for the shell
@@ -174,7 +188,7 @@ src-tauri/
   src/nats.rs         NATS-over-WebSocket connection lifecycle
   src/notifications.rs  subscription, dispatch, click delivery
   src/notification_actions.rs  what a notification button does, and its session gate
-  src/chat_api.rs     the REST calls a button completes without a window
+  src/chat_api.rs     the GraphQL mutations a button completes without a window
   src/macos_un.rs     UNUserNotificationCenter backend
   src/windows_toast.rs  toast XML + the button-argument codec
   src/windows_activator.rs  COM activator the toast buttons activate

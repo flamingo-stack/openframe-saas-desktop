@@ -5,8 +5,14 @@
 # Source of the frontend, in order:
 #   FRONTEND_DIR=/path/to/checkout   use an existing working copy as-is (no git
 #                                    operations — this is the local dev loop)
-#   otherwise                        clone/refresh FRONTEND_REPO at FRONTEND_REF
-#                                    into .frontend/ (git-ignored)
+#   otherwise                        fresh shallow clone of FRONTEND_REPO at
+#                                    FRONTEND_REF into .frontend/ (git-ignored),
+#                                    re-cloned on every build. FRONTEND_REF
+#                                    is required — no `main` default, so a build
+#                                    never silently ships the frontend's tip. A
+#                                    release passes the frontend image tag prod
+#                                    runs; the frontend release workflow tags
+#                                    that commit with a GitHub release.
 #
 # Mirrors openframe-mobile/scripts/build-web.sh, with one difference: no
 # inject-env.mjs step — the desktop shell injects window.__ENV at RUNTIME (see
@@ -22,7 +28,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FRONTEND_REPO="${FRONTEND_REPO:-https://github.com/flamingo-stack/openframe-oss-frontend}"
-FRONTEND_REF="${FRONTEND_REF:-main}"
+FRONTEND_REF="${FRONTEND_REF:-}"
 CHECKOUT="$HERE/.frontend"
 
 if [ -n "${FRONTEND_DIR:-}" ]; then
@@ -32,41 +38,53 @@ if [ -n "${FRONTEND_DIR:-}" ]; then
   fi
   echo "▸ Using local frontend checkout: $FRONTEND_DIR"
 else
-  # Shallow, single-ref: this is a build input, not something to develop in.
-  if [ -d "$CHECKOUT/.git" ]; then
-    echo "▸ Refreshing $CHECKOUT ($FRONTEND_REF)…"
-    git -C "$CHECKOUT" remote set-url origin "$FRONTEND_REPO"
-    git -C "$CHECKOUT" fetch --depth 1 origin "$FRONTEND_REF"
-  else
-    echo "▸ Cloning $FRONTEND_REPO ($FRONTEND_REF) → .frontend/…"
-    rm -rf "$CHECKOUT"
-    git clone --depth 1 --branch "$FRONTEND_REF" "$FRONTEND_REPO" "$CHECKOUT"
-    git -C "$CHECKOUT" fetch --depth 1 origin "$FRONTEND_REF"
+  if [ -z "$FRONTEND_REF" ]; then
+    echo "✗ FRONTEND_REF is required: the frontend image tag to release against (e.g. 1.0.100), or a branch for a dev build" >&2
+    exit 1
   fi
-  # Hard reset, not merge: local edits here are never intentional.
-  git -C "$CHECKOUT" checkout --quiet --detach FETCH_HEAD
-  git -C "$CHECKOUT" clean -qfd
+  # Shallow, single-ref: this is a build input, not something to develop in.
+  # Re-cloned every time rather than refreshed in place: fetching a tag into an
+  # existing shallow checkout leaves no local tag ref, so the bundle's
+  # `git describe` (its X-OpenFrame-Client version) would report a bare sha
+  # instead of the release. `npm ci` below reinstalls from scratch either way.
+  echo "▸ Cloning $FRONTEND_REPO ($FRONTEND_REF) → .frontend/…"
+  rm -rf "$CHECKOUT"
+  git -c advice.detachedHead=false clone --quiet --depth 1 --branch "$FRONTEND_REF" "$FRONTEND_REPO" "$CHECKOUT"
   FRONTEND_DIR="$CHECKOUT"
-  echo "▸ Frontend at $(git -C "$CHECKOUT" rev-parse --short HEAD)"
+  echo "▸ Frontend $FRONTEND_REF at $(git -C "$CHECKOUT" rev-parse --short HEAD)"
 fi
 
-echo "▸ Installing frontend dependencies…"
-if [ -f "$FRONTEND_DIR/package-lock.json" ]; then
-  ( cd "$FRONTEND_DIR" && npm ci )
+# openframe-oss-frontend became a monorepo at 1.0.147 and the web app moved to
+# apps/web; earlier tags have it at the root. FRONTEND_DIR may name either the
+# repo root or apps/web itself.
+WEB_DIR="$FRONTEND_DIR"
+if [ -f "$FRONTEND_DIR/apps/web/package.json" ]; then
+  WEB_DIR="$FRONTEND_DIR/apps/web"
+fi
+# Without this, npm walks up to the nearest package.json — this repo's — and
+# `npm run build` becomes `tauri build` against a www/ that doesn't exist yet.
+if [ ! -f "$WEB_DIR/package.json" ]; then
+  echo "✗ no web app in $FRONTEND_DIR (expected package.json there or in apps/web/)" >&2
+  exit 1
+fi
+
+echo "▸ Installing frontend dependencies ($WEB_DIR)…"
+if [ -f "$WEB_DIR/package-lock.json" ]; then
+  ( cd "$WEB_DIR" && npm ci )
 else
-  ( cd "$FRONTEND_DIR" && npm install )
+  ( cd "$WEB_DIR" && npm install )
 fi
 
 echo "▸ Building static export…"
-( cd "$FRONTEND_DIR" && OPENFRAME_BUILD_TARGET="export" npm run build )
+( cd "$WEB_DIR" && OPENFRAME_BUILD_TARGET="export" npm run build )
 
-if [ ! -d "$FRONTEND_DIR/dist" ]; then
-  echo "✗ export produced no dist/ in $FRONTEND_DIR" >&2
+if [ ! -d "$WEB_DIR/dist" ]; then
+  echo "✗ export produced no dist/ in $WEB_DIR" >&2
   exit 1
 fi
 
 echo "▸ Staging export bundle → www/"
 rm -rf "$HERE/www"
-cp -R "$FRONTEND_DIR/dist" "$HERE/www"
+cp -R "$WEB_DIR/dist" "$HERE/www"
 
 echo "✓ web bundle staged. Next: npm run dev (or make build)"

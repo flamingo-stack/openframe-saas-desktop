@@ -3,7 +3,7 @@
 # Mirrors clients/openframe-chat/Makefile in openframe-oss-tenant so the same CI
 # shape drives both:
 #   make lint
-#   make build TARGET=<rust-target> OPENFRAME_VERSION=<v> [BUNDLES=app]
+#   make build TARGET=<rust-target> OPENFRAME_VERSION=<v> FRONTEND_REF=<tag> [BUNDLES=app]
 #
 # Two differences, both forced by this shell bundling the openframe-frontend
 # static export rather than building its own UI:
@@ -11,6 +11,12 @@
 #     bundle is embedded by generate_context! at compile time, so every Rust
 #     target needs www/ to exist — hence the placeholder dependency on lint/test.
 #   - the shared auth host is baked in at compile time (see below).
+#
+# `make build` is the CI path: tauri.conf.json asks for updater artifacts, which
+# fail without TAURI_SIGNING_PRIVATE_KEY. A local unsigned .app skips them:
+#   make web FRONTEND_DIR=<frontend checkout>
+#   OPENFRAME_SHARED_HOST_URL=<host> npx tauri build --bundles app \
+#     --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
 CARGO ?= cargo
 NPM ?= npm
@@ -57,8 +63,9 @@ deps:
 	$(NPM) ci
 
 # Stage the openframe-oss-frontend static export into www/. Clones/refreshes
-# .frontend/ by default; FRONTEND_DIR=<path> uses an existing checkout instead,
-# FRONTEND_REF=<branch|tag> pins the ref.
+# .frontend/ at FRONTEND_REF=<tag|branch> — required; a release passes the
+# frontend image tag prod runs. FRONTEND_DIR=<path> uses an existing checkout
+# instead and needs no ref.
 web:
 	$(NPM) run build:web
 

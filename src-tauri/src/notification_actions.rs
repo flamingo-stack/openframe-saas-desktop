@@ -30,17 +30,11 @@ const DIALOG_CHANGED_EVENT: &str = "chat:dialog-changed";
 /// Notification types that earn action buttons. The rest of the set (tickets,
 /// client chats) has no action the shell can complete on its own.
 ///
-/// Three spellings for one decision: the spec catalog split the approval type by
-/// ticket linkage, the legacy context calls both `ADMIN_APPROVAL_REQUEST`, and
-/// which arrives depends on the contract that wrote the envelope. The buttons
-/// are the same either way — a press resolves the request by id.
-const APPROVAL_TYPES: [&str; 3] = [
-    "ADMIN_APPROVAL_REQUEST",
-    "TICKET_APPROVAL_REQUEST",
-    "MINGO_APPROVAL_REQUEST",
-];
-/// Unsplit, and spelled the same in both contracts.
-const MESSAGE_CONTEXT_TYPE: &str = "ADMIN_AI_MESSAGE";
+/// Two spellings for one decision: the catalog splits the approval type by
+/// ticket linkage. The buttons are the same either way — a press resolves the
+/// request by id.
+const APPROVAL_TYPES: [&str; 2] = ["TICKET_APPROVAL_REQUEST", "MINGO_APPROVAL_REQUEST"];
+const MESSAGE_TYPE: &str = "ADMIN_AI_MESSAGE";
 
 /// Which button set a notification gets. Derived from the click payload rather
 /// than passed in, so the envelope contract lives in one place and the same
@@ -72,7 +66,7 @@ fn kind_for(click: Option<&serde_json::Value>) -> ActionKind {
 
 /// The approval request a payload is about — the primitive fact the Approval
 /// button set is derived from, rather than the other way round. `None` unless
-/// the context says it is an approval **and** the id survived the payload
+/// the type says it is an approval **and** the id survived the payload
 /// projection, because an Approve that can resolve nothing is worse than no
 /// Approve at all.
 ///
@@ -80,17 +74,17 @@ fn kind_for(click: Option<&serde_json::Value>) -> ActionKind {
 /// toast this replaces, and which request a press resolves are all the same
 /// question.
 pub(crate) fn approval_request_id(click: Option<&serde_json::Value>) -> Option<String> {
-    context_str(click, "type")
+    payload_type(click)
         .is_some_and(|kind| APPROVAL_TYPES.contains(&kind.as_str()))
-        .then(|| context_str(click, "approvalRequestId"))
+        .then(|| payload_attr(click, "approvalRequestId"))
         .flatten()
 }
 
 /// The conversation a payload is about, on the same terms as
 /// [`approval_request_id`].
 fn dialog_id(click: Option<&serde_json::Value>) -> Option<String> {
-    (context_str(click, "type").as_deref() == Some(MESSAGE_CONTEXT_TYPE))
-        .then(|| context_str(click, "dialogId"))
+    (payload_type(click).as_deref() == Some(MESSAGE_TYPE))
+        .then(|| payload_attr(click, "dialogId"))
         .flatten()
 }
 
@@ -115,19 +109,17 @@ const SETTLED_RESOLUTIONS: [&str; 3] = ["APPROVED", "REJECTED", "CANCELLED"];
 
 /// Record the verdict an envelope carries, if it carries one. The gateway
 /// republishes an approval request once it is decided — same notification id,
-/// `eventType: "UPDATED"`, the verdict in `context.resolution` — so that every
-/// consumer can bring its copy up to date. Taking it at face value is what lets
-/// a decision made anywhere (the web UI, another device, another admin) reach
-/// the banner sitting in this machine's Action Center.
+/// `eventType: "UPDATED"`, the verdict in `attributes.resolution` — so that
+/// every consumer can bring its copy up to date. Taking it at face value is what
+/// lets a decision made anywhere (the web UI, another device, another admin)
+/// reach the banner sitting in this machine's Action Center.
 ///
-/// Takes a source object carrying the resolution fields — the envelope's
-/// `attributes` map (the spec contract) or its legacy `context` object — not
-/// the projected click payload the rest of this module reads: `resolution` is
-/// not one of the fields that survives the projection. The caller reads both
-/// sources; recording is idempotent.
-pub(crate) fn note_resolution(context: Option<&serde_json::Value>) {
-    let Some(context) = context else { return };
-    let settled = string_field(context, "resolution").is_some_and(|resolution| {
+/// Takes the envelope's `attributes` map — not the projected click payload the
+/// rest of this module reads: `resolution` is not one of the fields that
+/// survives the projection. Recording is idempotent.
+pub(crate) fn note_resolution(attributes: Option<&serde_json::Value>) {
+    let Some(attributes) = attributes else { return };
+    let settled = string_field(attributes, "resolution").is_some_and(|resolution| {
         SETTLED_RESOLUTIONS
             .iter()
             .any(|settled| resolution.eq_ignore_ascii_case(settled))
@@ -135,7 +127,7 @@ pub(crate) fn note_resolution(context: Option<&serde_json::Value>) {
     if !settled {
         return;
     }
-    if let Some(request_id) = string_field(context, "approvalRequestId") {
+    if let Some(request_id) = string_field(attributes, "approvalRequestId") {
         remember_resolved(&request_id);
     }
 }
@@ -246,7 +238,7 @@ fn announce_dialog_change(app: &AppHandle, context: &ActionContext) {
     // exists to decide whether a REPLY has somewhere to go. An approval carries
     // a conversation too, and resolving one changes it just as much — the gate
     // would drop exactly the notification whose dialog most needs refetching.
-    let Some(dialog_id) = context_str(context.payload.as_ref(), "dialogId") else {
+    let Some(dialog_id) = payload_attr(context.payload.as_ref(), "dialogId") else {
         return;
     };
     if let Err(e) = app.emit_to(
@@ -399,33 +391,38 @@ pub(crate) fn post(
     crate::windows_toast::post(app, title, body, click, user_id, kind, delivery);
 }
 
-/// A string field of the click payload's `context`, if present and non-empty.
-fn context_str(click: Option<&serde_json::Value>, key: &str) -> Option<String> {
-    string_field(click?.pointer("/context")?, key)
+/// The click payload's `type`, if present and non-empty.
+fn payload_type(click: Option<&serde_json::Value>) -> Option<String> {
+    string_field(click?, "type")
+}
+
+/// A string field of the click payload's `attributes`, if present and non-empty.
+fn payload_attr(click: Option<&serde_json::Value>, key: &str) -> Option<String> {
+    string_field(click?.pointer("/attributes")?, key)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn click(context: serde_json::Value) -> serde_json::Value {
-        serde_json::json!({ "context": context })
+    fn click(kind: &str, attributes: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "type": kind, "attributes": attributes })
     }
 
     #[test]
-    fn actionable_contexts_get_their_buttons() {
+    fn actionable_payloads_get_their_buttons() {
         assert_eq!(
-            kind_for(Some(&click(serde_json::json!({
-                "type": "ADMIN_APPROVAL_REQUEST",
-                "approvalRequestId": "req-1",
-            })))),
+            kind_for(Some(&click(
+                "MINGO_APPROVAL_REQUEST",
+                serde_json::json!({ "approvalRequestId": "req-1" })
+            ))),
             ActionKind::Approval
         );
         assert_eq!(
-            kind_for(Some(&click(serde_json::json!({
-                "type": "ADMIN_AI_MESSAGE",
-                "dialogId": "dlg-1",
-            })))),
+            kind_for(Some(&click(
+                "ADMIN_AI_MESSAGE",
+                serde_json::json!({ "dialogId": "dlg-1" })
+            ))),
             ActionKind::Message
         );
     }
@@ -433,33 +430,55 @@ mod tests {
     /// No id, no button: an Approve that cannot resolve anything is worse than
     /// no Approve at all.
     #[test]
-    fn contexts_without_the_id_the_action_needs_stay_default() {
+    fn payloads_without_the_id_the_action_needs_stay_default() {
         assert_eq!(
             kind_for(Some(&click(
-                serde_json::json!({ "type": "ADMIN_APPROVAL_REQUEST", "ticketId": "t-1" })
+                "TICKET_APPROVAL_REQUEST",
+                serde_json::json!({ "ticketId": "t-1" })
             ))),
             ActionKind::Default
         );
         assert_eq!(
             kind_for(Some(&click(
-                serde_json::json!({ "type": "ADMIN_AI_MESSAGE", "dialogId": "" })
+                "ADMIN_AI_MESSAGE",
+                serde_json::json!({ "dialogId": "" })
             ))),
             ActionKind::Default
         );
         assert_eq!(
             kind_for(Some(&click(
-                serde_json::json!({ "type": "TICKET_ASSIGNED", "ticketId": "t-1" })
+                "TICKET_ASSIGNED",
+                serde_json::json!({ "ticketId": "t-1" })
             ))),
             ActionKind::Default
         );
         assert_eq!(kind_for(None), ActionKind::Default);
     }
 
+    /// The ids live under `attributes`; the retired `context` wrapper, or ids at
+    /// the top level, earn nothing.
+    #[test]
+    fn ids_outside_attributes_earn_no_buttons() {
+        assert_eq!(
+            kind_for(Some(&serde_json::json!({
+                "context": { "type": "MINGO_APPROVAL_REQUEST", "approvalRequestId": "req-1" }
+            }))),
+            ActionKind::Default
+        );
+        assert_eq!(
+            kind_for(Some(&serde_json::json!({
+                "type": "MINGO_APPROVAL_REQUEST",
+                "approvalRequestId": "req-1"
+            }))),
+            ActionKind::Default
+        );
+    }
+
     fn approval(request_id: &str) -> serde_json::Value {
-        click(serde_json::json!({
-            "type": "ADMIN_APPROVAL_REQUEST",
-            "approvalRequestId": request_id,
-        }))
+        click(
+            "MINGO_APPROVAL_REQUEST",
+            serde_json::json!({ "approvalRequestId": request_id }),
+        )
     }
 
     /// The verdict on the wire is what settles a request, wherever it was made.
@@ -468,7 +487,6 @@ mod tests {
     #[test]
     fn only_a_terminal_resolution_settles_a_request() {
         let pending = serde_json::json!({
-            "type": "ADMIN_APPROVAL_REQUEST",
             "approvalRequestId": "wire-pending",
             "resolution": "PENDING",
         });
@@ -478,14 +496,13 @@ mod tests {
         for (i, resolution) in ["APPROVED", "rejected", "CANCELLED"].iter().enumerate() {
             let id = format!("wire-settled-{i}");
             note_resolution(Some(&serde_json::json!({
-                "type": "ADMIN_APPROVAL_REQUEST",
                 "approvalRequestId": id,
                 "resolution": resolution,
             })));
             assert!(is_resolved(&id), "{resolution} should settle the request");
         }
 
-        // Nothing to record: no verdict, no id, no context at all.
+        // Nothing to record: no verdict, no id, no attributes at all.
         note_resolution(Some(
             &serde_json::json!({ "approvalRequestId": "wire-bare" }),
         ));
@@ -493,23 +510,22 @@ mod tests {
         note_resolution(None);
     }
 
-    /// Both catalog spellings earn the same buttons as the legacy one — without
-    /// this, approvals lose their buttons the day the spec type is what arrives.
+    /// Both halves of the catalog's approval split earn the same buttons.
     #[test]
     fn every_approval_spelling_earns_the_same_buttons() {
         for kind in APPROVAL_TYPES {
             assert_eq!(
-                kind_for(Some(&click(serde_json::json!({
-                    "type": kind,
-                    "approvalRequestId": "req-1",
-                })))),
+                kind_for(Some(&click(
+                    kind,
+                    serde_json::json!({ "approvalRequestId": "req-1" })
+                ))),
                 ActionKind::Approval,
                 "{kind}"
             );
         }
     }
 
-    /// The verdict as the spec contract carries it.
+    /// The verdict as the wire carries it.
     #[test]
     fn a_verdict_in_attributes_settles_a_request() {
         note_resolution(Some(&serde_json::json!({
@@ -568,19 +584,22 @@ mod tests {
             approval_request_id(Some(&approval("req-1"))).as_deref(),
             Some("req-1")
         );
-        assert!(approval_request_id(Some(&click(serde_json::json!({
-            "type": "ADMIN_AI_MESSAGE", "dialogId": "dlg-1",
-        }))))
+        assert!(approval_request_id(Some(&click(
+            "ADMIN_AI_MESSAGE",
+            serde_json::json!({ "dialogId": "dlg-1" })
+        )))
         .is_none());
         assert!(approval_request_id(Some(&click(
-            serde_json::json!({ "type": "TICKET_ASSIGNED", "ticketId": "t-1" })
+            "TICKET_ASSIGNED",
+            serde_json::json!({ "ticketId": "t-1" })
         )))
         .is_none());
         assert!(approval_request_id(None).is_none());
         // The id an approval carries is the id a press resolves: a payload whose
         // id did not survive the projection has neither.
         assert!(approval_request_id(Some(&click(
-            serde_json::json!({ "type": "ADMIN_APPROVAL_REQUEST", "ticketId": "t-1" })
+            "TICKET_APPROVAL_REQUEST",
+            serde_json::json!({ "ticketId": "t-1" })
         )))
         .is_none());
     }

@@ -286,10 +286,11 @@ dials with a fresh bearer.
 - Notifications fire **only when the main window is hidden or unfocused**. The
   webview's own subscription keeps driving the in-app drawer — duplicate delivery,
   different sinks. A badge accumulates while hidden and clears on focus.
-- The click payload is the envelope's routing `context`, narrowed to the fields
-  the frontend's route mapping reads plus `approvalRequestId`, which the macOS
-  action buttons need. The rest of a context can be arbitrarily large, and it has
-  to fit inside a Windows activation URI.
+- The click payload is the envelope narrowed to its routing fields, in the
+  envelope's own shape: top-level `type` plus `attributes` with `ticketId`,
+  `dialogId` and `approvalRequestId` — what the frontend's route mapping reads,
+  plus the id the action buttons need. The rest of `attributes` can be
+  arbitrarily large, and the payload has to fit inside a Windows activation URI.
 - Every logout path tears the subscription down — including a session death the
   shell detects itself, which the webview may not notice for hours while idle in
   the tray. Otherwise the previous user's notification content would keep
@@ -341,8 +342,9 @@ not survive either.
 
 Some notifications complete their work from the banner, with no window and no
 webview: **Approve / Reject** on an AI tool-approval request, **Reply** on a Mingo
-message. Both are plain authenticated REST calls, so the whole decision runs in
-Rust (`chat_api.rs`) against the tenant host, with a bearer from
+message. Both are plain authenticated ai-agent GraphQL mutations
+(`resolveApprovalRequest`, `sendMessage` on `/chat/graphql`), so the whole
+decision runs in Rust (`chat_api.rs`) against the tenant host, with a bearer from
 `tokens::ensure_fresh`.
 
 Which buttons a notification earns, what a pressed one does, and how the outcome
@@ -378,14 +380,15 @@ been decided — under the same notification id, carrying:
 | Field | Meaning |
 |---|---|
 | `eventType` | `CREATED` for the first push, `UPDATED` for one that supersedes it. Absent → `CREATED`. |
-| `context.resolution` | Backend `ApprovalResolution`: `PENDING`, `APPROVED`, `REJECTED`, `CANCELLED`. Absent until decided. |
-| `context.resolvedByName` | Who decided it. |
+| `attributes.resolution` | Backend `ApprovalResolution`: `PENDING`, `APPROVED`, `REJECTED`, `CANCELLED`. |
+| `attributes.resolvedByName` | Who decided it. |
 
 That is a *correction*, not a second notification, and the shell has to read it as
 one — otherwise the republished copy arrives as a fresh banner still offering a
 decision that has already been made, whose only possible outcome is the gateway
-refusing it (`HTTP 409`). The frontend's drawer resolves this by mutating the
-existing entry in place; the shell mirrors that decision by decision:
+refusing it (`userErrors` code `ILLEGAL_STATE`). The frontend's drawer resolves
+this by mutating the existing entry in place; the shell mirrors that decision by
+decision:
 
 - **It does not alert again.** An `UPDATED` envelope is posted with
   `SuppressPopup`, so it lands in the Action Center without raising a banner, and it
@@ -404,9 +407,9 @@ existing entry in place; the shell mirrors that decision by decision:
 - **A press that beats the update is not an error.** Nothing recalls a banner the
   user is already looking at, so a press can still arrive against a settled request.
   It is caught one round-trip earlier than the gateway where the verdict is already
-  known, and past that the `409` itself is read as *already resolved*: the outcome
-  notification says so plainly instead of reporting a failure, and does not re-offer
-  a closed decision.
+  known, and past that `ILLEGAL_STATE` itself is read as *already resolved*: the
+  outcome notification says so plainly instead of reporting a failure, and does not
+  re-offer a closed decision.
 
 The tag is deliberately approval-only. Messages are not republished, and replacing
 a message toast would hide one the user has not read.
@@ -485,8 +488,8 @@ against the app's AUMID.
   > restarted. The shell does not restart system services to paper over this.
 - The class object is registered from an **MTA** thread, so activations arrive on an
   RPC thread and no message pump is involved — the only thread with a pump is
-  Tauri's event loop, which must not block on a REST call. It is registered from the
-  instance that survived the single-instance check, so COM never routes an
+  Tauri's event loop, which must not block on a network call. It is registered from
+  the instance that survived the single-instance check, so COM never routes an
   activation into a process that is about to exit.
 - Windows has no per-notification sidecar like macOS's `userInfo`, so the payload,
   the title and the delivered-to user id ride in each button's `arguments` string.
@@ -531,8 +534,8 @@ against the app's AUMID.
 - A superseding notification is folded into the banner it supersedes on **Windows
   only**. Each UN request is posted under a fresh UUID, so on macOS the update
   arrives as a second banner, and it alerts. The platform-neutral halves — no
-  buttons on a settled request, a `409` read as already resolved — apply there as
-  they do here, so the second banner is inert rather than misleading. Giving
+  buttons on a settled request, `ILLEGAL_STATE` read as already resolved — apply
+  there as they do here, so the second banner is inert rather than misleading. Giving
   `macos_un::post` the same identity (`UNNotificationRequest` replaces a request
   whose identifier it already holds) and honouring `Delivery::Update` would close
   it; it is left alone because it cannot be built or exercised from the Windows

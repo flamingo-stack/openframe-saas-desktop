@@ -73,7 +73,7 @@ pub(crate) const MAIN_LABEL: &str = "main";
 ///   in the user's **default browser**, where their SSO session already is, so
 ///   the ticket cannot be read out of a webview we control; it has to be handed
 ///   back by the OS.
-/// - `openframe-console://notify?context=…` — what a Windows toast activates
+/// - `openframe-console://notify?payload=…` — what a Windows toast activates
 ///   (`notifications::CLICK_URI_PREFIX`).
 ///
 /// Registered on macOS by `Info.plist` (`CFBundleURLTypes`) and on Windows by
@@ -354,6 +354,11 @@ pub(crate) struct AppConfig {
     /// and cleared on the next launch.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) autostart_show_window_next_start: Option<bool>,
+    /// Tray "Always Start Hidden": every cold start stays in the tray, not only
+    /// the ones the login registration makes. Shell-written by the tray toggle;
+    /// absent (or anything but `true`) leaves only a login start in the tray.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) start_hidden: Option<bool>,
 }
 
 /// The shared auth host in effect: config.json override, else the compile-time
@@ -425,6 +430,35 @@ pub(crate) fn write_atomic(path: &std::path::Path, data: &str) -> Result<(), Str
         let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
     }
     std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
+/// Whether `path` sits on a read-only mount: on macOS, Gatekeeper's App
+/// Translocation copy (a quarantined app opened where it was downloaded) or a
+/// mounted disk image — places the app runs from but does not stay. `false`
+/// when it cannot be told.
+///
+/// macOS only: elsewhere a read-only mount is not the app's home either way —
+/// a Linux AppImage always runs from one, and its updater replaces the image
+/// file instead.
+#[cfg(target_os = "macos")]
+pub(crate) fn on_read_only_mount(path: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut fs = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `path` is NUL-terminated, and `fs` is read only after statfs
+    // reported filling it.
+    if unsafe { libc::statfs(path.as_ptr(), fs.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    let flags = unsafe { fs.assume_init() }.f_flags;
+    flags & libc::MNT_RDONLY as u32 != 0
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn on_read_only_mount(_path: &std::path::Path) -> bool {
+    false
 }
 
 /// Accept "acme.openframe.ai", "https://acme.openframe.ai", or "…/" and
@@ -595,6 +629,11 @@ fn open_main_window(app: &AppHandle) -> Result<(), String> {
         .visible(false)
         .on_new_window(move |url, features| handle_new_window(&handler_app, url, features))
         .on_page_load(handle_page_load)
+        // Tauri's file-drop handler swallows every drag session at the
+        // NSDraggingDestination / WebView2 layer, so the page never sees
+        // dragover/drop and HTML5 drag-and-drop (the ticket board) is dead.
+        // Nothing here consumes file drops, so opt out of the handler.
+        .disable_drag_drop_handler()
         .build()
         .map_err(|e| e.to_string())?;
     spawn_show_fallback(&window);
@@ -710,6 +749,7 @@ fn handle_new_window(
         .visible(false)
         .on_new_window(move |u, f| handle_new_window(&child_app, u, f))
         .on_page_load(handle_page_load)
+        .disable_drag_drop_handler()
         .window_features(features)
         .build()
         {
@@ -1177,14 +1217,12 @@ fn take_pending_notification_click(window: WebviewWindow) -> Option<serde_json::
 /// `RunEvent::Opened`.
 ///
 /// Notification delivery raises the window only when there already is one, so
-/// callers still have to decide whether this process should have one at all.
+/// callers still have to decide whether this process should have one at all —
+/// which is why this reports whether it delivered anything.
 #[cfg(target_os = "windows")]
-fn handle_scheme_argv(app: &AppHandle, args: &[String]) {
-    for arg in args {
-        if handle_scheme_url(app, arg) || notifications::handle_notification_uri(app, arg) {
-            return;
-        }
-    }
+fn handle_scheme_argv(app: &AppHandle, args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| handle_scheme_url(app, arg) || notifications::handle_notification_uri(app, arg))
 }
 
 /// Register [`URI_SCHEME`] for this executable (HKCU, no elevation). Re-written
@@ -1284,12 +1322,26 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
         false,
         None::<&str>,
     )?;
+    let start_hidden_i = CheckMenuItem::with_id(
+        app,
+        "start_hidden",
+        "Always Start Hidden",
+        true,
+        false,
+        None::<&str>,
+    )?;
     let signout_i = MenuItem::with_id(app, "signout", "Sign Out", true, None::<&str>)?;
     let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show_i, &autostart_i, &signout_i, &quit_i])?;
+    let menu = Menu::with_items(
+        app,
+        &[&show_i, &autostart_i, &start_hidden_i, &signout_i, &quit_i],
+    )?;
     // Held so the webview's toggle moves the same check mark the tray does.
     app.manage(autostart::TrayCheck(autostart_i));
     autostart::sync_tray(app.handle());
+
+    app.manage(autostart::StartHiddenCheck(start_hidden_i));
+    autostart::sync_start_hidden_tray(app.handle());
 
     TrayIconBuilder::new()
         .icon(tray_icon())
@@ -1310,6 +1362,7 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => raise_or_open_main_window(app),
             "autostart" => autostart::toggle_from_tray(app),
+            "start_hidden" => autostart::toggle_start_hidden_from_tray(app),
             "signout" => {
                 if let Err(e) = sign_out(app) {
                     log::error!("sign_out failed: {e}");
@@ -1331,7 +1384,8 @@ pub fn run() {
             // carrying the URI in argv. Anything else is the user re-launching
             // the app — except a COM server launch, which only happens if this
             // instance failed to register the activator, and must not put a
-            // window on screen for a press meant to run in the background.
+            // window on screen for a press meant to run in the background, and
+            // our own login registration (below).
             #[cfg(target_os = "windows")]
             let handled = {
                 // Deliver first, decide about the window after: a click only
@@ -1345,11 +1399,12 @@ pub fn run() {
                 windows_activator::is_activation_launch(&argv)
             };
             #[cfg(not(target_os = "windows"))]
-            let handled = {
-                let _ = argv;
-                false
-            };
-            if !handled {
+            let handled = false;
+            // Our own login registration starting a second copy is never the
+            // user asking for the app. With Always Start Hidden the copy already
+            // running may have come up hidden from a launch that carried no
+            // flag, and raising here would put the window on screen at login.
+            if !handled && !autostart::has_flag(&argv) {
                 raise_or_open_main_window(app);
             }
         }))
@@ -1427,11 +1482,11 @@ pub fn run() {
             // handle_page_load still owns the reveal, so no unpainted flash.
             // `args_os`, not `args`: the latter panics on non-UTF-8 arguments.
             #[cfg(target_os = "windows")]
-            {
+            let delivered_a_click = {
                 let argv: Vec<String> = std::env::args_os()
                     .filter_map(|arg| arg.into_string().ok())
                     .collect();
-                handle_scheme_argv(&handle, &argv);
+                let delivered = handle_scheme_argv(&handle, &argv);
                 // COM started this process only to serve a button press, and a
                 // press that completes in the background must not put a window
                 // on screen for it. Which press it is arrives after setup, so
@@ -1444,22 +1499,40 @@ pub fn run() {
                     log::info!("started to serve a toast activation — not opening a window");
                     return Ok(());
                 }
-            }
+                delivered
+            };
+            // macOS delivers a click on a cold start after setup, through the
+            // notification center's delegate, and `show_primary_window` builds
+            // the window for it in a headless session.
+            #[cfg(not(target_os = "windows"))]
+            let delivered_a_click = false;
 
             // After the toast-activation return above: a COM server launch is
             // transient and has no business rewriting a login registration.
             autostart::reconcile_on_startup(&handle);
 
-            // Started by the OS at login, not by the user. Everything the app
-            // is useful for while closed — notifications, a live session — is
-            // already running by this point; the window is the one thing a
-            // login start must not put on screen.
-            let headless = autostart::launched_at_login() && !asked_for_a_window;
+            // Started by the OS at login, not by the user — or the user asked
+            // for every start to be like one. Everything the app is useful for
+            // while closed — notifications, a live session — is already running
+            // by this point; the window is the one thing such a start must not
+            // put on screen. A toast click that cold-started the app was stashed
+            // above for a window that only setup will build, so it wins.
+            let at_login = autostart::launched_at_login();
+            let headless = !asked_for_a_window
+                && !delivered_a_click
+                && (at_login || autostart::start_hidden(&handle));
             // Recorded so `show_primary_window` can tell "no window yet" from
             // "no window ever", which argv alone cannot answer.
             autostart::set_headless(headless);
             if headless {
-                log::info!("[autostart] started at login — staying in the tray");
+                log::info!(
+                    "[autostart] {} — staying in the tray",
+                    if at_login {
+                        "started at login"
+                    } else {
+                        "always start hidden is on"
+                    }
+                );
                 #[cfg(target_os = "macos")]
                 let _ = handle.set_activation_policy(ActivationPolicy::Accessory);
             }
@@ -1642,7 +1715,7 @@ mod tests {
     #[test]
     fn other_hosts_on_our_scheme_are_not_callbacks() {
         assert!(!is_auth_callback(&parse(
-            "openframe-console://notify?context=%7B%7D"
+            "openframe-console://notify?payload=%7B%7D"
         )));
     }
 
@@ -1667,5 +1740,17 @@ mod tests {
             plist.contains(&format!("<string>{URI_SCHEME}</string>")),
             "Info.plist does not register {URI_SCHEME} in CFBundleURLSchemes"
         );
+    }
+
+    // `/` is the sealed system snapshot, mounted read-only like a translocated
+    // copy or a disk image; the temp dir is on the writable Data volume, with
+    // /Applications.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_read_only_mount_is_told_apart_from_where_an_app_is_installed() {
+        assert!(on_read_only_mount(std::path::Path::new("/")));
+        assert!(!on_read_only_mount(&std::env::temp_dir()));
+        assert!(!on_read_only_mount(std::path::Path::new("/Applications")));
+        assert!(!on_read_only_mount(std::path::Path::new("/no/such/path")));
     }
 }

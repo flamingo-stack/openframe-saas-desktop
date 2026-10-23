@@ -1,4 +1,5 @@
 mod autostart;
+mod installer;
 // The background notification actions and the REST calls behind them exist on
 // both desktop platforms; Linux has no notification backend at all, so neither
 // module is built there.
@@ -1428,6 +1429,7 @@ pub fn run() {
         .manage(AuthState::default())
         .manage(tokens::TokenLifecycle::default())
         .manage(updater::UpdateManager::default())
+        .manage(installer::InstallerState::default())
         .invoke_handler(tauri::generate_handler![
             native_auth_start,
             native_auth_exchange_ticket,
@@ -1441,7 +1443,8 @@ pub fn run() {
             updater::update_check,
             updater::update_apply_now,
             autostart::autostart_status,
-            autostart::autostart_set
+            autostart::autostart_set,
+            installer::agent_install_start
         ])
         .setup(|app| {
             build_tray(app)?;

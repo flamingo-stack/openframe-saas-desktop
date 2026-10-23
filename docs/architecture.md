@@ -225,6 +225,9 @@ browser tab cannot - an elevation prompt and a place to run it.
   No window hosts a remote origin at all: the login page — which is
   third-party-influenced — renders in the user's own browser, not in a window of
   ours, and returns only a URL on the app's scheme.
+  Beyond `core:default` (whose window part only reads state) it grants
+  `core:window:allow-maximize`: sign-in, registration and the setup wizard are
+  drawn for a full screen, and the window is maximized from the first of them.
 - **Gateway CORS is a prerequisite.** The gateway must allow `tauri://localhost`
   (macOS/Linux) and `http://tauri.localhost` (Windows), and expose the
   `Access-Token`/`Refresh-Token` headers. Without it the bundle renders and every

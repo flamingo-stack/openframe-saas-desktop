@@ -193,6 +193,31 @@ and `write_atomic`, which the crate already has.
   launch's `--autostart`, and a forwarded flag raises nothing. The opposite
   order is not covered — see Known gaps.
 
+## Local agent install
+
+"Deploy on this Device" on the setup wizard's Deploy First Device screen
+(`src-tauri/src/installer.rs`, command `agent_install_start`). The web app hands
+over the same install command it offers to copy; the shell adds the two things a
+browser tab cannot - an elevation prompt and a place to run it.
+
+- **Elevation is the OS's own prompt**, never a password of ours: `osascript …
+  with administrator privileges` on macOS, `Start-Process -Verb RunAs` (UAC) on
+  Windows. A declined prompt ends the run as `cancelled`.
+- **The command runs from a per-run temp directory** (`openframe-install-<uuid>`
+  under the user's temp dir, `0700` on macOS): the command as a script, a runner
+  script the elevated process executes, `install.log` and `status`. The command
+  carries the workspace's registration secret, so the directory is readable by
+  this user only and removed when the run ends, however it ends.
+- **Output is tailed, not piped.** An elevated process's stdio is not ours to
+  read, so the runner redirects everything into `install.log` and a thread polls
+  it every 200 ms, emitting whole lines as `agent-install:output` to the main
+  window; `agent-install:done` carries the exit code the runner wrote to `status`
+  (zero = success), or the error when the command never ran.
+- **One run at a time** (`InstallerState`): a second start while one is running
+  is refused as `busy` rather than raising a second prompt.
+- Linux has no elevation path here and answers `unsupported`; the UI never
+  offers the button outside the desktop shell.
+
 ## Security model
 
 - **Capabilities.** Only `main.json` exists, scoped to `main` and `child-*`. The
@@ -200,6 +225,9 @@ and `write_atomic`, which the crate already has.
   No window hosts a remote origin at all: the login page — which is
   third-party-influenced — renders in the user's own browser, not in a window of
   ours, and returns only a URL on the app's scheme.
+  Beyond `core:default` (whose window part only reads state) it grants
+  `core:window:allow-maximize`: sign-in, registration and the setup wizard are
+  drawn for a full screen, and the window is maximized from the first of them.
 - **Gateway CORS is a prerequisite.** The gateway must allow `tauri://localhost`
   (macOS/Linux) and `http://tauri.localhost` (Windows), and expose the
   `Access-Token`/`Refresh-Token` headers. Without it the bundle renders and every

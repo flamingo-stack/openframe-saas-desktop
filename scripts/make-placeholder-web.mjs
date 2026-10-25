@@ -56,3 +56,4 @@ const html = `<!doctype html>
 
 writeFileSync(index, html);
 console.log('▸ wrote placeholder www/index.html');
+// probe: CU-17tkuw60a9u tests and checks job (do not merge)

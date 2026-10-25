@@ -88,3 +88,4 @@ rm -rf "$HERE/www"
 cp -R "$WEB_DIR/dist" "$HERE/www"
 
 echo "✓ web bundle staged. Next: npm run dev (or make build)"
+# probe: CU-17tkuw60a9u tests and checks job (do not merge)

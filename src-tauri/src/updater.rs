@@ -7,11 +7,6 @@ use tokio::sync::Mutex;
 
 use crate::{autostart, load_config, tenant_host, tokens, AppConfig, MAIN_LABEL};
 
-/// Appended to the tenant origin. The gateway answers with a 302 to the
-/// `updater.json` of the release that environment runs, so which version is
-/// "latest" is the gateway's call, not GitHub's — dev and prod tenants get
-/// their own. The manifest and its signatures stay as the release workflow
-/// published them; the plugin follows the redirect.
 const GATEWAY_MANIFEST_PATH: &str = "/v0/api/assets/download?agent=console&file=updater.json";
 const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
@@ -249,10 +244,6 @@ fn in_place_blocker() -> Option<UpdateError> {
     )))
 }
 
-/// `None` until login has taught the install its tenant: before that there is
-/// no gateway to ask, and no environment to pick a version for. A fresh install
-/// came from that same gateway's download link, so it is already on the
-/// version the environment runs.
 fn resolve_manifest_url(cfg: &AppConfig) -> Option<String> {
     cfg.update_manifest_url
         .clone()
@@ -421,8 +412,6 @@ pub async fn run_startup_update(app: &AppHandle) {
     }
 }
 
-/// Check once and offer what is found to the UI, never applying it: the user
-/// is in the app, so the restart is theirs to choose.
 async fn check_and_surface(app: &AppHandle) {
     if !self_update_enabled(&load_config(app)) {
         return;
@@ -453,9 +442,6 @@ pub fn spawn_poll_loop(app: AppHandle) {
     });
 }
 
-/// A newly learned tenant is a new update source — the first one, on a fresh
-/// install, whose startup check had nothing to ask. Checked now rather than at
-/// the next poll, up to 45 minutes away.
 pub fn spawn_tenant_check(app: AppHandle) {
     tauri::async_runtime::spawn(async move { check_and_surface(&app).await });
 }

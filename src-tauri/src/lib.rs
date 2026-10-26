@@ -1267,6 +1267,7 @@ fn native_auth_set_tenant_host(app: AppHandle, origin: String) -> Result<(), Str
         // native_auth_set_tokens — is where a tenant switch becomes visible.
         // The live connection belongs to the tenant being left.
         nats::reconnect(&app);
+        updater::spawn_tenant_check(app.clone());
     }
     Ok(())
 }

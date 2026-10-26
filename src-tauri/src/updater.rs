@@ -5,10 +5,14 @@ use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 use tauri_plugin_updater::{Update, UpdaterExt};
 use tokio::sync::Mutex;
 
-use crate::{autostart, load_config, tokens, AppConfig, MAIN_LABEL};
+use crate::{autostart, load_config, tenant_host, tokens, AppConfig, MAIN_LABEL};
 
-const DEFAULT_MANIFEST_URL: &str =
-    "https://github.com/flamingo-stack/openframe-saas-desktop/releases/latest/download/updater.json";
+/// Appended to the tenant origin. The gateway answers with a 302 to the
+/// `updater.json` of the release that environment runs, so which version is
+/// "latest" is the gateway's call, not GitHub's — dev and prod tenants get
+/// their own. The manifest and its signatures stay as the release workflow
+/// published them; the plugin follows the redirect.
+const GATEWAY_MANIFEST_PATH: &str = "/v0/api/assets/download?agent=console&file=updater.json";
 const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 const RUNTIME_POLL_INTERVAL: Duration = Duration::from_secs(45 * 60);
@@ -245,21 +249,22 @@ fn in_place_blocker() -> Option<UpdateError> {
     )))
 }
 
-fn resolve_manifest_url(app: &AppHandle) -> String {
-    if let Some(url) = load_config(app)
-        .update_manifest_url
+/// `None` until login has taught the install its tenant: before that there is
+/// no gateway to ask, and no environment to pick a version for. A fresh install
+/// came from that same gateway's download link, so it is already on the
+/// version the environment runs.
+fn resolve_manifest_url(cfg: &AppConfig) -> Option<String> {
+    cfg.update_manifest_url
+        .clone()
         .filter(|s| !s.is_empty())
-    {
-        return url;
-    }
-    if let Some(url) = option_env!("OPENFRAME_UPDATE_MANIFEST_URL").filter(|s| !s.is_empty()) {
-        return url.to_string();
-    }
-    DEFAULT_MANIFEST_URL.to_string()
+        .or_else(|| tenant_host(cfg).map(|host| format!("{host}{GATEWAY_MANIFEST_PATH}")))
 }
 
 async fn check_for_update(app: &AppHandle) -> Result<Option<Update>, UpdateError> {
-    let manifest_url = resolve_manifest_url(app);
+    let Some(manifest_url) = resolve_manifest_url(&load_config(app)) else {
+        log::info!("[updater] no tenant host yet — skipping check");
+        return Ok(None);
+    };
     let endpoint = url::Url::parse(&manifest_url).map_err(|e| {
         UpdateError::unavailable(format!("invalid manifest URL '{manifest_url}': {e}"))
     })?;
@@ -416,30 +421,43 @@ pub async fn run_startup_update(app: &AppHandle) {
     }
 }
 
+/// Check once and offer what is found to the UI, never applying it: the user
+/// is in the app, so the restart is theirs to choose.
+async fn check_and_surface(app: &AppHandle) {
+    if !self_update_enabled(&load_config(app)) {
+        return;
+    }
+    match check_for_update(app).await {
+        Ok(Some(update)) => {
+            log::info!(
+                "[updater] runtime: {} available — surfacing",
+                update.version
+            );
+            let _ = app.emit_to(
+                MAIN_LABEL,
+                EVENT_AVAILABLE,
+                UpdateAvailability::from_update(&update),
+            );
+        }
+        Ok(None) => {}
+        Err(e) => log::warn!("[updater] runtime check failed: {}", e.message),
+    }
+}
+
 pub fn spawn_poll_loop(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         loop {
             tokio::time::sleep(RUNTIME_POLL_INTERVAL).await;
-            if !self_update_enabled(&load_config(&app)) {
-                continue;
-            }
-            match check_for_update(&app).await {
-                Ok(Some(update)) => {
-                    log::info!(
-                        "[updater] runtime: {} available — surfacing",
-                        update.version
-                    );
-                    let _ = app.emit_to(
-                        MAIN_LABEL,
-                        EVENT_AVAILABLE,
-                        UpdateAvailability::from_update(&update),
-                    );
-                }
-                Ok(None) => {}
-                Err(e) => log::warn!("[updater] runtime check failed: {}", e.message),
-            }
+            check_and_surface(&app).await;
         }
     });
+}
+
+/// A newly learned tenant is a new update source — the first one, on a fresh
+/// install, whose startup check had nothing to ask. Checked now rather than at
+/// the next poll, up to 45 minutes away.
+pub fn spawn_tenant_check(app: AppHandle) {
+    tauri::async_runtime::spawn(async move { check_and_surface(&app).await });
 }
 
 #[tauri::command]
@@ -529,6 +547,36 @@ pub(crate) async fn publish_version_report(app: &AppHandle, client: &async_nats:
 mod tests {
     use super::*;
     use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn no_tenant_means_no_manifest() {
+        assert_eq!(resolve_manifest_url(&AppConfig::default()), None);
+    }
+
+    #[test]
+    fn the_manifest_comes_from_the_tenant_gateway() {
+        let cfg = AppConfig {
+            learned_host: Some("https://acme.openframe.build".into()),
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            resolve_manifest_url(&cfg).as_deref(),
+            Some("https://acme.openframe.build/v0/api/assets/download?agent=console&file=updater.json")
+        );
+    }
+
+    #[test]
+    fn a_configured_manifest_url_wins_over_the_gateway() {
+        let cfg = AppConfig {
+            learned_host: Some("https://acme.openframe.build".into()),
+            update_manifest_url: Some("https://example.test/updater.json".into()),
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            resolve_manifest_url(&cfg).as_deref(),
+            Some("https://example.test/updater.json")
+        );
+    }
 
     #[test]
     fn only_a_full_disk_is_reported_as_disk_space() {

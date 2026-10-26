@@ -7,7 +7,7 @@ use tokio::sync::Mutex;
 
 use crate::{autostart, load_config, tenant_host, tokens, AppConfig, MAIN_LABEL};
 
-const GATEWAY_MANIFEST_PATH: &str = "/v0/api/assets/download?agent=console&file=updater.json";
+const GATEWAY_MANIFEST_PATH: &str = "/v0/api/assets/download?agent=desktop&file=updater.json";
 const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 const RUNTIME_POLL_INTERVAL: Duration = Duration::from_secs(45 * 60);
@@ -547,7 +547,7 @@ mod tests {
         };
         assert_eq!(
             resolve_manifest_url(&cfg).as_deref(),
-            Some("https://acme.openframe.build/v0/api/assets/download?agent=console&file=updater.json")
+            Some("https://acme.openframe.build/v0/api/assets/download?agent=desktop&file=updater.json")
         );
     }
 

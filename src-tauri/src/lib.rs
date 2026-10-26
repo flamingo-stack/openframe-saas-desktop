@@ -714,9 +714,22 @@ fn spawn_show_fallback(window: &WebviewWindow) {
     });
 }
 
+/// Schemes of the companion apps a page may hand a link to; the OS opens
+/// whichever app claims the scheme. Nothing else outside http(s) leaves the app.
+///
+/// - `openframe-chat` — Fae, the end-user chat the agent installs on the device.
+///   "Open Fae" in the Getting Started tour opens `openframe-chat://open`.
+const APP_LINK_SCHEMES: &[&str] = &["openframe-chat"];
+
+/// Whether a link is for one of the [`APP_LINK_SCHEMES`] apps.
+fn is_app_link(url: &url::Url) -> bool {
+    APP_LINK_SCHEMES.contains(&url.scheme())
+}
+
 /// Routes `window.open` / `target="_blank"` requests, which a webview otherwise drops:
 /// bundle pages open in a new in-app window, external http(s) links open in the
-/// system browser, other schemes are blocked.
+/// system browser, companion-app links ([`APP_LINK_SCHEMES`]) go to the OS, other
+/// schemes are blocked.
 ///
 /// "In-app" means the target origin matches a live window that already hosts
 /// bundle content (main/child) — i.e. the app origin Tauri serves the bundle
@@ -729,6 +742,12 @@ fn handle_new_window(
     url: url::Url,
     features: NewWindowFeatures,
 ) -> NewWindowResponse<tauri::Wry> {
+    if is_app_link(&url) {
+        if let Err(e) = open_external(url.as_str()) {
+            log::error!("failed to open app link {url}: {e}");
+        }
+        return NewWindowResponse::Deny;
+    }
     if !matches!(url.scheme(), "http" | "https" | "tauri") {
         log::warn!("blocked new window for scheme '{}': {url}", url.scheme());
         return NewWindowResponse::Deny;
@@ -1742,6 +1761,16 @@ mod tests {
 
     fn parse(url: &str) -> url::Url {
         url::Url::parse(url).unwrap()
+    }
+
+    // "Open Fae" hands openframe-chat:// to the OS; any other non-web scheme
+    // stays blocked, this app's own included.
+    #[test]
+    fn only_companion_app_schemes_are_app_links() {
+        assert!(is_app_link(&parse("openframe-chat://open")));
+        assert!(!is_app_link(&parse("openframe-console://auth?devTicket=x")));
+        assert!(!is_app_link(&parse("file:///etc/passwd")));
+        assert!(!is_app_link(&parse("https://openframe.ai")));
     }
 
     // The callback the gateway sends when it honours the requested redirect

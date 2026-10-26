@@ -1,4 +1,5 @@
 mod autostart;
+mod download_link;
 mod installer;
 // The background notification actions and the REST calls behind them exist on
 // both desktop platforms; Linux has no notification backend at all, so neither
@@ -67,7 +68,7 @@ use tauri::ActivationPolicy;
 
 pub(crate) const MAIN_LABEL: &str = "main";
 
-/// The one URI scheme this app claims with the OS. Two hosts ride on it, and the
+/// The one URI scheme this app claims with the OS. Three hosts ride on it, and the
 /// host is what tells them apart:
 ///
 /// - `openframe-console://auth?devTicket=…` — the OAuth callback. The login runs
@@ -76,9 +77,11 @@ pub(crate) const MAIN_LABEL: &str = "main";
 ///   back by the OS.
 /// - `openframe-console://notify?payload=…` — what a Windows toast activates
 ///   (`notifications::CLICK_URI_PREFIX`).
+/// - `openframe-console://download?id=…` - the download page's "Open the app"
+///   link, carrying the id the installer was downloaded with (`download_link`).
 ///
 /// Registered on macOS by `Info.plist` (`CFBundleURLTypes`) and on Windows by
-/// [`register_url_scheme`] (HKCU) — one scheme, one registration, both uses.
+/// [`register_url_scheme`] (HKCU): one scheme, one registration, every use.
 ///
 /// The frontend's sign-in hand-off page (`/auth/desktop-return/`) launches
 /// `<scheme>://auth?…` with the login's outcome, naming the scheme as
@@ -1267,7 +1270,7 @@ fn take_pending_notification_click(window: WebviewWindow) -> Option<serde_json::
 }
 
 /// Deliver a scheme URI carried in a process's arguments — how Windows delivers
-/// both an OAuth callback and a toast click, either as our own argv (cold start)
+/// an OAuth callback, a toast click and an "Open the app" link, either as our own argv (cold start)
 /// or forwarded by the single-instance plugin (warm). macOS delivers neither
 /// this way: URL activation there is an Apple Event, which reaches us as
 /// `RunEvent::Opened`.
@@ -1277,8 +1280,11 @@ fn take_pending_notification_click(window: WebviewWindow) -> Option<serde_json::
 /// which is why this reports whether it delivered anything.
 #[cfg(target_os = "windows")]
 fn handle_scheme_argv(app: &AppHandle, args: &[String]) -> bool {
-    args.iter()
-        .any(|arg| handle_scheme_url(app, arg) || notifications::handle_notification_uri(app, arg))
+    args.iter().any(|arg| {
+        handle_scheme_url(app, arg)
+            || download_link::handle_url(app, arg)
+            || notifications::handle_notification_uri(app, arg)
+    })
 }
 
 /// Register [`URI_SCHEME`] for this executable (HKCU, no elevation). Re-written
@@ -1435,8 +1441,8 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
-            // A browser handing back the OAuth callback, or a toast click,
-            // reaches the running instance on Windows as a second launch
+            // A browser handing back the OAuth callback, a toast click, or an
+            // "Open the app" link reaches the running instance on Windows as a second launch
             // carrying the URI in argv. Anything else is the user re-launching
             // the app — except a COM server launch, which only happens if this
             // instance failed to register the activator, and must not put a
@@ -1485,6 +1491,7 @@ pub fn run() {
         .manage(tokens::TokenLifecycle::default())
         .manage(updater::UpdateManager::default())
         .manage(installer::InstallerState::default())
+        .manage(download_link::DownloadLinkState::default())
         .invoke_handler(tauri::generate_handler![
             native_auth_start,
             native_auth_cancel,
@@ -1500,7 +1507,8 @@ pub fn run() {
             updater::update_apply_now,
             autostart::autostart_status,
             autostart::autostart_set,
-            installer::agent_install_start
+            installer::agent_install_start,
+            download_link::take_pending_download_id
         ])
         .setup(|app| {
             build_tray(app)?;
@@ -1533,10 +1541,10 @@ pub fn run() {
             // nothing on that path, which opens no window either way.
             let asked_for_a_window = autostart::take_show_window_request(&handle);
 
-            // Cold start from a Windows protocol activation — a toast click, or
-            // an OAuth callback that arrived after the app was quit — put the
-            // URI in our own argv. Runs before the window exists so a click
-            // payload is stashed (the webview pulls it via
+            // Cold start from a Windows protocol activation (a toast click, an
+            // "Open the app" link, or an OAuth callback that arrived after the
+            // app was quit) put the URI in our own argv. Runs before the window
+            // exists so a click payload is stashed (the webview pulls it via
             // take_pending_notification_click) instead of being shown early —
             // handle_page_load still owns the reveal, so no unpainted flash.
             // `args_os`, not `args`: the latter panics on non-UTF-8 arguments.
@@ -1710,11 +1718,18 @@ pub fn run() {
             // nobody was waiting on raises nothing here — Windows is necessarily
             // laxer, since there the same URL arrives as a second process launch
             // and the single-instance handler raises for any relaunch.
+            //
+            // An "Open the app" link brings the window up as well. Not by building
+            // one: a link that started the app arrives before setup has, and
+            // setup's own open then reveals it unpainted. `show_primary_window`
+            // leaves that to setup, and builds one only where setup never will.
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Opened { urls } = &event {
                 for url in urls {
                     if handle_scheme_url(app, url.as_str()) {
                         raise_or_open_main_window(app);
+                    } else if download_link::handle_url(app, url.as_str()) {
+                        show_primary_window(app);
                     }
                 }
             }

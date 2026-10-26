@@ -109,7 +109,9 @@ to discover against, are out of scope for this shell.
   Matching is done against a live window's origin rather than a hardcoded one, so
   it is correct across platforms and in dev. External http(s) opens in the system
   browser; that now includes tenant-origin links, since app content no longer
-  lives there. Other schemes are blocked.
+  lives there. Companion-app links (`APP_LINK_SCHEMES`: `openframe-chat://`, Fae's
+  "Open Fae") are handed to the OS, which opens the app that claims the scheme.
+  Other schemes are blocked.
 - **No white flash.** Windows are created hidden with a dark background colour and
   revealed on `PageLoadEvent::Finished`, with a timer as a safety net.
   `background_color` alone is not enough on macOS, where it is not applied to the

@@ -36,6 +36,7 @@ use crate::{show_primary_window, tokens, MAIN_LABEL};
 
 /// Consumed by `onNativeNotificationClick` in the frontend's native-shell.ts —
 /// a rename here silently stops routing there.
+#[allow(dead_code)]
 const CLICK_EVENT: &str = "notification:click";
 /// Length limit for text the shell did not write: an incoming envelope's
 /// `description` and the gateway's error text. A body the shell composes itself
@@ -393,6 +394,7 @@ pub(crate) fn handle_notification_uri(app: &AppHandle, uri: &str) -> bool {
 
 /// The OS identified the exact notification that was clicked: hand the payload
 /// to the webview and raise the window.
+#[allow(dead_code)]
 pub(crate) fn deliver_click(app: &AppHandle, payload: Option<serde_json::Value>) {
     match payload {
         Some(payload) => {
@@ -413,6 +415,7 @@ pub(crate) fn deliver_click(app: &AppHandle, payload: Option<serde_json::Value>)
 /// Emit `notification:click`, or stash it if the webview has not signalled
 /// readiness yet (cold start: the click that launched the app happens before
 /// React mounts the listener).
+#[allow(dead_code)]
 fn emit_or_stash(app: &AppHandle, payload: serde_json::Value) {
     let Some(plane) = app.try_state::<NotificationsPlane>() else {
         return;

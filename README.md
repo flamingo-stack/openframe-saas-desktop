@@ -139,7 +139,7 @@ Other keys, all optional:
 | Key | Purpose |
 |---|---|
 | `self_update_enabled` | `false` disables the startup and background update checks. |
-| `update_manifest_url` | Overrides the updater manifest endpoint. |
+| `update_manifest_url` | Overrides the updater manifest endpoint. By default the manifest comes from the tenant gateway (`<learned_host>/v0/api/assets/download?agent=desktop&file=updater.json`), which redirects to the `updater.json` of the release that environment runs; before the first login there is no tenant and no check. |
 | `autostart_enforced` | Pins **Start at Login** on (`true`) or off (`false`) for a managed install, and takes the toggle away from the user. Absent leaves the choice to them. |
 | `autostart_configured` | Shell-written. Records that the start-at-login default has been applied, so it is applied once rather than re-asserted over a user who turned it off. |
 | `autostart_show_window_next_start` | Shell-written, cleared on the next launch. Set by an update that restarts while a window is open, so the relaunch shows one even in a login session. |

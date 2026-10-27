@@ -38,6 +38,7 @@ pub const EVENT_DONE: &str = "agent-install:done";
 /// is answered with [`InstallError::busy`] instead of a second elevation prompt.
 #[derive(Default)]
 pub struct InstallerState {
+    /// Whether an install is currently in flight.
     running: AtomicBool,
 }
 
@@ -51,6 +52,7 @@ pub struct InstallError {
 }
 
 impl InstallError {
+    /// Another install is already running.
     fn busy() -> Self {
         Self {
             kind: "busy",
@@ -106,12 +108,14 @@ impl InstallError {
     }
 }
 
+/// Lines emitted to the frontend as [`EVENT_OUTPUT`].
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct OutputEvent {
     lines: Vec<String>,
 }
 
+/// The final outcome emitted to the frontend as [`EVENT_DONE`].
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DoneEvent {
@@ -247,12 +251,27 @@ mod run {
         }
     }
 
+    /// Write `contents` to `path`, visible under its final name only once it
+    /// already carries owner-only permissions: on unix the file is created
+    /// directly with mode `0o600` rather than tightened after the fact, so
+    /// there is no window where a secret-bearing file is world- or
+    /// group-readable.
     fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
-        fs::write(path, contents)?;
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)?;
+            file.write_all(contents.as_bytes())?;
+        }
+        #[cfg(not(unix))]
+        {
+            fs::write(path, contents)?;
         }
         Ok(())
     }

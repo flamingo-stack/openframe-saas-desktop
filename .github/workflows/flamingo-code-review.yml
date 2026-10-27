@@ -595,8 +595,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      # Reads the stage 2 check run a developer's machine posted on this commit.
-      checks: read
+      # Reads the stage 2 check run a developer's machine posted on this commit, and publishes this job's result on the
+      # pull request's head when a comment started the run (the job's own check lands on the default branch's commit).
+      checks: write
       # A repository may map the job's own token for its package registry
       # (secret.GITHUB_TOKEN = GITHUB_TOKEN): reading packages, nothing else.
       packages: read
@@ -804,6 +805,9 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha || needs.resolve_command.outputs.head_sha }}
           WF_RUN_ID: ${{ github.run_id }}
           REVIEW_STAGE2_FILE: ${{ runner.temp }}/stage2.json
+          # A comment-started run's result, published on the PR head under the required check's name.
+          TESTS_CHECK_NAME: ${{ github.event_name == 'issue_comment' && 'Flamingo Code Review / tests and checks' || '' }}
+          TESTS_OUTCOME: ${{ steps.run.outcome }}
         run: |
           if grep -aq -- "argv.includes('--tests')" /tmp/code-review-post.mjs; then
             "$HUB_NODE" /tmp/code-review-post.mjs --tests
@@ -1016,7 +1020,7 @@ jobs:
           FLAMINGO_TEST_SECRET_3: ${{ steps.plan.outputs.secret_3_name != '' && secrets[steps.plan.outputs.secret_3_name] || '' }}
         run: $HUB_NODE /tmp/code-review-tests.mjs run --plan-file "$RUNNER_TEMP/test-plan.json" --kinds test,mutation,check --out "$RUNNER_TEMP/stage2.json" --sweep --fail-on-failure
 
-      - name: Hand the results to the sweep's review
+      - name: Hand the results to the sweep review
         if: always() && (steps.run.outcome == 'success' || steps.run.outcome == 'failure')
         uses: actions/upload-artifact@v4
         with:
@@ -1025,7 +1029,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 1
 
-      - name: Summarize the sweep's tests and checks
+      - name: Summarize the sweep tests and checks
         if: always() && (steps.run.outcome == 'success' || steps.run.outcome == 'failure')
         run: |
           {
@@ -1525,7 +1529,7 @@ jobs:
       # A SWEEP reviews what its tests and checks found too (sweep_checks): their
       # stage2.json, which the reviewer turns into findings. Absent when that job
       # did not run or failed before writing it; the review runs either way.
-      - name: Take the sweep's tests and checks
+      - name: Take the sweep tests and checks
         if: env.MODE == 'sweep'
         continue-on-error: true
         uses: actions/download-artifact@v4
